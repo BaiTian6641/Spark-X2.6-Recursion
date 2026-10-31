@@ -16,7 +16,6 @@ from contextlib import nullcontext
 import copy
 import dataclasses
 import importlib
-import inspect
 import math
 from typing import Optional
 
@@ -25,10 +24,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-_SDPA_SUPPORTS_GQA = (
-    hasattr(F, 'scaled_dot_product_attention')
-    and 'enable_gqa' in inspect.signature(F.scaled_dot_product_attention).parameters
-)
+
+def _probe_sdpa_gqa() -> bool:
+    if not hasattr(F, 'scaled_dot_product_attention'):
+        return False
+    try:
+        q = torch.zeros((1, 2, 1, 4), dtype=torch.float32)
+        k = torch.zeros((1, 1, 1, 4), dtype=torch.float32)
+        F.scaled_dot_product_attention(q, k, k, enable_gqa=True)
+        return True
+    except Exception:
+        return False
+
+
+_SDPA_SUPPORTS_GQA = _probe_sdpa_gqa()
 
 
 @dataclasses.dataclass
@@ -121,9 +130,15 @@ def patch_spark_attention_for_long_context(base_model: nn.Module) -> int:
     ):
         if scaling is None:
             scaling = 1.0 / math.sqrt(query.shape[-1])
+        if key.dtype != query.dtype:
+            key = key.to(query.dtype)
+        if value.dtype != query.dtype:
+            value = value.to(query.dtype)
         attn_mask = None
         if attention_mask is not None:
             attn_mask = attention_mask[:, :, :, : key.shape[-2]]
+            if attn_mask.dtype != torch.bool and attn_mask.dtype != query.dtype:
+                attn_mask = attn_mask.to(query.dtype)
         use_gqa = _SDPA_SUPPORTS_GQA and (module.num_key_value_groups > 1)
         if not use_gqa and orig_repeat_kv is not None and module.num_key_value_groups > 1:
             key = orig_repeat_kv(key, module.num_key_value_groups)
@@ -935,8 +950,12 @@ def build_optimizer(model: SparkXLoop, lr_adapter=1e-4, lr_full=1e-5, weight_dec
             return bnb.optim.PagedAdamW8bit(groups, betas=(0.9, 0.95), eps=1e-8)
         except Exception:
             pass
-    use_fused = torch.cuda.is_available() and 'fused' in inspect.signature(torch.optim.AdamW.__init__).parameters
-    return torch.optim.AdamW(groups, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+    if torch.cuda.is_available():
+        try:
+            return torch.optim.AdamW(groups, betas=(0.9, 0.95), eps=1e-8, fused=True)
+        except Exception:
+            pass
+    return torch.optim.AdamW(groups, betas=(0.9, 0.95), eps=1e-8)
 
 
 def trainable_state(model: SparkXLoop):
