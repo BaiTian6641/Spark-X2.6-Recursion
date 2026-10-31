@@ -1,0 +1,29 @@
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# Checkpoints, exports, and training logs
+runs/
+exports/
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.gguf
+
+# Jupyter / Colab temporary artifacts
+.ipynb_checkpoints/
+wandb/
+*.log
+
+# OS / IDE files
+.DS_Store
+.idea/
+.vscode/

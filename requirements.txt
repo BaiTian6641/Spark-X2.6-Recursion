@@ -1,0 +1,8 @@
+transformers==4.57.1
+accelerate>=1.10,<2
+datasets>=3,<5
+huggingface_hub>=0.34,<2
+safetensors>=0.5
+openai>=1.5
+bitsandbytes>=0.45.0
+cut-cross-entropy
