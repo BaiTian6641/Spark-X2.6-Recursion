@@ -24,8 +24,8 @@ enable_thinking=os.environ.get('ENABLE_THINKING','1').lower() not in ('0','false
 use_visit_cache=os.environ.get('USE_VISIT_CACHE','1').lower() not in ('0','false','no')
 max_new_tokens=int(os.environ.get('MAX_NEW_TOKENS','256' if enable_thinking else '64'))
 if not torch.cuda.is_available(): raise RuntimeError('CUDA GPU required for default inference script')
-root=Path(snapshot_download(repo_id=repo,token=token,allow_patterns=[f'stages/{stage}/*']))
-folder=root/'stages'/stage
+root=Path(snapshot_download(repo_id=repo,token=token,allow_patterns=[f'stages/{stage}/*','loop_config.json','trainable.safetensors','*.py']))
+folder=(root/'stages'/stage) if (root/'stages'/stage/'loop_config.json').exists() else root
 meta=json.loads((folder/'loop_config.json').read_text())
 dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 base=AutoModelForCausalLM.from_pretrained(meta['base_id'],revision=meta['base_revision'],
