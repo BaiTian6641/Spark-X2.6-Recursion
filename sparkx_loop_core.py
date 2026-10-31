@@ -433,10 +433,19 @@ class TwoStreamMHC(nn.Module):
             self.pass_up = None
 
     def mixing_matrix(self, dyn_mix: Optional[torch.Tensor] = None, base_logits: Optional[torch.Tensor] = None):
-        # Sinkhorn in log space for stability, supporting both [2, 2] and [B, T, 2, 2].
+        # Exact Sinkhorn projection onto the Birkhoff polytope in log space, supporting [2, 2] and [B, T, 2, 2].
         x = (self.mix_logits if base_logits is None else base_logits).float()
         if dyn_mix is not None:
             x = x + dyn_mix.float()
+        if x.shape[-2:] == (2, 2):
+            # Exact closed-form k->inf Sinkhorn limit for 2x2 matrices via cross-ratio invariance:
+            # P_00 = P_11 = sigmoid(0.5 * (x_00 + x_11 - x_01 - x_10)), P_01 = P_10 = 1 - P_00
+            diag_logit = 0.5 * (x[..., 0, 0] + x[..., 1, 1] - x[..., 0, 1] - x[..., 1, 0])
+            p = torch.sigmoid(diag_logit)
+            q = 1.0 - p
+            row0 = torch.stack((p, q), dim=-1)
+            row1 = torch.stack((q, p), dim=-1)
+            return torch.stack((row0, row1), dim=-2)
         for _ in range(self.sinkhorn_steps):
             x = x - torch.logsumexp(x, dim=-1, keepdim=True)
             x = x - torch.logsumexp(x, dim=-2, keepdim=True)
