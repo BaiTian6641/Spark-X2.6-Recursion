@@ -17,7 +17,7 @@ from safetensors.torch import load_file
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from sparkx_loop_core import LoopSettings, SparkXLoop, attach_lora
 
-repo=os.environ.get('LOOP_REPO','TassP0lar/Spark-X2.6-4B-Loop-mHC')
+repo=os.environ.get('LOOP_REPO','TassP0lar/Spark-X2.6-4B-Loop-mHC-R24-step01850')
 stage=os.environ.get('LOOP_STAGE','R24')
 token=os.environ.get('HF_TOKEN') or os.environ.get('HF_TOKEM')
 enable_thinking=os.environ.get('ENABLE_THINKING','1').lower() not in ('0','false','no')
@@ -37,10 +37,10 @@ if meta.get('lora_rank',0)>0:
 settings=LoopSettings(
     start=4,end=28,passes=meta['loop_passes'],
     eng_buckets=meta['engram_buckets'],eng_dim=meta['engram_dim'],
-    eng_experts=meta.get('engram_experts',8),
+    eng_experts=meta.get('engram_experts',16),
     eng_top_k=meta.get('engram_top_k',2),
-    eng_expert_rank=meta.get('engram_expert_rank',16),
-    eng_shared_rank=meta.get('engram_shared_rank',16),
+    eng_expert_rank=meta.get('eng_expert_rank',meta.get('engram_expert_rank',16)),
+    eng_shared_rank=meta.get('eng_shared_rank',meta.get('engram_shared_rank',16)),
     backbone_engram_stride=meta.get('backbone_engram_stride',4),
     checkpoint_layers=False,dynamic_mhc=meta.get('dynamic_mhc',True),
     sublayer_mhc=meta.get('sublayer_mhc',True),
