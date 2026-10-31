@@ -40,6 +40,11 @@ class LoopSettings:
     mhc_streams: int = 2
     eng_buckets: int = 16384
     eng_dim: int = 64
+    eng_experts: int = 8            # Tier-3 MoE routed memory experts per Engram layer
+    eng_top_k: int = 2              # Sparse Top-K active memory experts per token
+    eng_expert_rank: int = 16       # PEER / UltraMemV2 inner value slots per expert
+    eng_shared_rank: int = 16       # Tier-2 Hot Shared Expert bottleneck rank
+    backbone_engram_stride: int = 4 # Insert Backbone MoE-Engram at each 4-layer Spark macro-block anchor
     checkpoint_layers: bool = True
     offload_checkpoint_to_cpu: bool = False  # uses 130 GB System RAM pinned memory when True
     use_mhc: bool = True
@@ -194,33 +199,77 @@ def attach_lora(base_model: nn.Module, start: int = 4, end: int = 36, rank: int 
 
 
 class HashedBigramEngram(nn.Module):
-    """Multi-scale causal N-gram memory (2-gram + 3-gram + skip-2-gram) with context-aware gating.
+    """Memory-Tiered MoE-Engram (DeepSeek Conditional Memory + Shared/Routed PEER Experts).
 
-    Position-independent and strictly causal (depends only on tokens t-2, t-1, t), so it
-    generalizes seamlessly across Spark-X2.6-4B's 1M token context window.
-    Zero-initialized `project.weight` guarantees exact 0.0 output at step 0.
+    Combines three cooperating memory tiers with O(1) / sparse Top-K routing:
+    1. Tier 1 (Lexical N-Gram Tier): Multi-head causal modular hashing over 2-gram (t-1, t),
+       3-gram (t-2, t-1, t), and skip-2-gram (t-2, t) with O(1) embedding table lookup.
+    2. Tier 2 (Hot Shared Knowledge Tier): DeepSeekMoE-style always-active compact low-rank
+       shared expert (`shared_down` -> SiLU -> `shared_up`) capturing universal reasoning primitives.
+    3. Tier 3 (Cold/Domain Sparse Routed Memory Experts): MoE + PEER/UltraMemV2-style bank of
+       `num_experts` memory experts (`expert_down`, `expert_up`), activating only Top-K (`top_k=2`)
+       experts per token with pass-conditioned routing (`pass_router_bias`) and auxiliary-loss-free
+       load balancing (`expert_bias`, `expert_load_ema`).
+    4. Context-Aware Compatibility Gate & Zero-Init Projection: Modulates fused tiered memory by
+       `2 * sigmoid(ctx_gate(h_t))` and projects via zero-initialized `project.weight` so Step-0
+       output is strictly 0.0 (preserving exact backbone behavior at initialization).
     """
-    def __init__(self, hidden: int, buckets: int = 16384, dim: int = 64, rmsnorm_eps: float = 1e-6):
+    def __init__(self, hidden: int, buckets: int = 16384, dim: int = 64,
+                 num_experts: int = 8, top_k: int = 2, expert_rank: int = 16,
+                 shared_rank: int = 16, max_passes: int = 4, rmsnorm_eps: float = 1e-6):
         super().__init__()
+        self.hidden = hidden
         self.buckets = buckets
         self.dim = dim
+        self.num_experts = max(1, int(num_experts))
+        self.top_k = min(max(1, int(top_k)), self.num_experts)
+        self.expert_rank = max(1, int(expert_rank))
+        self.shared_rank = max(1, int(shared_rank))
+        self.max_passes = max(1, int(max_passes))
         self.rmsnorm_eps = rmsnorm_eps
+
+        # Tier 1: O(1) Multi-Scale Causal N-Gram Lookup Tables
         self.emb = nn.Embedding(buckets, dim, dtype=torch.float32)
         self.emb_tri = nn.Embedding(buckets, dim, dtype=torch.float32)
         self.emb_skip = nn.Embedding(buckets, dim, dtype=torch.float32)
+
+        # Tier 2: Hot Shared Knowledge Expert (always active, low-rank SwiGLU/SiLU bottleneck)
+        self.shared_down = nn.Linear(hidden, self.shared_rank, bias=False, dtype=torch.float32)
+        self.shared_up = nn.Linear(self.shared_rank, dim, bias=False, dtype=torch.float32)
+
+        # Tier 3: Sparse Routed Domain Memory Experts (MoE + PEER/UltraMemV2 value expansion)
+        self.router = nn.Linear(hidden, self.num_experts, bias=False, dtype=torch.float32)
+        self.pass_router_bias = nn.Parameter(torch.zeros(self.max_passes, self.num_experts, dtype=torch.float32))
+        self.register_buffer('expert_bias', torch.zeros(self.num_experts, dtype=torch.float32))
+        self.register_buffer('expert_load_ema', torch.full((self.num_experts,), 1.0 / self.num_experts, dtype=torch.float32))
+        self.query_proj = nn.Linear(hidden, dim, bias=False, dtype=torch.float32)
+        self.expert_down = nn.Parameter(torch.empty(self.num_experts, self.expert_rank, dim, dtype=torch.float32))
+        self.expert_up = nn.Parameter(torch.empty(self.num_experts, self.expert_rank, dim, dtype=torch.float32))
+
+        # DeepSeek Engram Context-Aware Compatibility Gate & Zero-Init Backbone Projection
         self.ctx_gate = nn.Linear(hidden, dim, bias=True, dtype=torch.float32)
         self.project = nn.Linear(dim, hidden, bias=False, dtype=torch.float32)
         self.gain = nn.Parameter(torch.tensor(-2.0, dtype=torch.float32))
+
         nn.init.normal_(self.emb.weight, std=0.02)
         nn.init.normal_(self.emb_tri.weight, std=0.02)
         nn.init.normal_(self.emb_skip.weight, std=0.02)
+        nn.init.kaiming_uniform_(self.shared_down.weight, a=math.sqrt(5))
+        nn.init.normal_(self.shared_up.weight, std=0.02)
+        nn.init.normal_(self.router.weight, std=0.01)
+        nn.init.kaiming_uniform_(self.query_proj.weight, a=math.sqrt(5))
+        nn.init.normal_(self.expert_down, std=0.02)
+        nn.init.normal_(self.expert_up, std=0.02)
         nn.init.zeros_(self.ctx_gate.weight)
         nn.init.zeros_(self.ctx_gate.bias)
         nn.init.zeros_(self.project.weight)
 
-    def forward(self, input_ids: torch.LongTensor, dtype: torch.dtype,
-                prev_ids: Optional[torch.LongTensor] = None,
-                hidden_states: Optional[torch.Tensor] = None):
+    @staticmethod
+    def compute_ngram_indices(
+        input_ids: torch.LongTensor,
+        buckets: int,
+        prev_ids: Optional[torch.LongTensor] = None,
+    ) -> tuple[torch.LongTensor, torch.LongTensor, torch.LongTensor]:
         # Deterministic causal hashing over (t-2, t-1, t); zero access to future tokens.
         bsz, seq_len = input_ids.shape
         if prev_ids is None:
@@ -239,17 +288,67 @@ class HashedBigramEngram(nn.Module):
                 prev2 = last2
             else:
                 prev2 = torch.cat((last2, last1, input_ids[:, :-2]), dim=1)
-        idx_bi = ((prev1 * 1000003 + input_ids * 9176 + 29) % self.buckets).long()
-        idx_tri = ((prev2 * 2000003 + prev1 * 1000033 + input_ids * 19391 + 73) % self.buckets).long()
-        idx_skip = ((prev2 * 1500007 + input_ids * 31337 + 53) % self.buckets).long()
+        idx_bi = ((prev1 * 1000003 + input_ids * 9176 + 29) % buckets).long()
+        idx_tri = ((prev2 * 2000003 + prev1 * 1000033 + input_ids * 19391 + 73) % buckets).long()
+        idx_skip = ((prev2 * 1500007 + input_ids * 31337 + 53) % buckets).long()
+        return idx_bi, idx_tri, idx_skip
+
+    def forward(self, input_ids: torch.LongTensor, dtype: torch.dtype,
+                prev_ids: Optional[torch.LongTensor] = None,
+                hidden_states: Optional[torch.Tensor] = None,
+                pass_idx: int = 0,
+                ngram_indices: Optional[tuple[torch.LongTensor, torch.LongTensor, torch.LongTensor]] = None):
+        if ngram_indices is None:
+            idx_bi, idx_tri, idx_skip = self.compute_ngram_indices(input_ids, self.buckets, prev_ids=prev_ids)
+        else:
+            idx_bi, idx_tri, idx_skip = ngram_indices
+
         with torch.autocast(device_type=input_ids.device.type, enabled=False):
-            mem = self.emb(idx_bi) + 0.5 * self.emb_tri(idx_tri) + 0.5 * self.emb_skip(idx_skip)
-            mem = mem * torch.rsqrt(mem.pow(2).mean(dim=-1, keepdim=True) + self.rmsnorm_eps)
+            # Tier 1: O(1) Lexical N-Gram Lookup
+            mem_lex = self.emb(idx_bi) + 0.5 * self.emb_tri(idx_tri) + 0.5 * self.emb_skip(idx_skip)
+
             if hidden_states is not None:
-                gate = 2.0 * torch.sigmoid(self.ctx_gate(hidden_states.float()))
+                h_f32 = hidden_states.float()
+                h_norm = h_f32 * torch.rsqrt(h_f32.pow(2).mean(dim=-1, keepdim=True) + self.rmsnorm_eps)
+
+                # Tier 2: Hot Shared Knowledge Expert
+                mem_shared = self.shared_up(F.silu(self.shared_down(h_norm)))
+
+                # Tier 3: Cold/Domain Sparse Routed Memory Experts (Top-K MoE + PEER)
+                p_idx = min(max(0, int(pass_idx)), self.max_passes - 1)
+                router_logits = self.router(h_norm) + self.pass_router_bias[p_idx].view(1, 1, -1)
+                routing_probs = F.softmax(router_logits, dim=-1)
+                _, top_idx = torch.topk(routing_probs + self.expert_bias.view(1, 1, -1), k=self.top_k, dim=-1)
+                top_w = torch.gather(routing_probs, dim=-1, index=top_idx)
+                top_w = top_w / (top_w.sum(dim=-1, keepdim=True) + 1e-6)
+
+                if self.training:
+                    with torch.no_grad():
+                        one_hot = F.one_hot(top_idx, num_classes=self.num_experts).float()
+                        freq = one_hot.mean(dim=(0, 1, 2))
+                        self.expert_load_ema.mul_(0.95).add_(freq, alpha=0.05)
+                        target_freq = 1.0 / float(self.num_experts)
+                        self.expert_bias.add_(torch.sign(target_freq - self.expert_load_ema) * 1e-3).clamp_(-0.5, 0.5)
+
+                q = self.query_proj(h_norm) + mem_lex
+                p_k = self.expert_down[top_idx]  # [B, T, K, R, dim]
+                v_k = self.expert_up[top_idx]    # [B, T, K, R, dim]
+                act = F.silu((p_k * q.unsqueeze(2).unsqueeze(3)).sum(dim=-1))  # [B, T, K, R]
+                exp_out = (act.unsqueeze(-1) * v_k).sum(dim=-2)                # [B, T, K, dim]
+                mem_routed = (top_w.unsqueeze(-1) * exp_out).sum(dim=-2)       # [B, T, dim]
+
+                mem = mem_lex + mem_shared + mem_routed
+                mem = mem * torch.rsqrt(mem.pow(2).mean(dim=-1, keepdim=True) + self.rmsnorm_eps)
+                gate = 2.0 * torch.sigmoid(self.ctx_gate(h_norm))
                 mem = mem * gate
+            else:
+                mem = mem_lex * torch.rsqrt(mem_lex.pow(2).mean(dim=-1, keepdim=True) + self.rmsnorm_eps)
+
             z = self.project(mem) * torch.sigmoid(self.gain)
         return z.to(dtype)
+
+
+TieredMoEEngram = HashedBigramEngram
 
 
 class TwoStreamMHC(nn.Module):
@@ -485,7 +584,28 @@ class SparkXLoop(nn.Module):
             )
             for i in range(self.settings.start, self.settings.end)
         })
-        self.engram = HashedBigramEngram(self.width, self.settings.eng_buckets, self.settings.eng_dim)
+        def _make_engram():
+            return HashedBigramEngram(
+                self.width,
+                buckets=self.settings.eng_buckets,
+                dim=self.settings.eng_dim,
+                num_experts=self.settings.eng_experts,
+                top_k=self.settings.eng_top_k,
+                expert_rank=self.settings.eng_expert_rank,
+                shared_rank=self.settings.eng_shared_rank,
+                max_passes=self.settings.max_passes,
+            )
+
+        self.engram = _make_engram()
+        stride = max(0, int(self.settings.backbone_engram_stride))
+        if stride > 0:
+            self.backbone_engrams = nn.ModuleDict({
+                str(i): _make_engram()
+                for i in range(self.settings.start, self.settings.end)
+                if (i - self.settings.start + 1) % stride == 0
+            })
+        else:
+            self.backbone_engrams = nn.ModuleDict()
         self.enable_checkpoint = self.settings.checkpoint_layers
         self.offload_checkpoint_to_cpu = self.settings.offload_checkpoint_to_cpu
         self.loop_start, self.loop_end, self.loop_passes = self.settings.start, self.settings.end, self.settings.passes
@@ -588,22 +708,36 @@ class SparkXLoop(nn.Module):
         )
         h = embeds.float()  # matches upstream Spark 2.5 model forward
         virtual_idx = 0
+        ngram_indices = (
+            self.engram.compute_ngram_indices(input_ids, self.settings.eng_buckets, prev_ids=prev_ids)
+            if self.engram_enabled else None
+        )
 
         # Original prelude layers, unchanged.
         for idx in range(self.loop_start):
             h = self._apply_layer(idx, h, masks, ropes, past_key_values=past_key_values,
                                   cache_position=cache_position, virtual_idx=virtual_idx)
             virtual_idx += 1
-        # Multi-scale causal Engram inserted after prelude; zero-initialized project keeps step-0 parity exact.
+        # Memory-Tiered MoE-Engram inserted after prelude; zero-initialized project keeps step-0 parity exact.
         if self.engram_enabled:
-            h = h + self.engram(input_ids, h.dtype, prev_ids=prev_ids, hidden_states=h)
+            h = h + self.engram(
+                input_ids, h.dtype, prev_ids=prev_ids, hidden_states=h,
+                pass_idx=0, ngram_indices=ngram_indices,
+            )
 
         if not self.mhc_enabled:
             # Direct recurrence negative control.
-            for _ in range(self.loop_passes):
+            for p in range(self.loop_passes):
                 for idx in range(self.loop_start, self.loop_end):
                     h = self._apply_layer(idx, h, masks, ropes, past_key_values=past_key_values,
                                           cache_position=cache_position, virtual_idx=virtual_idx)
+                    if self.engram_enabled and str(idx) in self.backbone_engrams:
+                        eng_delta = self.backbone_engrams[str(idx)](
+                            input_ids, h.dtype, prev_ids=prev_ids, hidden_states=h,
+                            pass_idx=p, ngram_indices=ngram_indices,
+                        )
+                        if p == 0:
+                            h = h + eng_delta
                     virtual_idx += 1
         else:
             streams = torch.stack((h, h), dim=0)
@@ -614,11 +748,25 @@ class SparkXLoop(nn.Module):
                     ctrl = self.controllers[str(idx)]
                     rp, mk = ropes[kind], masks[kind]
                     v_cache = _VisitCache(past_key_values, idx, virtual_idx) if past_key_values is not None else None
+                    eng_mod = (
+                        self.backbone_engrams[str(idx)]
+                        if (self.engram_enabled and str(idx) in self.backbone_engrams)
+                        else None
+                    )
                     virtual_idx += 1
                     # Capture immutable locals, not a changing Python loop variable.
-                    def step(s, _ctrl=ctrl, _layer=layer, _rp=rp, _mk=mk, _extra=(p > 0), _p=p, _vc=v_cache, _cp=cache_position):
-                        return _ctrl(s, _layer, _rp, _mk, extra=_extra, pass_idx=_p,
-                                     past_key_values=_vc, cache_position=_cp)
+                    def step(s, _ctrl=ctrl, _layer=layer, _rp=rp, _mk=mk, _extra=(p > 0), _p=p, _vc=v_cache, _cp=cache_position, _eng=eng_mod):
+                        s_out = _ctrl(s, _layer, _rp, _mk, extra=_extra, pass_idx=_p,
+                                      past_key_values=_vc, cache_position=_cp)
+                        if _eng is not None:
+                            eng_delta = _eng(
+                                input_ids, s_out.dtype, prev_ids=prev_ids, hidden_states=s_out[0],
+                                pass_idx=_p, ngram_indices=ngram_indices,
+                            )
+                            if _extra:
+                                eng_delta = eng_delta * torch.tanh(_ctrl.ffn_extra_gain.float()).to(s_out.dtype)
+                            s_out = torch.stack((s_out[0] + eng_delta, s_out[1]), dim=0)
+                        return s_out
                     if v_cache is None and self.training and self.enable_checkpoint:
                         with self._checkpoint_context():
                             streams = checkpoint(step, streams, use_reentrant=False)
@@ -741,6 +889,8 @@ def set_trainables(model: SparkXLoop, full_layer_ids=(), full_finetune: bool = F
         p.requires_grad_(True)
     for p in model.engram.parameters():
         p.requires_grad_(True)
+    for p in model.backbone_engrams.parameters():
+        p.requires_grad_(True)
     for idx in full_layer_ids:
         if not (0 <= idx < model.n_layers):
             raise ValueError(f'Invalid full layer {idx}')
@@ -756,7 +906,11 @@ def optimizer_groups(model: SparkXLoop, lr_adapter=1e-4, lr_full=1e-5, weight_de
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if (name.startswith('controllers.') and '.pass_' not in name) or name == 'engram.gain':
+        if (
+            (name.startswith('controllers.') and '.pass_' not in name)
+            or name == 'engram.gain'
+            or (name.startswith('backbone_engrams.') and name.endswith('.gain'))
+        ):
             routing.append(p)
         elif name.startswith('base.model.') and '.lora_' not in name:
             backbone.append(p)

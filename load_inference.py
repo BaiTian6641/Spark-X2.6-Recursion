@@ -37,6 +37,11 @@ if meta.get('lora_rank',0)>0:
 settings=LoopSettings(
     start=4,end=28,passes=meta['loop_passes'],
     eng_buckets=meta['engram_buckets'],eng_dim=meta['engram_dim'],
+    eng_experts=meta.get('engram_experts',8),
+    eng_top_k=meta.get('engram_top_k',2),
+    eng_expert_rank=meta.get('engram_expert_rank',16),
+    eng_shared_rank=meta.get('engram_shared_rank',16),
+    backbone_engram_stride=meta.get('backbone_engram_stride',4),
     checkpoint_layers=False,dynamic_mhc=meta.get('dynamic_mhc',True),
     sublayer_mhc=meta.get('sublayer_mhc',True),
     pass_adapter_rank=meta.get('pass_adapter_rank',16),

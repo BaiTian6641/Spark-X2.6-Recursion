@@ -142,9 +142,24 @@ assert loop.controllers['4'].pass_up[1].weight.grad is not None
 assert base.model.layers[6].mlp.gate_proj.base.weight.grad is not None
 assert base.model.layers[7].mlp.gate_proj.lora_B.weight.grad is not None
 assert loop.engram.project.weight.grad is not None
+assert '7' in loop.backbone_engrams
+assert loop.backbone_engrams['7'].project.weight.grad is not None
+
+# Verify Tier-1 (N-gram), Tier-2 (Shared Expert), and Tier-3 (MoE Routed Experts) gradients once project.weight is non-zero
+nn.init.normal_(loop.engram.project.weight, std=0.01)
+nn.init.normal_(loop.backbone_engrams['7'].project.weight, std=0.01)
+loop.zero_grad(set_to_none=True)
+result2 = loop(ids, labels=label)
+result2['loss'].backward()
+assert loop.engram.emb.weight.grad is not None
+assert loop.engram.shared_down.weight.grad is not None
+assert loop.engram.router.weight.grad is not None
+assert loop.engram.expert_down.grad is not None
+assert loop.engram.expert_up.grad is not None
+assert loop.backbone_engrams['7'].expert_up.grad is not None
 
 # Verify full_finetune=True unfreezes all layers
 all_params = set_trainables(loop, full_finetune=True)
 assert base.model.layers[0].mlp.gate_proj.weight.requires_grad
 assert base.model.layers[7].mlp.gate_proj.base.weight.requires_grad
-print('PASS cpu: Dual-mHC, pass adapters, multi-scale Engram, chunked CE, _VisitCache, full/hybrid train', count_params(loop))
+print('PASS cpu: Dual-mHC, pass adapters, Backbone Tiered MoE-Engram, chunked CE, _VisitCache, full/hybrid train', count_params(loop))
