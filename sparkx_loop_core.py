@@ -657,6 +657,9 @@ class SparkXLoop(nn.Module):
     def total_virtual_layers(self) -> int:
         return len(self.execution_plan)
 
+    def effective_depth(self) -> int:
+        return len(self.execution_plan)
+
     def _make_loop_cache_config(self):
         cfg = copy.deepcopy(self.base.config)
         plan = self.execution_plan
