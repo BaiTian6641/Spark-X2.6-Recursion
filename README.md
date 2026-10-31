@@ -53,6 +53,7 @@ Inspired by **DeepSeek Engram ("Conditional Memory via Scalable Lookup")**, **De
 | [`setup_g4_env.sh`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/setup_g4_env.sh) | Automated environment bootstrapper for Colab G4 (`unsloth`, `unsloth_zoo`, `bitsandbytes`, `cut-cross-entropy`, `transformers==4.57.1`, `datasets`, `accelerate`, `peft`, `openai`, `zstandard`). |
 | [`requirements.txt`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/requirements.txt) | Python dependencies for full finetuning and inference. |
 | [`START_HERE.md`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/START_HERE.md) | Quick-start guide for running the 23-hour Colab G4 full finetune. |
+| [`REFERENCES.md`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/REFERENCES.md) | Complete academic citations, BibTeX entries, base model attributions, and 26 Hugging Face dataset references. |
 
 ---
 

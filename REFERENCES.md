@@ -1,0 +1,257 @@
+# References & Citations (`Spark-X2.6-Recursion` / `SparkX-Loop v0.2`)
+
+This document provides complete academic citations, upstream model attributions, and dataset references for the **`Spark-X2.6-Recursion`** (`SparkX-Loop v0.2`) architecture and full-finetuning pipeline implemented in [`sparkx_loop_core.py`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_loop_core.py) and [`SparkX_Loop_v02_OneShot_Colab.ipynb`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/SparkX_Loop_v02_OneShot_Colab.ipynb).
+
+---
+
+## 1. Core Architectural Research Papers
+
+### 1.1 Manifold-Constrained Hyper-Connections (mHC) & Multi-Stream Residuals
+Used in [`TwoStreamMHC`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_loop_core.py#L323-L485) for sublayer Dual-mHC (`mhc_attn` + `mhc_ffn`), token-dependent FP32 RMSNorm routing, and Sinkhorn-Knopp projection onto the Birkhoff polytope of doubly-stochastic matrices:
+
+1. **Manifold-Constrained Hyper-Connections (mHC)**
+   - **Authors:** Zhenda Xie, Yixuan Wei, Huanqi Cao, Chenggang Zhao, Chengqi Deng, Jiashi Li, Damai Dai, Huazuo Gao, Jiang Chang, Liang Zhao, Shangyan Zhou, Zhean Xu, Zhengyan Zhang, Wangding Zeng, Shengding Hu, Yuqing Wang, Jingyang Yuan, Lean Wang, Wenfeng Liang (*DeepSeek-AI*)
+   - **Preprint:** [arXiv:2512.24880](https://arxiv.org/abs/2512.24880) (2025)
+2. **Hyper-Connections (HC)**
+   - **Authors:** Defa Zhu, Hongzhi Huang, Zihao Huang, Yutao Zeng, Yunyao Mao, Banggu Wu, Qiyang Min, Xun Zhou (*ByteDance Seed*)
+   - **Preprint:** [arXiv:2409.19606](https://arxiv.org/abs/2409.19606) (ICLR 2025)
+
+```bibtex
+@article{xie2025mhc,
+  title={Manifold-Constrained Hyper-Connections},
+  author={Xie, Zhenda and Wei, Yixuan and Cao, Huanqi and Zhao, Chenggang and Deng, Chengqi and Li, Jiashi and Dai, Damai and Gao, Huazuo and Chang, Jiang and Zhao, Liang and Zhou, Shangyan and Xu, Zhean and Zhang, Zhengyan and Zeng, Wangding and Hu, Shengding and Wang, Yuqing and Yuan, Jingyang and Wang, Lean and Liang, Wenfeng},
+  journal={arXiv preprint arXiv:2512.24880},
+  year={2025},
+  url={https://arxiv.org/abs/2512.24880}
+}
+
+@inproceedings{zhu2025hyperconnections,
+  title={Hyper-Connections},
+  author={Zhu, Defa and Huang, Hongzhi and Huang, Zihao and Zeng, Yutao and Mao, Yunyao and Wu, Banggu and Min, Qiyang and Zhou, Xun},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2025},
+  url={https://arxiv.org/abs/2409.19606}
+}
+```
+
+---
+
+### 1.2 Conditional Memory (Engram) & Memory-Tiered MoE Routing
+Used in [`HashedBigramEngram` / `TieredMoEEngram`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_loop_core.py#L201-L320) and [`SparkXLoop`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_loop_core.py#L604-L625) to implement the 3-tier backbone memory architecture (Tier 1: $O(1)$ Multi-Head Causal N-Gram Lookup; Tier 2: Hot Shared Expert; Tier 3: Sparse Top-$K$ PEER/UltraMemV2 Routed Memory Experts with Auxiliary-Loss-Free Load Balancing and Context-Aware Gating):
+
+1. **Engram: Conditional Memory via Scalable Lookup**
+   - **Authors:** Xin Cheng, Rui Tian, Wangding Zeng, Damai Dai, Qinyu Chen, Bingxuan Wang, Zhenda Xie, Kezhao Huang, Xingkai Yu, Chengqi Deng, Shangyan Zhou, Chenggang Zhao, Zhewen Hao, Yukun Li, Han Zhang, Zhengyan Zhang, Yixu Wei, M. Y. Xu, Huishuai Zhang, Dongyan Zhao, Wenfeng Liang (*DeepSeek-AI & Peking University*)
+   - **Preprint:** [arXiv:2601.07372](https://arxiv.org/abs/2601.07372) (2026)
+2. **PEER: Mixture of a Million Experts (Parameter Efficient Expert Retrieval)**
+   - **Author:** Xu Owen He (*Google DeepMind*)
+   - **Preprint:** [arXiv:2407.04153](https://arxiv.org/abs/2407.04153) (2024)
+3. **UltraMem & UltraMemV2: Ultra-Sparse Memory Networks**
+   - **Authors:** Zihao Huang, Qiyang Min, Hongzhi Huang, Defa Zhu, Yutao Zeng, Ran Guo, Xun Zhou (*ByteDance Seed*)
+   - **Preprints:** [arXiv:2411.12364](https://arxiv.org/abs/2411.12364) (2024) and [arXiv:2508.18756](https://arxiv.org/abs/2508.18756) (2025)
+4. **DeepSeekMoE & Auxiliary-Loss-Free Load Balancing**
+   - **Authors:** Damai Dai et al. (*DeepSeek-AI*), [arXiv:2401.06066](https://arxiv.org/abs/2401.06066) (2024); Lean Wang et al. (*DeepSeek-AI*), [arXiv:2408.15664](https://arxiv.org/abs/2408.15664) (2024)
+
+```bibtex
+@article{cheng2026engram,
+  title={Conditional Memory via Scalable Lookup: A New Axis of Sparsity for Large Language Models},
+  author={Cheng, Xin and Tian, Rui and Zeng, Wangding and Dai, Damai and Chen, Qinyu and Wang, Bingxuan and Xie, Zhenda and Huang, Kezhao and Yu, Xingkai and Deng, Chengqi and Zhou, Shangyan and Zhao, Chenggang and Hao, Zhewen and Li, Yukun and Zhang, Han and Zhang, Zhengyan and Wei, Yixu and Xu, M. Y. and Zhang, Huishuai and Zhao, Dongyan and Liang, Wenfeng},
+  journal={arXiv preprint arXiv:2601.07372},
+  year={2026},
+  url={https://arxiv.org/abs/2601.07372}
+}
+
+@article{he2024peer,
+  title={Mixture of a Million Experts},
+  author={He, Xu Owen},
+  journal={arXiv preprint arXiv:2407.04153},
+  year={2024},
+  url={https://arxiv.org/abs/2407.04153}
+}
+
+@article{huang2024ultramem,
+  title={Ultra-Sparse Memory Network},
+  author={Huang, Zihao and Min, Qiyang and Huang, Hongzhi and Zhu, Defa and Zeng, Yutao and Guo, Ran and Zhou, Xun},
+  journal={arXiv preprint arXiv:2411.12364},
+  year={2024},
+  url={https://arxiv.org/abs/2411.12364}
+}
+
+@article{huang2025ultramemv2,
+  title={UltraMemV2: Memory Networks Scaling to 120B Parameters with Superior Long-Context Learning},
+  author={Huang, Zihao and Min, Qiyang and Huang, Hongzhi and Zhu, Defa and Zeng, Yutao and Guo, Ran and Zhou, Xun},
+  journal={arXiv preprint arXiv:2508.18756},
+  year={2025},
+  url={https://arxiv.org/abs/2508.18756}
+}
+
+@article{dai2024deepseekmoe,
+  title={DeepSeekMoE: Towards Ultimate Expert Specialization in Mixture-of-Experts Language Models},
+  author={Dai, Damai and Deng, Chengqi and Zhao, Chenggang and Xu, R. X. and Gao, Huazuo and Chen, Deli and Li, Jiashi and Zeng, Wangding and Yu, Xingkai and Wu, Y. and others},
+  journal={arXiv preprint arXiv:2401.06066},
+  year={2024},
+  url={https://arxiv.org/abs/2401.06066}
+}
+
+@article{wang2024auxlossfree,
+  title={Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-Experts},
+  author={Wang, Lean and Gao, Huazuo and Zhao, Chenggang and Sun, Xu and Dai, Damai},
+  journal={arXiv preprint arXiv:2408.15664},
+  year={2024},
+  url={https://arxiv.org/abs/2408.15664}
+}
+```
+
+---
+
+### 1.3 Looped Recursive Transformers & Latent Depth Recurrence
+Used in [`SparkXLoop`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_loop_core.py#L556-L830) and [`_VisitCache`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_loop_core.py#L66-L85) for progressive Prelude/Recurrent-Core/Coda depth expansion (`warmup -> R8 -> R12 -> R24`, 36 physical -> 60 effective layers) and per-visit KV-cached looped decoding:
+
+1. **Reasoning with Latent Thoughts: On the Power of Looped Transformers**
+   - **Authors:** Nikunj Saunshi, Nishanth Dikkala, Zhiyuan Li, Sanjiv Kumar, Sashank J. Reddi (*Google Research*)
+   - **Preprint:** [arXiv:2502.17416](https://arxiv.org/abs/2502.17416) (2025)
+2. **Scaling up Test-Time Compute with Latent Reasoning: A Recurrent Depth Approach**
+   - **Authors:** Jonas Geiping, Sean McLeish, Neel Jain, John Kirchenbauer, Siddharth Singh, Brian R. Bartoldson, Bhavya Kailkhura, Abhinav Bhatele, Tom Goldstein
+   - **Preprint:** [arXiv:2502.05171](https://arxiv.org/abs/2502.05171) (2025)
+3. **Looped Transformers as Programmable Computers**
+   - **Authors:** Angeliki Giannou, Shashank Rajput, Jy-yong Sohn, Kangwook Lee, Jason D. Lee, Dimitris Papailiopoulos
+   - **Preprint:** [arXiv:2301.13196](https://arxiv.org/abs/2301.13196) (ICML 2023)
+4. **SenseNova-Loop-9B-Preview**
+   - **Authors:** SenseTime Research
+   - **Model Repository:** [https://huggingface.co/sensenova/SenseNova-Loop-9B-Preview](https://huggingface.co/sensenova/SenseNova-Loop-9B-Preview) (2026)
+
+```bibtex
+@article{saunshi2025looped,
+  title={Reasoning with Latent Thoughts: On the Power of Looped Transformers},
+  author={Saunshi, Nikunj and Dikkala, Nishanth and Li, Zhiyuan and Kumar, Sanjiv and Reddi, Sashank J.},
+  journal={arXiv preprint arXiv:2502.17416},
+  year={2025},
+  url={https://arxiv.org/abs/2502.17416}
+}
+
+@article{geiping2025recurrent,
+  title={Scaling up Test-Time Compute with Latent Reasoning: A Recurrent Depth Approach},
+  author={Geiping, Jonas and McLeish, Sean and Jain, Neel and Kirchenbauer, John and Singh, Siddharth and Bartoldson, Brian R. and Kailkhura, Bhavya and Bhatele, Abhinav and Goldstein, Tom},
+  journal={arXiv preprint arXiv:2502.05171},
+  year={2025},
+  url={https://arxiv.org/abs/2502.05171}
+}
+
+@inproceedings{giannou2023looped,
+  title={Looped Transformers as Programmable Computers},
+  author={Giannou, Angeliki and Rajput, Shashank and Sohn, Jy-yong and Lee, Kangwook and Lee, Jason D. and Papailiopoulos, Dimitris},
+  booktitle={International Conference on Machine Learning (ICML)},
+  year={2023},
+  url={https://arxiv.org/abs/2301.13196}
+}
+```
+
+---
+
+### 1.4 Long-Context Attention (NoPE + Sliding Window), Chunked CE & Memory-Efficient Training
+Used in [`patch_spark_attention_for_long_context`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_loop_core.py#L92-L162), [`fused_masked_cross_entropy`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_loop_core.py#L488-L522), and [`build_optimizer`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_loop_core.py#L868-L884):
+
+1. **Base Model: `XHToken/Spark-X2.6-4B`**
+   - **Repository:** [https://huggingface.co/XHToken/Spark-X2.6-4B](https://huggingface.co/XHToken/Spark-X2.6-4B) (`3 × sliding_attention w=512 RoPE + 1 × full_attention NoPE` per 4-layer macro-block, 1M token context support)
+2. **Cut Your Losses in Large-Vocabulary Language Models (Cut Cross-Entropy)**
+   - **Authors:** Erik Wijmans, Brody Huval, Alexander Hertzberg, Vladlen Koltun, Philipp Krähenbühl (*Apple*)
+   - **Preprint:** [arXiv:2411.09009](https://arxiv.org/abs/2411.09009) (2024)
+3. **FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning**
+   - **Author:** Tri Dao
+   - **Preprint:** [arXiv:2307.08691](https://arxiv.org/abs/2307.08691) (2023)
+4. **8-bit Optimizers via Block-wise Quantization (`PagedAdamW8bit`)**
+   - **Authors:** Tim Dettmers, Mike Lewis, Sam Shleifer, Luke Zettlemoyer
+   - **Preprint:** [arXiv:2110.02861](https://arxiv.org/abs/2110.02861) (ICLR 2022)
+5. **Unsloth Studio**
+   - **Authors:** Daniel Han, Michael Han, and Unsloth AI Team
+   - **Repository:** [https://github.com/unslothai/unsloth](https://github.com/unslothai/unsloth)
+
+---
+
+## 2. Curated Training & Evaluation Datasets (26 Hugging Face Sources)
+
+### 2.1 Scientific Reasoning & PhD/University STEM Chain-of-Thought
+| Dataset ID | Partition / Split | Description & Citation |
+| :--- | :--- | :--- |
+| [`nvidia/OpenScienceReasoning-2`](https://huggingface.co/datasets/nvidia/OpenScienceReasoning-2) | `default / train` | Multi-domain synthetic & verified scientific reasoning corpus with `<think>...</think>` traces and `\boxed{}` solutions across biology, chemistry, physics, and immunology. |
+| [`Jackrong/Kimi-K2.5-Reasoning-1M-Cleaned`](https://huggingface.co/datasets/Jackrong/Kimi-K2.5-Reasoning-1M-Cleaned) | `PHD-Science / train` | Cleaned PhD-level scientific research trajectories with structured `<think>...</think>` reasoning distilled from Kimi-K2.5. |
+| [`MegaScience/MegaScience`](https://huggingface.co/datasets/MegaScience/MegaScience) | `default / train` | Large-scale (1.25M) open scientific reasoning post-training mixture (*Fan et al., 2025*, [arXiv:2507.16812](https://arxiv.org/abs/2507.16812)). |
+| [`MegaScience/TextbookReasoning`](https://huggingface.co/datasets/MegaScience/TextbookReasoning) | `default / train` | University-level textbook questions, derivations, and reference answers across medicine, physics, chemistry, and biology (*Fan et al., 2025*, [arXiv:2507.16812](https://arxiv.org/abs/2507.16812)). |
+| [`OpenDataArena/Spark-234K`](https://huggingface.co/datasets/OpenDataArena/Spark-234K) | `default / train` | Graduate-level physics, chemistry, and quantitative STEM derivations curated by OpenDataArena. |
+| [`HuggingFaceTB/smoltalk2`](https://huggingface.co/datasets/HuggingFaceTB/smoltalk2) | `Mid / OpenThoughts3_1.2M` | Curated STEM, science, and algorithmic reasoning subset from SmolTalk2 / OpenThoughts3 (*Guha et al., 2025*). |
+
+```bibtex
+@article{fan2025megascience,
+  title={MegaScience: Pushing the Frontiers of Post-Training Datasets for Science Reasoning},
+  author={Fan, Run-Ze and Wang, Zengzhi and Liu, Pengfei},
+  journal={arXiv preprint arXiv:2507.16812},
+  year={2025},
+  url={https://arxiv.org/abs/2507.16812}
+}
+
+@misc{nvidia2025opensciencereasoning2,
+  title={OpenScienceReasoning-2 Dataset},
+  author={{NVIDIA}},
+  year={2025},
+  howpublished={\url{https://huggingface.co/datasets/nvidia/OpenScienceReasoning-2}}
+}
+```
+
+---
+
+### 2.2 High-Quality Multi-Turn Conversation & Instruction Following
+| Dataset ID | Partition / Split | Description & Citation |
+| :--- | :--- | :--- |
+| [`nvidia/Nemotron-Instruction-Following-Chat-v1`](https://huggingface.co/datasets/nvidia/Nemotron-Instruction-Following-Chat-v1) | `default / chat_if` | Multi-turn conversational and instruction-following dataset developed for NVIDIA Nemotron post-training. |
+| [`NousResearch/Hermes-3-Dataset`](https://huggingface.co/datasets/NousResearch/Hermes-3-Dataset) | `default / train` | High-quality multi-turn system-prompted assistant dialogues (*Teknium et al., 2024*, [arXiv:2408.11857](https://arxiv.org/abs/2408.11857)). |
+| [`HuggingFaceH4/ultrachat_200k`](https://huggingface.co/datasets/HuggingFaceH4/ultrachat_200k) | `default / train_sft` | Filtered 200k multi-turn dialogue corpus derived from UltraChat (*Ding et al., 2023*, [arXiv:2305.14233](https://arxiv.org/abs/2305.14233); *Tunstall et al., 2023*, [arXiv:2310.16944](https://arxiv.org/abs/2310.16944)). |
+| [`DataCreatorAI/Multi-Turn-Conversational-SFT`](https://huggingface.co/datasets/DataCreatorAI/Multi-Turn-Conversational-SFT) | `default / train` | Reviewed multi-turn conversational SFT corpus in OpenAI `messages` format across technical and everyday domains. |
+
+```bibtex
+@article{teknium2024hermes3,
+  title={Hermes 3 Technical Report},
+  author={Teknium, Ryan and Quesnelle, Jeffrey and Guang, Chen},
+  journal={arXiv preprint arXiv:2408.11857},
+  year={2024},
+  url={https://arxiv.org/abs/2408.11857}
+}
+
+@article{ding2023ultrachat,
+  title={Enhancing Chat Language Models by Scaling High-quality Instructional Conversations},
+  author={Ding, Ning and Chen, Yulin and Xu, Bokai and Qin, Yujia and Zheng, Zhi and Hu, Shengding and Liu, Zhiyuan and Sun, Maosong and Zhou, Bowen},
+  journal={arXiv preprint arXiv:2305.14233},
+  year={2023},
+  url={https://arxiv.org/abs/2305.14233}
+}
+```
+
+---
+
+### 2.3 Claude Fable, Claude Opus & GPT Astra / GPT-5 / GPT-6 Reasoning Traces
+| Family | Dataset ID | Description |
+| :--- | :--- | :--- |
+| **Claude Fable** | [`kelexine/fable-5-sft-traces`](https://huggingface.co/datasets/kelexine/fable-5-sft-traces) | Multi-turn SFT & explicit `reasoning_content` CoT traces. |
+| **Claude Fable** | [`HelioAI/Claude-Fable-5-5500x`](https://huggingface.co/datasets/HelioAI/Claude-Fable-5-5500x) | 5,500 long-form analytical `<think>...</think>` reasoning traces. |
+| **Claude Fable** | [`MoreThought/Fable-5.1-Max-Reasoning-Filtered-10000x`](https://huggingface.co/datasets/MoreThought/Fable-5.1-Max-Reasoning-Filtered-10000x) | 10,000 filtered high-effort reasoning traces. |
+| **Claude Fable** | [`saidutta69/fable-5-premium-v2`](https://huggingface.co/datasets/saidutta69/fable-5-premium-v2) | Curated `openai_chat/train.parquet` reasoning & chat split. |
+| **Claude Fable** | [`armand0e/Fable-5-Chat`](https://huggingface.co/datasets/armand0e/Fable-5-Chat) | Conversational instruction-following dialogues. |
+| **Claude Opus** | [`Roman1111111/claude-opus-4.6-10000x`](https://huggingface.co/datasets/Roman1111111/claude-opus-4.6-10000x) | 10,000 Opus 4.6 `<think>...</think>` reasoning traces. |
+| **Claude Opus** | [`TeichAI/lordx64-claude-opus-4.7-max-cleaned`](https://huggingface.co/datasets/TeichAI/lordx64-claude-opus-4.7-max-cleaned) | Cleaned Opus 4.7 max-effort reasoning traces. |
+| **Claude Opus** | [`angrygiraffe/claude-opus-4.6-4.7-reasoning-8.7k`](https://huggingface.co/datasets/angrygiraffe/claude-opus-4.6-4.7-reasoning-8.7k) | 8,700 combined Opus 4.6/4.7 reasoning traces. |
+| **Claude Opus** | [`ronaldcmz/claude_opus_4.8_max_thinking_5k_v2`](https://huggingface.co/datasets/ronaldcmz/claude_opus_4.8_max_thinking_5k_v2) | 5,000 Opus 4.8 max-thinking traces. |
+| **Claude Opus** | [`TeichAI/Claude-Opus-4.6-Reasoning-887x`](https://huggingface.co/datasets/TeichAI/Claude-Opus-4.6-Reasoning-887x) | Curated high-density Opus 4.6 reasoning traces. |
+| **GPT Astra / 6** | [`FlaneAI/GPT-6Astra-scientific-research`](https://huggingface.co/datasets/FlaneAI/GPT-6Astra-scientific-research) | Scientific research trajectories (`step_by_step_trace` + `final_solution`). |
+| **GPT-5 Series** | [`Roman1111111/gpt-5.4-step-by-step-reasoning`](https://huggingface.co/datasets/Roman1111111/gpt-5.4-step-by-step-reasoning) | Step-by-step analytical derivations. |
+| **GPT-5 Series** | [`vanty120/Gpt-5.4-Xhigh-Reasoning-2000x`](https://huggingface.co/datasets/vanty120/Gpt-5.4-Xhigh-Reasoning-2000x) | 2,000 `xhigh`-effort `<think>...</think>` reasoning traces. |
+| **GPT-5 Series** | [`TeichAI/gpt-5.1-high-reasoning-1000x`](https://huggingface.co/datasets/TeichAI/gpt-5.1-high-reasoning-1000x) | 1,000 high-effort reasoning traces. |
+| **GPT-5.5** | [`Manusagents/GPT-5.5-Gemini-3.1-Pro-Grok-4-Claude-Fable-5-Mythos-5-Qwen-3.7-Max-and-more-Distillation-Dataset`](https://huggingface.co/datasets/Manusagents/GPT-5.5-Gemini-3.1-Pro-Grok-4-Claude-Fable-5-Mythos-5-Qwen-3.7-Max-and-more-Distillation-Dataset) | `data/distilled/gpt55_thinking/shard-00000.jsonl` reasoning shard. |
+| **Math Benchmark** | [`openai/gsm8k`](https://huggingface.co/datasets/openai/gsm8k) | Grade School Math 8K step-by-step verification (*Cobbe et al., 2021*, [arXiv:2110.14168](https://arxiv.org/abs/2110.14168)). |
+
+```bibtex
+@article{cobbe2021gsm8k,
+  title={Training Verifiers to Solve Math Word Problems},
+  author={Cobbe, Karl and Kosaraju, Vineet and Bavarian, Mohammad and Chen, Mark and Jun, Heewoo and Kaiser, Lukasz and Plappert, Matthias and Tworek, Jerry and Hilton, Jacob and Nakano, Reiichiro and Hesse, Christopher and Schulman, John},
+  journal={arXiv preprint arXiv:2110.14168},
+  year={2021},
+  url={https://arxiv.org/abs/2110.14168}
+}
+```
