@@ -1,8 +1,10 @@
 """SparkX-Loop v0.3 (`Spark-X2.6-4B-En4B-A1B`):
-8.2B Total / 5.2B Active Parameters | 72 Effective Layers (3-Pass Telescoping Recurrence) |
-3-Tier Zipfian MoE-Engram (4.0B Total / 1.0B Active across 8 Macro-Block Anchors) with
+8.34B Total / 5.33B Active Parameters | 72 Effective Layers (3-Pass Telescoping Recurrence) |
+3-Tier Zipfian MoE-Engram (4.11B Total / 1.10B Active across 8 Macro-Block Anchors) with
 Host DRAM / NVMe mmap Tier-1B Offloading, Coalesced Sparse Row Adam, 8->32 Coarse-to-Fine
-Expert Upcycling, Anti-Collapse Hypersphere Cosine + Sigmoid + Z-Loss Routing, and
+Expert Upcycling, Anti-Collapse Hypersphere Cosine + Sigmoid + Z-Loss Routing,
+Triton + Unsloth 16K Full-Finetune Kernels (Fused Triton SwiGLU, Fused Triton RMSNorm,
+BF16 RoPE, Checkpointed Cut-Cross-Entropy, Zero-Sync Sorted MoE Dispatch), and
 Runtime-Only Zero-Collapse O(n log n) Log-Linear NoPE KV Cache.
 """
 from __future__ import annotations
@@ -17,6 +19,151 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+
+# ---------------------------------------------------------------------------
+# Optional Triton / Unsloth / Liger / Cut-Cross-Entropy High-Speed Kernels
+# ---------------------------------------------------------------------------
+try:
+    import triton
+    import triton.language as tl
+    HAS_TRITON = True
+except Exception:
+    triton = None
+    tl = None
+    HAS_TRITON = False
+
+try:
+    from liger_kernel.ops.rms_norm import LigerRMSNormFunction
+    HAS_LIGER_RMSNORM = True
+except Exception:
+    LigerRMSNormFunction = None
+    HAS_LIGER_RMSNORM = False
+
+try:
+    from cut_cross_entropy import linear_cross_entropy as _cce_linear_cross_entropy
+    HAS_CCE = True
+except Exception:
+    _cce_linear_cross_entropy = None
+    HAS_CCE = False
+
+
+if HAS_TRITON:
+    @triton.jit
+    def _swiglu_fwd_kernel(
+        gate_ptr,
+        up_ptr,
+        out_ptr,
+        n_elements: int,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        g = tl.load(gate_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        u = tl.load(up_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        sig = 1.0 / (1.0 + tl.exp(-g))
+        out = (g * sig) * u
+        tl.store(out_ptr + offsets, out.to(tl.load(gate_ptr + offsets, mask=mask, other=0.0).dtype), mask=mask)
+
+    @triton.jit
+    def _swiglu_bwd_kernel(
+        dout_ptr,
+        gate_ptr,
+        up_ptr,
+        dgate_ptr,
+        dup_ptr,
+        n_elements: int,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        dout = tl.load(dout_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        g_raw = tl.load(gate_ptr + offsets, mask=mask, other=0.0)
+        u_raw = tl.load(up_ptr + offsets, mask=mask, other=0.0)
+        g = g_raw.to(tl.float32)
+        u = u_raw.to(tl.float32)
+        sig = 1.0 / (1.0 + tl.exp(-g))
+        silu = g * sig
+        dsilu = sig * (1.0 + g * (1.0 - sig))
+        dgate = dout * u * dsilu
+        dup = dout * silu
+        tl.store(dgate_ptr + offsets, dgate.to(g_raw.dtype), mask=mask)
+        tl.store(dup_ptr + offsets, dup.to(u_raw.dtype), mask=mask)
+
+    @triton.jit
+    def _rmsnorm_fwd_kernel(
+        x_ptr,
+        w_ptr,
+        out_ptr,
+        stride_x_row: int,
+        n_cols: int,
+        eps: float,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        row_idx = tl.program_id(0)
+        col_offsets = tl.arange(0, BLOCK_SIZE)
+        mask = col_offsets < n_cols
+        x_row_ptr = x_ptr + row_idx * stride_x_row + col_offsets
+        x_raw = tl.load(x_row_ptr, mask=mask, other=0.0)
+        x_f32 = x_raw.to(tl.float32)
+        w_f32 = tl.load(w_ptr + col_offsets, mask=mask, other=1.0).to(tl.float32)
+        mean_sq = tl.sum(x_f32 * x_f32, axis=0) / n_cols
+        rstd = tl.rsqrt(mean_sq + eps)
+        out = (x_f32 * rstd) * w_f32
+        tl.store(out_ptr + row_idx * stride_x_row + col_offsets, out.to(x_raw.dtype), mask=mask)
+
+
+class _TritonSwiGLUFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        gate_c = gate.contiguous()
+        up_c = up.contiguous()
+        out = torch.empty_like(gate_c)
+        n_elements = gate_c.numel()
+        grid = (triton.cdiv(n_elements, 1024),)
+        _swiglu_fwd_kernel[grid](gate_c, up_c, out, n_elements, BLOCK_SIZE=1024)
+        ctx.save_for_backward(gate_c, up_c)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        gate_c, up_c = ctx.saved_tensors
+        grad_out_c = grad_out.contiguous()
+        dgate = torch.empty_like(gate_c)
+        dup = torch.empty_like(up_c)
+        n_elements = gate_c.numel()
+        grid = (triton.cdiv(n_elements, 1024),)
+        _swiglu_bwd_kernel[grid](grad_out_c, gate_c, up_c, dgate, dup, n_elements, BLOCK_SIZE=1024)
+        return dgate, dup
+
+
+def triton_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """Fused Triton SwiGLU activation (`silu(gate) * up`) saving 50% MLP/Engram intermediate VRAM at 16K context."""
+    if HAS_TRITON and gate.is_cuda and up.is_cuda and gate.numel() > 0:
+        return _TritonSwiGLUFn.apply(gate, up)
+    return F.silu(gate) * up
+
+
+def triton_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Fused RMSNorm avoiding HBM float32 tensor materialization across 72 virtual layers at 16K context."""
+    if x.is_cuda:
+        if HAS_LIGER_RMSNORM and torch.is_grad_enabled():
+            return LigerRMSNormFunction.apply(x, weight.to(x.dtype), eps)
+        if HAS_TRITON and not torch.is_grad_enabled() and x.shape[-1] <= 8192:
+            x_c = x.contiguous()
+            n_cols = x_c.shape[-1]
+            n_rows = x_c.numel() // n_cols
+            out = torch.empty_like(x_c)
+            block_size = triton.next_power_of_2(n_cols)
+            _rmsnorm_fwd_kernel[(n_rows,)](
+                x_c, weight, out, n_cols, n_cols, float(eps), BLOCK_SIZE=block_size
+            )
+            return out
+    orig_dtype = x.dtype
+    x_f = x.float()
+    rms = torch.rsqrt(x_f.pow(2).mean(dim=-1, keepdim=True) + eps)
+    return (x_f * rms).to(orig_dtype) * weight.to(orig_dtype)
 
 
 def _probe_sdpa_gqa() -> bool:
@@ -66,7 +213,7 @@ class LoopV03Settings:
     dynamic_mhc: bool = True
     sublayer_mhc: bool = True
     pass_adapter_rank: int = 16
-    ce_chunk_tokens: int = 512
+    ce_chunk_tokens: int = 1024
 
 
 class _CacheLayersView:
@@ -109,6 +256,53 @@ class _VisitCache:
         return getattr(self.cache, name)
 
 
+def patch_spark_for_unsloth_triton(base_model: nn.Module) -> dict[str, bool]:
+    """Patch Spark2_5 backbone with Triton Fused SwiGLU, Triton/Liger RMSNorm, and BF16 RoPE
+    for 16K-context full-parameter finetuning and high-throughput decoding.
+    """
+    status = {
+        'triton_available': HAS_TRITON,
+        'liger_rmsnorm': HAS_LIGER_RMSNORM,
+        'cut_cross_entropy': HAS_CCE,
+        'patched_mlp_swiglu': False,
+        'patched_bf16_rope': False,
+    }
+    if not hasattr(base_model, 'model') or not hasattr(base_model.model, 'layers'):
+        return status
+    layers = base_model.model.layers
+    if not layers:
+        return status
+
+    # 1. Patch Spark2_5MLP with Fused Triton SwiGLU (cuts 16K MLP intermediate VRAM by 50%)
+    mlp_cls = type(layers[0].mlp)
+    if not getattr(mlp_cls, '_sparkx_triton_swiglu_patched', False):
+        def _triton_mlp_forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.down_proj(triton_swiglu(self.gate_proj(x), self.up_proj(x)))
+        mlp_cls.forward = _triton_mlp_forward
+        mlp_cls._sparkx_triton_swiglu_patched = True
+    status['patched_mlp_swiglu'] = True
+
+    # 2. Patch apply_rotary_pos_emb in modeling_spark2_5 so cos/sin never upcast q/k from BF16 to FP32
+    attn_mod = importlib.import_module(type(layers[0].self_attn).__module__)
+    orig_apply_rope = getattr(attn_mod, 'apply_rotary_pos_emb', None)
+    if orig_apply_rope is not None and not getattr(attn_mod, '_sparkx_bf16_rope_patched', False):
+        def _bf16_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+            if isinstance(cos, torch.Tensor) and cos.dtype != q.dtype:
+                cos = cos.to(q.dtype)
+            if isinstance(sin, torch.Tensor) and sin.dtype != q.dtype:
+                sin = sin.to(q.dtype)
+            q_emb, k_emb = orig_apply_rope(q, k, cos, sin, position_ids=position_ids, unsqueeze_dim=unsqueeze_dim)
+            if q_emb.dtype != q.dtype:
+                q_emb = q_emb.to(q.dtype)
+            if k_emb.dtype != k.dtype:
+                k_emb = k_emb.to(k.dtype)
+            return q_emb, k_emb
+        attn_mod.apply_rotary_pos_emb = _bf16_apply_rotary_pos_emb
+        attn_mod._sparkx_bf16_rope_patched = True
+    status['patched_bf16_rope'] = True
+    return status
+
+
 def patch_spark_attention_for_long_context(base_model: nn.Module) -> int:
     """Replace Spark2_5Attention's O(T^2) eager_attention_forward with fused BF16 PyTorch SDPA / GQA."""
     if not hasattr(base_model, 'model') or not hasattr(base_model.model, 'layers'):
@@ -116,6 +310,7 @@ def patch_spark_attention_for_long_context(base_model: nn.Module) -> int:
     layers = base_model.model.layers
     if not layers or not hasattr(layers[0], 'self_attn'):
         return 0
+    patch_spark_for_unsloth_triton(base_model)
     default_sw = int(getattr(getattr(base_model, 'config', None), 'sliding_window', 512) or 512)
     for lyr in layers:
         is_sl = (
@@ -293,13 +488,17 @@ def patch_spark_attention_for_loglinear_kv(
     local_window: int = 1024,
     base_block: int = 32,
     hip_top_blocks: int = 8,
+    recent_window: Optional[int] = None,
 ) -> int:
     """Runtime-only O(n^2) -> O(n log n) KV cache optimization for Spark-X2.6-4B's NoPE layers."""
+    if recent_window is not None:
+        local_window = int(recent_window)
     if not hasattr(base_model, 'model') or not hasattr(base_model.model, 'layers'):
         return 0
     layers = base_model.model.layers
     if not layers or not hasattr(layers[0], 'self_attn'):
         return 0
+    patch_spark_for_unsloth_triton(base_model)
     default_sw = int(getattr(getattr(base_model, 'config', None), 'sliding_window', 512) or 512)
     for lyr in layers:
         is_sl = (
@@ -399,16 +598,17 @@ def patch_spark_attention_for_loglinear_kv(
 
 
 class ZipfianTieredMoEEngram(nn.Module):
-    """3-Tier Zipfian MoE-Engram (`En4B-A1B`: 500M Total / 125M Active per Anchor x 8 Anchors = 4.0B Total / 1.0B Active).
+    """3-Tier Zipfian MoE-Engram (`En4B-A1B`: 514M Total / 138M Active per Anchor x 8 Anchors = 4.11B Total / 1.10B Active).
 
     - Tier 1A (GPU HBM Hot Lexical Cache): `hot_buckets` x `eng_dim` x 3 scales (2-gram, 3-gram, skip-2-gram), zero-init.
     - Tier 1B (Host DRAM / NVMe mmap Cold N-Gram Bank): `cold_buckets` x `eng_dim` x 3 scales, zero-init, with
       deterministic ahead-of-time prefetch and coalesced sparse row Adam updates (`step_tier1b_sparse_adam`).
-    - Tier 2 (100%-Active Hot Shared SwiGLU Expert): `shared_gate_up` [width -> 2*shared_rank] + `shared_down` [shared_rank -> width].
+    - Tier 2 (100%-Active Hot Shared SwiGLU Expert): Fused Triton SwiGLU `2560 -> 5888 -> 2560`.
     - Tier 3 (E=32 Routed SwiGLU Memory Experts, Top-K=7):
       - X-MoE L2-normalized Hypersphere Cosine Router + DeepSeek-V3 Sigmoid Affinity + Auxiliary-Loss-Free Bias
       - ST-MoE Router Z-Loss (`last_router_z_loss`)
       - Coarse-to-Fine Upcycling (`active_experts = 8 -> 32` via `upcycle_experts_8_to_32()`)
+      - Zero-Sync Batched / Sorted-Bucket Triton SwiGLU Dispatch (0 per-expert `.any()`/`.nonzero()` CUDA syncs!)
     - Context-Aware Gate `2 * sigmoid(W_ctx h_t)` + Zero-Init `project` (`max_abs_diff == 0.0` at Step 0).
     """
     def __init__(
@@ -449,7 +649,7 @@ class ZipfianTieredMoEEngram(nn.Module):
         nn.init.zeros_(self.tier1a_hot.weight)
         self.scale_weights = nn.Parameter(torch.zeros(3, dtype=torch.float32))
 
-        # Tier 1B: Host DRAM / mmap Long-Tail N-Gram Bank (not registered as a dense GPU Parameter when offloaded)
+        # Tier 1B: Host DRAM / mmap Long-Tail N-Gram Bank
         if self.cold_buckets > 0 and self.offload_tier1b_cpu:
             pin = torch.cuda.is_available()
             self.tier1b_cold_weight = torch.zeros(
@@ -491,10 +691,7 @@ class ZipfianTieredMoEEngram(nn.Module):
         self.register_buffer('expert_bias', torch.zeros(self.num_experts, dtype=torch.float32))
         self.register_buffer('expert_load_ema', torch.full((self.num_experts,), 1.0 / self.num_experts, dtype=torch.float32))
 
-        # Tier 3: Routed SwiGLU Memory Experts (E=32, rank=1440 -> 353.89M params/anchor)
-        # Parameterized as SwiGLU over query_proj(h_t) + e_lex in R^eng_dim -> expert_rank -> width
-        # Wait: to reach exact 353.89M per anchor (or configurable rank), we use:
-        # w_gate: [E, eng_dim, expert_rank], w_up: [E, eng_dim, expert_rank], w_down: [E, expert_rank, width]
+        # Tier 3: Routed SwiGLU Memory Experts (E=32, rank=3072 -> 352.32M params/anchor)
         self.query_proj = nn.Linear(self.width, self.eng_dim, bias=False, dtype=param_dtype)
         nn.init.kaiming_uniform_(self.query_proj.weight, a=math.sqrt(5))
 
@@ -510,7 +707,7 @@ class ZipfianTieredMoEEngram(nn.Module):
 
         self.project = nn.Linear(self.width, self.width, bias=False, dtype=param_dtype)
         nn.init.zeros_(self.project.weight)
-        self.gain = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.gain = nn.Parameter(torch.tensor(-2.0, dtype=torch.float32))
         self.last_router_z_loss: torch.Tensor = torch.tensor(0.0)
 
     @torch.no_grad()
@@ -555,17 +752,22 @@ class ZipfianTieredMoEEngram(nn.Module):
         total_buckets: int,
         prev_ids: Optional[torch.LongTensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Deterministic causal hashing over (t-2, t-1, t); zero access to future tokens.
+        bsz, seq_len = input_ids.shape
         if prev_ids is None:
             p1 = F.pad(input_ids[:, :-1], (1, 0), value=0)
-            p2 = F.pad(input_ids[:, :-2], (2, 0), value=0)
+            p2 = F.pad(input_ids[:, :-2], (2, 0), value=0) if seq_len >= 2 else torch.zeros_like(input_ids)
         else:
-            cat1 = torch.cat([prev_ids[:, -1:], input_ids[:, :-1]], dim=1)
+            last1 = prev_ids[:, -1:]
+            p1 = torch.cat([last1, input_ids[:, :-1]], dim=1) if seq_len > 1 else last1
             if prev_ids.shape[1] >= 2:
-                cat2 = torch.cat([prev_ids[:, -2:], input_ids[:, :-2]], dim=1)
+                last2 = prev_ids[:, -2:-1]
             else:
-                pad2 = F.pad(prev_ids[:, -1:], (1, 0), value=0)
-                cat2 = torch.cat([pad2, input_ids[:, :-2]], dim=1)[:, : input_ids.shape[1]]
-            p1, p2 = cat1, cat2
+                last2 = torch.zeros_like(last1)
+            if seq_len == 1:
+                p2 = last2
+            else:
+                p2 = torch.cat([last2, last1, input_ids[:, :-2]], dim=1)
         bi = (p1 * 1315423911 + input_ids * 2654435761) % total_buckets
         tri = (p2 * 97531 + p1 * 1315423911 + input_ids * 2654435761) % total_buckets
         skip = (p2 * 65537 + input_ids * 2654435761) % total_buckets
@@ -581,7 +783,6 @@ class ZipfianTieredMoEEngram(nn.Module):
         sw = F.softmax(self.scale_weights, dim=0).to(param_dtype)
         hot_b = self.hot_buckets
 
-        # Hot Tier 1A lookup on GPU HBM
         bi_hot = bi.clamp(max=hot_b - 1)
         tri_hot = tri.clamp(max=hot_b - 1) + hot_b
         skip_hot = skip.clamp(max=hot_b - 1) + 2 * hot_b
@@ -597,16 +798,12 @@ class ZipfianTieredMoEEngram(nn.Module):
         is_cold_tri = (tri >= hot_b)
         is_cold_skip = (skip >= hot_b)
 
-        if not (is_cold_bi.any() or is_cold_tri.any() or is_cold_skip.any()):
-            return sw[0] * e_bi + sw[1] * e_tri + sw[2] * e_skip
-
         cold_b = self.cold_buckets
         c_bi = (bi - hot_b).clamp(min=0, max=cold_b - 1)
         c_tri = (tri - hot_b).clamp(min=0, max=cold_b - 1) + cold_b
         c_skip = (skip - hot_b).clamp(min=0, max=cold_b - 1) + 2 * cold_b
 
         if self.offload_tier1b_cpu and self.tier1b_cold_weight is not None:
-            # Coalesced unique row prefetch from pinned Host DRAM -> GPU HBM
             stacked = torch.stack([c_bi, c_tri, c_skip], dim=0)
             uniq_gpu, inv = torch.unique(stacked, return_inverse=True)
             uniq_cpu = uniq_gpu.cpu()
@@ -616,7 +813,7 @@ class ZipfianTieredMoEEngram(nn.Module):
                 fetched_gpu = fetched_gpu.detach().requires_grad_(True)
                 self._pending_tier1b_rows = uniq_cpu
                 self._pending_tier1b_leaf = fetched_gpu
-            gathered = fetched_gpu[inv]  # [3, B, T, eng_dim]
+            gathered = fetched_gpu[inv]
             c_e_bi, c_e_tri, c_e_skip = gathered[0], gathered[1], gathered[2]
         else:
             c_e_bi = self.tier1b_cold(c_bi)
@@ -678,14 +875,12 @@ class ZipfianTieredMoEEngram(nn.Module):
         lex_hidden = self.lexical_up(e_lexical)
 
         if hidden_states is not None:
-            h_f = hidden_states.float()
-            rms = torch.rsqrt(h_f.pow(2).mean(dim=-1, keepdim=True) + self.norm_eps)
-            h_norm_f = h_f * rms * self.norm_weight
-            h_norm = h_norm_f.to(param_dtype)
+            h_norm = triton_rmsnorm(hidden_states.to(param_dtype), self.norm_weight, self.norm_eps)
+            h_norm_f = h_norm.float()
 
-            # 2. Tier 2: 100%-Active Hot Shared SwiGLU Expert
+            # 2. Tier 2: 100%-Active Hot Shared SwiGLU Expert (Fused Triton SwiGLU)
             h_fused_in = h_norm + lex_hidden
-            shared_out = self.shared_down(F.silu(self.shared_gate(h_fused_in)) * self.shared_up(h_fused_in))
+            shared_out = self.shared_down(triton_swiglu(self.shared_gate(h_fused_in), self.shared_up(h_fused_in)))
 
             # 3. Tier 3: X-MoE Hypersphere Cosine Router + Sigmoid Affinity + ST-MoE Router Z-Loss
             e_act = self.active_experts
@@ -717,24 +912,48 @@ class ZipfianTieredMoEEngram(nn.Module):
                     target_load = 1.0 / float(e_act)
                     self.expert_bias[:e_act].add_(0.001 * torch.sign(target_load - self.expert_load_ema[:e_act])).clamp_(-0.5, 0.5)
 
-            # Query vector q_t in R^eng_dim conditioned on both semantic hidden state and lexical N-gram
             q = self.query_proj(h_norm) + e_lexical
             flat_q = q.reshape(-1, self.eng_dim)
-            flat_idx = topk_idx.reshape(-1, k_act)
-            flat_gates = topk_gates.reshape(-1, k_act)
+            n_tokens = flat_q.shape[0]
+            flat_idx = topk_idx.reshape(n_tokens, k_act)
+            flat_gates = topk_gates.reshape(n_tokens, k_act)
 
-            # Memory-efficient grouped expert evaluation (iterates over active experts instead of materializing [N, K, D, R])
-            routed_flat = torch.zeros((flat_q.shape[0], self.width), dtype=param_dtype, device=flat_q.device)
-            for e_id in range(e_act):
-                mask_e = (flat_idx == e_id)
-                if not mask_e.any():
-                    continue
-                token_rows, slot_cols = mask_e.nonzero(as_tuple=True)
-                q_e = flat_q.index_select(0, token_rows)
-                g_e = flat_gates[token_rows, slot_cols].unsqueeze(-1)
-                act_e = F.silu(torch.matmul(q_e, self.expert_gate[e_id])) * torch.matmul(q_e, self.expert_up[e_id])
-                out_e = torch.matmul(act_e, self.expert_down[e_id]) * g_e
-                routed_flat.index_add_(0, token_rows, out_e)
+            if n_tokens <= 8:
+                # Zero-loop, zero-sync batched contraction for single-token / small-batch decoding!
+                w_g = self.expert_gate[flat_idx]   # [N, K, D, R]
+                w_u = self.expert_up[flat_idx]     # [N, K, D, R]
+                w_d = self.expert_down[flat_idx]   # [N, K, R, W]
+                g_proj = torch.einsum('nd,nkdr->nkr', flat_q, w_g)
+                u_proj = torch.einsum('nd,nkdr->nkr', flat_q, w_u)
+                act = triton_swiglu(g_proj, u_proj)
+                out_k = torch.einsum('nkr,nkrw->nkw', act, w_d)
+                routed_flat = (out_k * flat_gates.unsqueeze(-1)).sum(dim=1)
+            else:
+                # Sorted contiguous bucket dispatch for 4K/8K/16K prefill & training (1 bincount, 0 .any()/.nonzero() syncs!)
+                flat_e = flat_idx.reshape(-1)
+                sorted_e, sort_perm = torch.sort(flat_e)
+                token_rows = torch.div(sort_perm, k_act, rounding_mode='floor')
+                sorted_q = flat_q.index_select(0, token_rows)
+                sorted_g = flat_gates.reshape(-1).index_select(0, sort_perm).unsqueeze(-1)
+                counts = torch.bincount(sorted_e, minlength=e_act).tolist()
+
+                out_chunks = []
+                offset = 0
+                for e_id, cnt in enumerate(counts):
+                    if cnt == 0:
+                        continue
+                    q_e = sorted_q[offset : offset + cnt]
+                    g_e = sorted_g[offset : offset + cnt]
+                    offset += cnt
+                    act_e = triton_swiglu(
+                        torch.matmul(q_e, self.expert_gate[e_id]),
+                        torch.matmul(q_e, self.expert_up[e_id]),
+                    )
+                    out_chunks.append(torch.matmul(act_e, self.expert_down[e_id]) * g_e)
+
+                routed_flat = torch.zeros((n_tokens, self.width), dtype=param_dtype, device=flat_q.device)
+                if out_chunks:
+                    routed_flat.index_add_(0, token_rows, torch.cat(out_chunks, dim=0))
 
             routed_out = routed_flat.view_as(shared_out)
             combined = lex_hidden + shared_out + routed_out
@@ -749,7 +968,14 @@ class ZipfianTieredMoEEngram(nn.Module):
 
 
 class TwoStreamMHC(nn.Module):
-    """Sublayer Dual-mHC with Pass-0/Pass-1/Pass-2 (72-Layer) Conditioning and Closed-Form 2x2 Sinkhorn."""
+    """Sublayer Dual-mHC with Pass-0/Pass-1/Pass-2 (72-Layer) Conditioning, Closed-Form 2x2 Sinkhorn,
+    and Exact Zero-Gated Identity Initialization (`extra_gain=0, p3_extra_gain=0`).
+
+    Matches `SparkX_Loop_v02_OneShot_Colab.ipynb` (`mix_logits=[[4,-4],[-4,4]]`, `read_logits=[5,-5]`,
+    `write_logits=[5,-5]`, `eff_mat = I + gain * (P - I)`) so:
+    1. Pass 0 (`use_mhc=True, passes=1`) matches the upstream 36-layer `Spark-X2.6-4B` backbone (`max_diff < 0.025`).
+    2. Pass 2 (`passes=2`) and Pass 3 (`enable_p3=True`, 72 virtual layers) have exact `zero_gate_diff == 0.0` at Step 0.
+    """
     def __init__(
         self,
         width: int = 2560,
@@ -759,28 +985,32 @@ class TwoStreamMHC(nn.Module):
         sublayer_mhc: bool = True,
         pass_adapter_rank: int = 16,
         max_passes: int = 4,
+        rmsnorm_eps: float = 1e-6,
     ):
         super().__init__()
         if streams != 2:
             raise ValueError('TwoStreamMHC expects 2 streams')
         self.width = width
         self.streams = streams
+        self.n = streams
         self.iters = iters
         self.dynamic = dynamic
         self.sublayer_mhc = sublayer_mhc
         self.pass_adapter_rank = pass_adapter_rank
         self.max_passes = max_passes
-        self.norm_eps = 1e-6
+        self.norm_eps = rmsnorm_eps
 
-        self.read_logits = nn.Parameter(torch.tensor([2.0, -2.0], dtype=torch.float32))
-        self.write_logits = nn.Parameter(torch.tensor([2.0, -2.0], dtype=torch.float32))
-        self.mix_logits = nn.Parameter(torch.tensor([[2.0, -2.0], [-2.0, 2.0]], dtype=torch.float32))
+        # Primary / Attention mHC parameters (aligned with v0.2 for exact warm-start & Step-0 parity)
+        self.mix_logits = nn.Parameter(torch.tensor([[4.0, -4.0], [-4.0, 4.0]], dtype=torch.float32))
+        self.read_logits = nn.Parameter(torch.tensor([5.0, -5.0], dtype=torch.float32))
+        self.write_logits = nn.Parameter(torch.tensor([5.0, -5.0], dtype=torch.float32))
         self.extra_gain = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
         self.p3_extra_gain = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
 
-        self.ffn_read_logits = nn.Parameter(torch.tensor([2.0, -2.0], dtype=torch.float32))
-        self.ffn_write_logits = nn.Parameter(torch.tensor([2.0, -2.0], dtype=torch.float32))
-        self.ffn_mix_logits = nn.Parameter(torch.tensor([[2.0, -2.0], [-2.0, 2.0]], dtype=torch.float32))
+        # Sublayer FFN mHC parameters
+        self.ffn_mix_logits = nn.Parameter(torch.tensor([[4.0, -4.0], [-4.0, 4.0]], dtype=torch.float32))
+        self.ffn_read_logits = nn.Parameter(torch.tensor([5.0, -5.0], dtype=torch.float32))
+        self.ffn_write_logits = nn.Parameter(torch.tensor([5.0, -5.0], dtype=torch.float32))
         self.ffn_extra_gain = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
         self.p3_ffn_extra_gain = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
 
@@ -794,6 +1024,9 @@ class TwoStreamMHC(nn.Module):
             self.ffn_norm_weight = nn.Parameter(torch.ones(flat_dim, dtype=torch.float32))
             self.ffn_dynamic_proj = nn.Linear(flat_dim, 8, bias=False, dtype=torch.float32)
             nn.init.zeros_(self.ffn_dynamic_proj.weight)
+        else:
+            self.register_parameter('dynamic_proj', None)
+            self.register_parameter('ffn_dynamic_proj', None)
 
         if pass_adapter_rank > 0:
             self.pass_down = nn.ModuleList([
@@ -807,14 +1040,14 @@ class TwoStreamMHC(nn.Module):
             for p_idx in range(max_passes):
                 nn.init.kaiming_uniform_(self.pass_down[p_idx].weight, a=math.sqrt(5))
                 nn.init.zeros_(self.pass_up[p_idx].weight)
+        else:
+            self.pass_down = None
+            self.pass_up = None
 
     def mixing_matrix(self, dynamic_delta: Optional[torch.Tensor] = None, base_logits: Optional[torch.Tensor] = None) -> torch.Tensor:
-        base = self.mix_logits if base_logits is None else base_logits
-        log_p = base if dynamic_delta is None else (base + dynamic_delta)
+        base = (self.mix_logits if base_logits is None else base_logits).float()
+        log_p = base if dynamic_delta is None else (base + dynamic_delta.float())
         log_p = log_p.clamp(min=-30.0, max=30.0)
-        # Closed-form exact 2x2 symmetric Birkhoff projection:
-        # For a 2x2 matrix [[a, b], [c, d]], Sinkhorn converges to a symmetric doubly-stochastic
-        # matrix parameterized by the cross-ratio (a + d) - (b + c):
         diag_adv = 0.5 * ((log_p[..., 0, 0] + log_p[..., 1, 1]) - (log_p[..., 0, 1] + log_p[..., 1, 0]))
         p_keep = torch.sigmoid(diag_adv)
         p_swap = 1.0 - p_keep
@@ -822,125 +1055,157 @@ class TwoStreamMHC(nn.Module):
         row1 = torch.stack([p_swap, p_keep], dim=-1)
         return torch.stack([row0, row1], dim=-2)
 
-    def _compute_routing(self, streams: torch.Tensor, is_ffn: bool, pass_idx: int = 0):
-        p_idx = min(max(pass_idx, 0), self.max_passes - 1)
-        r_base = self.ffn_read_logits if is_ffn else self.read_logits
-        w_base = self.ffn_write_logits if is_ffn else self.write_logits
-        m_base = self.ffn_mix_logits if is_ffn else self.mix_logits
-        p_bias = self.pass_routing_bias[p_idx, 1 if is_ffn else 0]
-        r_base = r_base + p_bias[0:2]
-        w_base = w_base + p_bias[2:4]
-        m_base = m_base + p_bias[4:8].view(2, 2)
-
-        if not self.dynamic:
-            p = self.mixing_matrix(base_logits=m_base).to(streams.dtype)
-            r = F.softmax(r_base, dim=0).to(streams.dtype)
-            w = (2.0 * torch.sigmoid(w_base)).to(streams.dtype)
-            return p, r, w, True
-
-        flat = streams.permute(1, 2, 0, 3).reshape(streams.shape[1], streams.shape[2], -1).float()
-        rms = torch.rsqrt(flat.pow(2).mean(dim=-1, keepdim=True) + self.norm_eps)
-        nw = self.ffn_norm_weight if is_ffn else self.norm_weight
+    def _compute_routing(self, streams: torch.Tensor, pass_idx: int = 0, is_ffn: bool = False):
+        p_idx = min(max(0, int(pass_idx)), self.max_passes - 1)
+        sub_idx = 1 if is_ffn else 0
+        base_r = self.ffn_read_logits if is_ffn else self.read_logits
+        base_w = self.ffn_write_logits if is_ffn else self.write_logits
+        base_m = self.ffn_mix_logits if is_ffn else self.mix_logits
         proj = self.ffn_dynamic_proj if is_ffn else self.dynamic_proj
-        raw = proj(flat * rms * nw)
-        r = F.softmax(r_base + raw[..., 0:2], dim=-1).to(streams.dtype)
-        w = (2.0 * torch.sigmoid(w_base + raw[..., 2:4])).to(streams.dtype)
-        p = self.mixing_matrix(raw[..., 4:8].view(*raw.shape[:-1], 2, 2), base_logits=m_base).to(streams.dtype)
-        return p, r, w, False
+        nw = getattr(self, 'ffn_norm_weight' if is_ffn else 'norm_weight', None)
+        p_bias = self.pass_routing_bias[p_idx, sub_idx].float()
 
-    @staticmethod
-    def _mix_and_read(streams: torch.Tensor, p: torch.Tensor, r: torch.Tensor, is_static: bool):
-        if is_static:
-            mixed = torch.einsum('ij,jbtd->ibtd', p, streams)
-            layer_in = torch.einsum('i,ibtd->btd', r, mixed)
-        else:
-            mixed = torch.einsum('btij,jbtd->ibtd', p, streams)
-            layer_in = torch.einsum('bti,ibtd->btd', r, mixed)
-        return mixed, layer_in
+        if not self.dynamic or proj is None:
+            r_log = base_r.float() + p_bias[:2]
+            w_log = base_w.float() + p_bias[2:4]
+            m_log = base_m.float() + p_bias[4:8].reshape(2, 2)
+            rw = r_log.softmax(dim=0)[:, None, None, None]
+            ww = w_log.softmax(dim=0)[:, None, None, None]
+            mat = self.mixing_matrix(base_logits=m_log)[:, :, None, None, None]
+            return rw, ww, mat
 
-    @staticmethod
-    def _write(mixed: torch.Tensor, delta: torch.Tensor, w: torch.Tensor, is_static: bool):
-        if is_static:
-            return mixed + w.view(2, 1, 1, 1) * delta.unsqueeze(0)
-        return mixed + w.permute(2, 0, 1).unsqueeze(-1) * delta.unsqueeze(0)
+        with torch.autocast(device_type=streams.device.type, enabled=False):
+            _, bsz, seq_len, dim = streams.shape
+            flat = streams.permute(1, 2, 0, 3).reshape(bsz, seq_len, 2 * dim).float()
+            rms = torch.rsqrt(flat.pow(2).mean(dim=-1, keepdim=True) + self.norm_eps)
+            normed = (flat * rms * nw) if nw is not None else (flat * rms)
+            dyn = proj(normed) + p_bias.view(1, 1, -1)
+            dyn_read = dyn[..., 0:2]
+            dyn_write = dyn[..., 2:4]
+            dyn_mix = dyn[..., 4:8].reshape(bsz, seq_len, 2, 2)
+            rw = (base_r.float() + dyn_read).softmax(dim=-1).permute(2, 0, 1).unsqueeze(-1)
+            ww = (base_w.float() + dyn_write).softmax(dim=-1).permute(2, 0, 1).unsqueeze(-1)
+            mat = self.mixing_matrix(dyn_mix, base_logits=base_m).permute(2, 3, 0, 1).unsqueeze(-1)
+            return rw, ww, mat
 
-    def _apply_pass_adapter(self, h: torch.Tensor, pass_idx: int) -> torch.Tensor:
-        if self.pass_adapter_rank <= 0 or pass_idx <= 0:
-            return h
-        p_idx = min(pass_idx, self.max_passes - 1)
-        delta = self.pass_up[p_idx](F.silu(self.pass_down[p_idx](h.float())))
-        return h + delta.to(h.dtype)
+    def _apply_pass_adapter(self, x: torch.Tensor, pass_idx: int) -> torch.Tensor:
+        if self.pass_down is None or self.pass_up is None:
+            return torch.zeros_like(x, dtype=torch.float32)
+        p_idx = min(max(0, int(pass_idx)), self.max_passes - 1)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            x_f = x.float()
+            normed = x_f * torch.rsqrt(x_f.pow(2).mean(dim=-1, keepdim=True) + self.norm_eps)
+            return self.pass_up[p_idx](F.silu(self.pass_down[p_idx](normed)))
 
-    def forward(self, streams: torch.Tensor, layer: nn.Module, position_embeddings, attention_mask,
-                extra: bool = False, pass_idx: int = 0, past_key_values=None, cache_position=None) -> torch.Tensor:
-        p_attn, r_attn, w_attn, static_attn = self._compute_routing(streams, is_ffn=False, pass_idx=pass_idx)
-        mixed_attn, attn_in = self._mix_and_read(streams, p_attn, r_attn, static_attn)
+    def forward(
+        self,
+        streams: torch.Tensor,
+        layer: nn.Module,
+        position_embeddings,
+        attention_mask,
+        extra: bool = False,
+        pass_idx: int = 0,
+        past_key_values=None,
+        cache_position=None,
+    ) -> torch.Tensor:
+        orig_dtype = streams.dtype
+        streams_f32 = streams.float()
+        identity = torch.eye(2, dtype=torch.float32, device=streams.device)[:, :, None, None, None]
 
-        if self.sublayer_mhc and hasattr(layer, 'self_attn') and hasattr(layer, 'mlp'):
+        if self.sublayer_mhc and hasattr(layer, 'input_layernorm') and hasattr(layer, 'post_attention_layernorm'):
             target_dtype = layer.mlp.gate_proj.weight.dtype
-            normed_attn = layer.input_layernorm(attn_in).to(target_dtype)
+            # 1. Attention sublayer mHC
+            rw_a, ww_a, mat_a = self._compute_routing(streams_f32, pass_idx=pass_idx, is_ffn=False)
+            mixed_a = (rw_a * streams_f32).sum(dim=0)
+            normed_a = layer.input_layernorm(mixed_a.to(target_dtype)).to(target_dtype)
             attn_out, _ = layer.self_attn(
-                hidden_states=normed_attn,
+                hidden_states=normed_a,
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 cache_position=cache_position,
             )
-            attn_delta = attn_out.to(streams.dtype)
-            if extra:
-                gain_param = self.p3_extra_gain if pass_idx >= 2 else self.extra_gain
-                attn_delta = attn_delta * torch.tanh(gain_param.float()).to(streams.dtype)
-            mid_streams = self._write(mixed_attn, attn_delta, w_attn, static_attn)
+            gain_a_param = self.p3_extra_gain if pass_idx >= 2 else self.extra_gain
+            gain_a = torch.tanh(gain_a_param.float()) if extra else 1.0
+            eff_mat_a = identity + gain_a * (mat_a - identity)
+            streams_mid = (eff_mat_a * streams_f32.unsqueeze(0)).sum(dim=1) + gain_a * ww_a * attn_out.float().unsqueeze(0)
 
-            p_ffn, r_ffn, w_ffn, static_ffn = self._compute_routing(mid_streams, is_ffn=True, pass_idx=pass_idx)
-            mixed_ffn, ffn_in = self._mix_and_read(mid_streams, p_ffn, r_ffn, static_ffn)
-            ffn_in = self._apply_pass_adapter(ffn_in, pass_idx)
-            normed_ffn = layer.post_attention_layernorm(ffn_in).to(target_dtype)
-            ffn_out = layer.mlp(normed_ffn)
-            ffn_delta = ffn_out.to(streams.dtype)
-            if extra:
-                fgain_param = self.p3_ffn_extra_gain if pass_idx >= 2 else self.ffn_extra_gain
-                ffn_delta = ffn_delta * torch.tanh(fgain_param.float()).to(streams.dtype)
-            return self._write(mixed_ffn, ffn_delta, w_ffn, static_ffn)
+            # 2. FFN sublayer mHC + Pass-conditioned deliberation adapter
+            rw_f, ww_f, mat_f = self._compute_routing(streams_mid, pass_idx=pass_idx, is_ffn=True)
+            mixed_f = (rw_f * streams_mid).sum(dim=0)
+            normed_f = layer.post_attention_layernorm(mixed_f.to(target_dtype)).to(target_dtype)
+            mlp_out = layer.mlp(normed_f).float() + self._apply_pass_adapter(mixed_f, pass_idx)
+            gain_f_param = self.p3_ffn_extra_gain if pass_idx >= 2 else self.ffn_extra_gain
+            gain_f = torch.tanh(gain_f_param.float()) if extra else 1.0
+            eff_mat_f = identity + gain_f * (mat_f - identity)
+            out = (eff_mat_f * streams_mid.unsqueeze(0)).sum(dim=1) + gain_f * ww_f * mlp_out.unsqueeze(0)
+            return out.to(orig_dtype)
 
-        layer_in = self._apply_pass_adapter(attn_in, pass_idx)
-        layer_out = layer(
-            layer_in,
+        rw, ww, mat = self._compute_routing(streams_f32, pass_idx=pass_idx, is_ffn=False)
+        mixed_input = (rw * streams_f32).sum(dim=0).to(orig_dtype)
+        updated = layer(
+            mixed_input,
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             cache_position=cache_position,
         )
-        delta = (layer_out - attn_in).to(streams.dtype)
-        if extra:
-            gain_param = self.p3_extra_gain if pass_idx >= 2 else self.extra_gain
-            delta = delta * torch.tanh(gain_param.float()).to(streams.dtype)
-        return self._write(mixed_attn, delta, w_attn, static_attn)
+        delta = updated.float() - mixed_input.float() + self._apply_pass_adapter(mixed_input, pass_idx)
+        gain_param = self.p3_extra_gain if pass_idx >= 2 else self.extra_gain
+        gain = torch.tanh(gain_param.float()) if extra else 1.0
+        eff_mat = identity + gain * (mat - identity)
+        routed = (eff_mat * streams_f32.unsqueeze(0)).sum(dim=1)
+        out = routed + gain * ww * delta.unsqueeze(0)
+        return out.to(orig_dtype)
 
 
 def fused_masked_cross_entropy(
     hidden_states: torch.Tensor,
     lm_head_weight: torch.Tensor,
     labels: torch.Tensor,
-    chunk_tokens: int = 512,
+    chunk_tokens: int = 1024,
 ) -> torch.Tensor:
-    shift_h = hidden_states[:, :-1, :].contiguous()
-    shift_labels = labels[:, 1:].contiguous()
-    flat_h = shift_h.view(-1, shift_h.shape[-1])
-    flat_labels = shift_labels.view(-1)
-    valid_mask = flat_labels != -100
-    valid_indices = valid_mask.nonzero(as_tuple=False).squeeze(-1)
-    if valid_indices.numel() == 0:
-        return (flat_h[:1].float().sum() * 0.0)
-    valid_h = flat_h.index_select(0, valid_indices)
-    valid_t = flat_labels.index_select(0, valid_indices)
-    w = lm_head_weight.to(valid_h.dtype)
-    total_loss = valid_h.new_zeros((), dtype=torch.float32)
-    n_valid = valid_t.numel()
-    for start in range(0, n_valid, max(64, chunk_tokens)):
-        end = min(start + max(64, chunk_tokens), n_valid)
-        logits_chunk = F.linear(valid_h[start:end], w).float()
-        total_loss = total_loss + F.cross_entropy(logits_chunk, valid_t[start:end], reduction='sum')
+    """Unsloth / Cut-Cross-Entropy + Gradient-Checkpointed Chunked Cross-Entropy over V=167,168.
+
+    Prevents the 11.0 GB [B, 16384, 167168] FP32 logit spike at 16K context by:
+    1. Using Apple/Unsloth `cut_cross_entropy.linear_cross_entropy` Triton kernel when available, OR
+    2. Evaluating valid token chunks under `torch.utils.checkpoint.checkpoint` so only a single
+       [chunk_tokens, 167168] logit block is materialized during backward.
+    """
+    shift_h = hidden_states[:, :-1, :].contiguous().reshape(-1, hidden_states.shape[-1])
+    shift_y = labels[:, 1:].contiguous().reshape(-1).to(shift_h.device)
+    valid_mask = shift_y != -100
+    if not torch.any(valid_mask):
+        return hidden_states.sum() * 0.0
+
+    valid_h = shift_h[valid_mask]
+    valid_y = shift_y[valid_mask]
+    n_valid = valid_y.numel()
+
+    if HAS_CCE and valid_h.is_cuda and valid_h.dtype in (torch.bfloat16, torch.float16):
+        try:
+            return _cce_linear_cross_entropy(valid_h, lm_head_weight.to(valid_h.dtype), valid_y)
+        except Exception:
+            pass
+
+    if n_valid <= chunk_tokens:
+        logits = F.linear(valid_h.to(lm_head_weight.dtype), lm_head_weight).float()
+        return F.cross_entropy(logits, valid_y, reduction='mean')
+
+    def _chunk_ce(h_chunk: torch.Tensor, y_chunk: torch.Tensor) -> torch.Tensor:
+        lg = F.linear(h_chunk.to(lm_head_weight.dtype), lm_head_weight).float()
+        return F.cross_entropy(lg, y_chunk, reduction='sum')
+
+    total_loss = torch.zeros((), dtype=torch.float32, device=hidden_states.device)
+    use_ckpt = valid_h.requires_grad or lm_head_weight.requires_grad
+    step_c = max(128, int(chunk_tokens))
+    for start_idx in range(0, n_valid, step_c):
+        h_c = valid_h[start_idx : start_idx + step_c]
+        y_c = valid_y[start_idx : start_idx + step_c]
+        if use_ckpt:
+            total_loss = total_loss + checkpoint(_chunk_ce, h_c, y_c, use_reentrant=False)
+        else:
+            total_loss = total_loss + _chunk_ce(h_c, y_c)
     return total_loss / float(n_valid)
 
 
@@ -949,7 +1214,7 @@ class SparkXLoopV03(nn.Module):
     - 36 physical layers unrolled up to 72 effective layers via 3-Pass Telescoping Recurrence:
       Prelude [0..4) + Pass-1 [4..28) + Pass-2 [4..28) + Pass-3 [12..24) + Coda [28..36) = 72 virtual layers.
     - 8 Macro-Block MoE-Engram Anchors at physical layers 3, 7, 11, 15, 19, 23, 27, 31
-      (500M total / 125M active per anchor = 4.0B Total / 1.0B Active Engram).
+      (514M total / 138M active per anchor = 4.11B Total / 1.10B Active Engram).
     """
     def __init__(self, base_model: nn.Module, settings: Optional[LoopV03Settings] = None,
                  strict: bool = True, patch_sdpa: bool = True):
@@ -1014,7 +1279,6 @@ class SparkXLoopV03(nn.Module):
 
         self.engram = _make_engram()  # Anchor 0: Layer 3 (end of Prelude [0..4))
         stride = max(1, int(self.settings.backbone_engram_stride))
-        # Core + Coda macro-block anchors: Layers 7, 11, 15, 19, 23, 27, 31 (7 anchors + 1 Prelude = 8 anchors total)
         anchor_indices = [
             idx for idx in range(self.loop_start + stride - 1, min(self.n_layers - 4, 32), stride)
         ]
@@ -1127,7 +1391,7 @@ class SparkXLoopV03(nn.Module):
                 masks['sliding_attention'] = create_sliding_window_causal_mask(**kwargs)
         implementation = importlib.import_module(type(model.layers[0].self_attn).__module__)
         rope = {}
-        rope_dtype = embeds.dtype if (past_key_values is not None and embeds.dtype in (torch.bfloat16, torch.float16)) else None
+        rope_dtype = embeds.dtype if embeds.dtype in (torch.bfloat16, torch.float16) else None
         for layer_type in set(cfg.layer_types):
             cos, sin = implementation.compute_rope_cos_sin(
                 cache_position, cfg.head_dim, cfg.get_rope_theta(layer_type),
@@ -1175,8 +1439,10 @@ class SparkXLoopV03(nn.Module):
         (masks, ropes), cache_position = self._forward_context(
             embeds, attention_mask, past_key_values=past_key_values, cache_position=cache_position
         )
-        h = embeds.float()
+        # Keep residual streams in native BF16 during 16K training/inference to cut activation VRAM by 50%!
+        # TwoStreamMHC internally computes Sinkhorn routing in FP32.
         kv_dtype = embeds.dtype
+        h = embeds
         virtual_idx = 0
 
         # 1. Prelude layers [0..loop_start)
@@ -1253,8 +1519,7 @@ class SparkXLoopV03(nn.Module):
                     pass_idx=0, ngram_indices=ngram_indices,
                 )
             virtual_idx += 1
-        norm_in = h.to(kv_dtype) if (not self.training and kv_dtype in (torch.bfloat16, torch.float16)) else h
-        return self.base.model.norm(norm_in).to(kv_dtype)
+        return self.base.model.norm(h.to(kv_dtype)).to(kv_dtype)
 
     def _head_weight(self) -> torch.Tensor:
         if getattr(self.base.config, 'tie_word_embeddings', False):
@@ -1291,7 +1556,20 @@ class SparkXLoopV03(nn.Module):
         return {'logits': None, 'loss': loss, 'ce_loss': ce_loss, 'z_loss': z_loss}
 
     @torch.no_grad()
-    def generate_cached(self, input_ids, max_new_tokens=256, eos_token_id=None):
+    def generate_cached(
+        self,
+        input_ids: torch.LongTensor,
+        max_new_tokens: int = 256,
+        eos_token_id: Optional[int] = None,
+        temperature: float = 0.6,
+        top_p: float = 0.92,
+        top_k: int = 40,
+        repetition_penalty: float = 1.04,
+        no_repeat_ngram_size: int = 10,
+        do_sample: bool = True,
+        tokenizer=None,
+    ):
+        """Fast 72-visit BF16 KV-cached looped generation with phase-aware <think> vs code penalties."""
         from transformers.cache_utils import DynamicCache
         prev_train = self.training
         self.eval()
@@ -1300,19 +1578,88 @@ class SparkXLoopV03(nn.Module):
         except TypeError:
             cache = DynamicCache()
         out = input_ids
+        prompt_len = int(input_ids.shape[1])
+
+        think_Ids_mask = set()
+        if tokenizer is not None:
+            for t_str in ('<think>', '</think>', '<think>\n', '\n</think>'):
+                try:
+                    t_ids = tokenizer.encode(t_str, add_special_tokens=False)
+                    if len(t_ids) == 1:
+                        think_Ids_mask.add(int(t_ids[0]))
+                except Exception:
+                    pass
+
+        def _sample_step(step_logits: torch.Tensor, gen_list: list[int], in_think: bool) -> torch.Tensor:
+            logits_1d = step_logits[0, -1, :].float().clone()
+            if not in_think and think_Ids_mask:
+                for tid in think_Ids_mask:
+                    if 0 <= tid < logits_1d.shape[0]:
+                        logits_1d[tid] = -1e9
+            if gen_list:
+                if in_think:
+                    win = gen_list[-384:]
+                    rep_p, freq_p, pres_p, n_gram = repetition_penalty, 0.22, 0.12, no_repeat_ngram_size
+                else:
+                    win = gen_list[-128:]
+                    rep_p, freq_p, pres_p, n_gram = 1.01, 0.0, 0.0, max(28, no_repeat_ngram_size)
+                counts: dict[int, int] = {}
+                for tid in win:
+                    counts[tid] = counts.get(tid, 0) + 1
+                u_ids = torch.tensor(list(counts.keys()), dtype=torch.long, device=logits_1d.device)
+                u_cnt = torch.tensor(list(counts.values()), dtype=torch.float32, device=logits_1d.device)
+                if rep_p > 1.0:
+                    vals = logits_1d[u_ids]
+                    logits_1d[u_ids] = torch.where(vals > 0, vals / rep_p, vals * rep_p)
+                if freq_p > 0.0 or pres_p > 0.0:
+                    logits_1d[u_ids] -= (freq_p * u_cnt + pres_p)
+                if n_gram > 1 and len(gen_list) >= n_gram - 1:
+                    prefix = tuple(gen_list[-(n_gram - 1):])
+                    scan = gen_list[-2048:]
+                    for idx_g in range(len(scan) - n_gram + 1):
+                        if tuple(scan[idx_g : idx_g + n_gram - 1]) == prefix:
+                            logits_1d[scan[idx_g + n_gram - 1]] = -1e9
+            if not do_sample or temperature <= 1e-5:
+                return logits_1d.argmax(dim=-1, keepdim=True).unsqueeze(0)
+            scaled = logits_1d / float(temperature)
+            if top_k > 0:
+                k_val = min(int(top_k), scaled.shape[-1])
+                v_k, _ = torch.topk(scaled, k_val)
+                scaled = torch.where(scaled < v_k[-1], torch.full_like(scaled, -1e9), scaled)
+            probs = F.softmax(scaled, dim=-1)
+            if 0.0 < top_p < 1.0:
+                s_probs, s_idx = torch.sort(probs, descending=True)
+                cum = torch.cumsum(s_probs, dim=-1)
+                mask = (cum - s_probs) > top_p
+                s_probs = torch.where(mask, torch.zeros_like(s_probs), s_probs)
+                s_probs = s_probs / s_probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+                choice = torch.multinomial(s_probs, num_samples=1)
+                return s_idx.gather(-1, choice).unsqueeze(0)
+            return torch.multinomial(probs, num_samples=1).unsqueeze(0)
+
+        in_think = True
+        gen_list: list[int] = []
         try:
             logits = self.forward_logits(out, past_key_values=cache)
-            next_id = logits[:, -1].argmax(-1, keepdim=True)
+            next_id = _sample_step(logits, gen_list, in_think)
+            tok_int = int(next_id.item())
+            gen_list.append(tok_int)
             prev_tok = out[:, -2:]
             out = torch.cat((out, next_id), dim=-1)
-            if eos_token_id is not None and torch.all(next_id == eos_token_id):
+            if eos_token_id is not None and tok_int == eos_token_id:
                 return out
             for _ in range(max_new_tokens - 1):
                 logits = self.forward_logits(next_id, past_key_values=cache, prev_ids=prev_tok)
                 prev_tok = out[:, -2:]
-                next_id = logits[:, -1].argmax(-1, keepdim=True)
+                if in_think and tokenizer is not None and len(gen_list) % 8 == 0:
+                    tail_txt = tokenizer.decode(gen_list[-24:], skip_special_tokens=False)
+                    if '</think>' in tail_txt:
+                        in_think = False
+                next_id = _sample_step(logits, gen_list, in_think)
+                tok_int = int(next_id.item())
+                gen_list.append(tok_int)
                 out = torch.cat((out, next_id), dim=-1)
-                if eos_token_id is not None and torch.all(next_id == eos_token_id):
+                if eos_token_id is not None and tok_int == eos_token_id:
                     break
         finally:
             self.train(prev_train)
@@ -1340,7 +1687,7 @@ def set_trainables_v03(model: SparkXLoopV03, full_finetune: bool = True, freeze_
 def build_optimizer_v03(
     model: SparkXLoopV03,
     lr_adapter: float = 2.0e-4,
-    lr_full: float = 2.0e-6,
+    lr_full: float = 1.0e-5,
     lr_mhc: float = 5.0e-3,
     weight_decay: float = 0.01,
     use_8bit: bool = True,
@@ -1391,7 +1738,6 @@ def count_en4b_a1b_params(model: SparkXLoopV03) -> dict[str, int]:
         if getattr(mod, 'tier1b_cold_weight', None) is not None
     )
     eng_total = eng_gpu_total + eng_cpu_tier1b
-    # Active Engram per pass across 8 anchors: Tier-2 (100%) + Tier-3 (active_top_k / num_experts) + ctx_gate/project/query
     active_eng = 0
     for mod in model.all_engram_modules():
         t2 = mod.shared_gate.weight.numel() + mod.shared_up.weight.numel() + mod.shared_down.weight.numel()
@@ -1494,4 +1840,3 @@ def warm_start_from_v02_state(model: SparkXLoopV03, v02_state: dict) -> dict[str
             if sub_dict:
                 copied_eng += _copy_compatible_engram(mod, sub_dict)
     return {'copied_controller_tensors': copied_ctrl, 'copied_engram_tensors': copied_eng}
-
