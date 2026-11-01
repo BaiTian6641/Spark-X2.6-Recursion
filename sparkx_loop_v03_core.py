@@ -1141,7 +1141,7 @@ class TwoStreamMHC(nn.Module):
             # 1. Attention sublayer mHC
             rw_a, ww_a, mat_a = self._compute_routing(streams_f32, pass_idx=pass_idx, is_ffn=False)
             mixed_a = (rw_a * streams_f32).sum(dim=0)
-            normed_a = layer.input_layernorm(mixed_a.to(target_dtype)).to(target_dtype)
+            normed_a = layer.input_layernorm(mixed_a.to(orig_dtype)).to(target_dtype)
             attn_out, _ = layer.self_attn(
                 hidden_states=normed_a,
                 position_embeddings=position_embeddings,
@@ -1157,7 +1157,7 @@ class TwoStreamMHC(nn.Module):
             # 2. FFN sublayer mHC + Pass-conditioned deliberation adapter
             rw_f, ww_f, mat_f = self._compute_routing(streams_mid, pass_idx=pass_idx, is_ffn=True)
             mixed_f = (rw_f * streams_mid).sum(dim=0)
-            normed_f = layer.post_attention_layernorm(mixed_f.to(target_dtype)).to(target_dtype)
+            normed_f = layer.post_attention_layernorm(mixed_f.to(orig_dtype)).to(target_dtype)
             mlp_out = layer.mlp(normed_f).float() + self._apply_pass_adapter(mixed_f, pass_idx)
             gain_f_param = self.p3_ffn_extra_gain if pass_idx >= 2 else self.ffn_extra_gain
             gain_f = torch.tanh(gain_f_param.float()) if extra else 1.0
@@ -1431,12 +1431,9 @@ class SparkXLoopV03(nn.Module):
             _VisitCache(past_key_values, idx, virtual_idx if virtual_idx is not None else idx, kv_dtype=kv_dtype)
             if past_key_values is not None else None
         )
-        target_dtype = layer.mlp.gate_proj.weight.dtype
-        def step(x, _layer=layer, _rp=rp, _mk=mk, _vc=v_cache, _cp=cache_position, _dt=target_dtype):
-            x_in = x.to(_dt) if x.dtype != _dt else x
-            out = _layer(x_in, position_embeddings=_rp, attention_mask=_mk,
-                         past_key_values=_vc, cache_position=_cp)
-            return out.to(x.dtype) if out.dtype != x.dtype else out
+        def step(x, _layer=layer, _rp=rp, _mk=mk, _vc=v_cache, _cp=cache_position):
+            return _layer(x, position_embeddings=_rp, attention_mask=_mk,
+                          past_key_values=_vc, cache_position=_cp)
         if v_cache is None and self.training and self.enable_checkpoint and (
             h.requires_grad or any(p.requires_grad for p in layer.parameters())
         ):
@@ -1458,10 +1455,9 @@ class SparkXLoopV03(nn.Module):
         (masks, ropes), cache_position = self._forward_context(
             embeds, attention_mask, past_key_values=past_key_values, cache_position=cache_position
         )
-        # Keep residual streams in native BF16 during 16K training/inference to cut activation VRAM by 50%!
-        # TwoStreamMHC internally computes Sinkhorn routing in FP32.
+        # Match upstream Spark2_5Model.forward residual stream dtype (embeds.float())
         kv_dtype = embeds.dtype
-        h = embeds
+        h = embeds.float()
         virtual_idx = 0
 
         # 1. Prelude layers [0..loop_start)
@@ -1538,7 +1534,7 @@ class SparkXLoopV03(nn.Module):
                     pass_idx=0, ngram_indices=ngram_indices,
                 )
             virtual_idx += 1
-        return self.base.model.norm(h.to(kv_dtype)).to(kv_dtype)
+        return self.base.model.norm(h).to(kv_dtype)
 
     def _head_weight(self) -> torch.Tensor:
         if getattr(self.base.config, 'tie_word_embeddings', False):
