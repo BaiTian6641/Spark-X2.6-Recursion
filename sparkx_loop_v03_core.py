@@ -851,7 +851,20 @@ class ZipfianTieredMoEEngram(nn.Module):
 
     @torch.no_grad()
     def step_tier1b_sparse_adam(self, lr: float = 2e-4, beta1: float = 0.9, beta2: float = 0.95, eps: float = 1e-8):
-        """Coalesced sparse Adam update on pinned Host DRAM for Tier 1B (<0.3 ms/step)."""
+        """Coalesced sparse Adam update on pinned Host DRAM for Tier 1B (<0.3 ms/step) + Post-Backward Router Bias EMA."""
+        # 1. Update auxiliary-loss-free expert load EMA & router bias AFTER backward/optimizer step
+        #    (never during forward, so gradient checkpointing recomputation is 100% deterministic!)
+        pending_load = getattr(self, '_pending_expert_load', None)
+        if pending_load is not None:
+            e_act = self.active_experts
+            load = pending_load.to(device=self.expert_load_ema.device, dtype=torch.float32)
+            if load.numel() == e_act:
+                self.expert_load_ema[:e_act].lerp_(load, 0.05)
+                target_load = 1.0 / float(e_act)
+                self.expert_bias[:e_act].add_(0.001 * torch.sign(target_load - self.expert_load_ema[:e_act])).clamp_(-0.5, 0.5)
+            self._pending_expert_load = None
+
+        # 2. Coalesced sparse Adam update for Tier 1B cold N-gram rows
         if (
             not self.offload_tier1b_cpu
             or self.tier1b_cold_weight is None
@@ -932,9 +945,7 @@ class ZipfianTieredMoEEngram(nn.Module):
                 with torch.no_grad():
                     one_hot = F.one_hot(topk_idx, num_classes=e_act).float()
                     load = one_hot.sum(dim=-2).mean(dim=(0, 1)) / float(k_act)
-                    self.expert_load_ema[:e_act].lerp_(load, 0.05)
-                    target_load = 1.0 / float(e_act)
-                    self.expert_bias[:e_act].add_(0.001 * torch.sign(target_load - self.expert_load_ema[:e_act])).clamp_(-0.5, 0.5)
+                    self._pending_expert_load = load.detach()
 
             q = self.query_proj(h_norm) + e_lexical
             flat_q = q.reshape(-1, self.eng_dim)

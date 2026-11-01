@@ -1157,6 +1157,15 @@ def run_v03_four_stage_training(
     hf_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Execute the 4-stage progressive sequence length & depth training loop with 22.5h budget & emergency recovery."""
+    import importlib
+    importlib.reload(_core_mod)
+    # Hot-bind latest checkpoint-safe ZipfianTieredMoEEngram methods onto already-instantiated modules in VRAM
+    for eng_mod in model.all_engram_modules():
+        eng_cls = type(eng_mod)
+        eng_cls.forward = _core_mod.ZipfianTieredMoEEngram.forward
+        eng_cls.step_tier1b_sparse_adam = _core_mod.ZipfianTieredMoEEngram.step_tier1b_sparse_adam
+        eng_mod._pending_expert_load = None
+
     device = next(model.base.parameters()).device
     start_wall = time.time()
     max_seconds = float(cfg.get('MAX_RUN_HOURS', 22.5)) * 3600.0
