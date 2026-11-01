@@ -764,18 +764,28 @@ def save_and_push_v03_checkpoint(
 
     loop_sd = _build_loop_modules_state_dict(model)
     save_file(loop_sd, str(ckpt_dir / 'loop_modules_v03.safetensors'))
+    if hasattr(_core_mod, 'loop_v03_state_dict'):
+        torch.save(_core_mod.loop_v03_state_dict(model, include_tier1b=True), str(ckpt_dir / 'loop_v03_state.pt'))
 
     meta = {
         'architecture': 'Spark-X2.6-4B-En4B-A1B (v0.3)',
+        'base_model': cfg.get('BASE_MODEL_ID', 'XHToken/Spark-X2.6-4B'),
+        'merged_standalone': bool(push_backbone),
         'global_step': global_step,
         'stage_name': stage_name,
         'effective_layers': model.total_virtual_layers,
         'execution_plan': model.execution_plan,
+        'active_meta': {
+            'engram_active_experts': model.engram.active_experts,
+            'engram_active_top_k': model.engram.active_top_k,
+        },
         'settings': model.settings.to_dict() if hasattr(model.settings, 'to_dict') else dataclasses.asdict(model.settings),
         'metrics': metrics,
         'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
     }
-    (ckpt_dir / 'loop_config_v03.json').write_text(json.dumps(meta, indent=2))
+    meta_json = json.dumps(meta, indent=2)
+    (ckpt_dir / 'loop_config_v03.json').write_text(meta_json)
+    (ckpt_dir / 'loop_config.json').write_text(meta_json)
 
     if push_backbone:
         model.base.save_pretrained(str(ckpt_dir), safe_serialization=True, max_shard_size='4GB')
@@ -826,16 +836,26 @@ def export_final_v03_to_hub(
 
     loop_sd = _build_loop_modules_state_dict(model)
     save_file(loop_sd, str(out_dir / 'loop_modules_v03.safetensors'))
+    if hasattr(_core_mod, 'loop_v03_state_dict'):
+        torch.save(_core_mod.loop_v03_state_dict(model, include_tier1b=True), str(out_dir / 'loop_v03_state.pt'))
 
     meta = {
         'architecture': 'Spark-X2.6-4B-En4B-A1B (v0.3)',
+        'base_model': cfg.get('BASE_MODEL_ID', 'XHToken/Spark-X2.6-4B'),
+        'merged_standalone': True,
         'global_step': global_step,
         'effective_layers': model.total_virtual_layers,
         'execution_plan': model.execution_plan,
+        'active_meta': {
+            'engram_active_experts': model.engram.active_experts,
+            'engram_active_top_k': model.engram.active_top_k,
+        },
         'settings': model.settings.to_dict() if hasattr(model.settings, 'to_dict') else dataclasses.asdict(model.settings),
         'metrics': metrics,
     }
-    (out_dir / 'loop_config_v03.json').write_text(json.dumps(meta, indent=2))
+    meta_json = json.dumps(meta, indent=2)
+    (out_dir / 'loop_config_v03.json').write_text(meta_json)
+    (out_dir / 'loop_config.json').write_text(meta_json)
 
     for helper_file in ('sparkx_loop_v03_core.py', 'load_inference_v03.py'):
         src = Path(helper_file)
