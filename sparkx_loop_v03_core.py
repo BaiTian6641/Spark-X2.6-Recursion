@@ -621,6 +621,20 @@ def patch_spark_attention_for_loglinear_kv(
     return len(layers)
 
 
+class _AttachAuxLossFn(torch.autograd.Function):
+    """Megatron-LM / DeepSeek-V3 style in-graph MoE auxiliary loss attachment.
+    Forwards `x` unchanged while injecting `1.0` gradient into `aux_loss` during backward,
+    so zero autograd tensors ever escape `torch.utils.checkpoint` frames or persist across stages/passes.
+    """
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, aux_loss: torch.Tensor) -> torch.Tensor:
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output, grad_output.new_ones((), dtype=torch.float32)
+
+
 class ZipfianTieredMoEEngram(nn.Module):
     """3-Tier Zipfian MoE-Engram (`En4B-A1B`: 514M Total / 138M Active per Anchor x 8 Anchors = 4.11B Total / 1.10B Active).
 
@@ -931,7 +945,11 @@ class ZipfianTieredMoEEngram(nn.Module):
 
             if self.training:
                 log_z = torch.logsumexp(router_logits, dim=-1)
-                self.last_router_z_loss = log_z.pow(2).mean()
+                z_curr = log_z.pow(2).mean()
+                self.last_router_z_loss = z_curr.detach()
+                active_z = getattr(self, '_active_z_losses', None)
+                if active_z is not None:
+                    active_z.append(z_curr)
             else:
                 self.last_router_z_loss = router_logits.new_zeros(())
 
@@ -1333,7 +1351,14 @@ class SparkXLoopV03(nn.Module):
             mod.step_tier1b_sparse_adam(lr=lr)
 
     def total_router_z_loss(self) -> torch.Tensor:
-        losses = [mod.last_router_z_loss for mod in self.all_engram_modules() if mod.last_router_z_loss is not None]
+        losses = []
+        for mod in self.all_engram_modules():
+            active_z = getattr(mod, '_active_z_losses', None)
+            if active_z:
+                losses.extend(active_z)
+                mod._active_z_losses = None
+            elif mod.last_router_z_loss is not None:
+                losses.append(mod.last_router_z_loss.detach())
         if not losses:
             return torch.tensor(0.0, device=self._head_weight().device)
         return torch.stack([l.to(self._head_weight().device) for l in losses]).mean()
@@ -1457,6 +1482,9 @@ class SparkXLoopV03(nn.Module):
                        prev_ids: Optional[torch.LongTensor] = None) -> torch.Tensor:
         if input_ids.ndim != 2:
             raise ValueError('Expected input_ids shape [batch, sequence]')
+        for mod in self.all_engram_modules():
+            mod.last_router_z_loss = None
+            mod._active_z_losses = [] if (self.training and torch.is_grad_enabled()) else None
         # Ahead-of-time deterministic token-ID hashing (computed before Layer 0!)
         ngram_indices = (
             self.engram.compute_ngram_indices(input_ids, self.engram.total_buckets, prev_ids=prev_ids)
@@ -1471,12 +1499,23 @@ class SparkXLoopV03(nn.Module):
         h = embeds.float()
         virtual_idx = 0
 
-        # 1. Prelude layers [0..loop_start)
+        # 1. Prelude layers [0..loop_start) (includes Anchor 0 at Layer 3 + any backbone anchors < loop_start)
         for idx in range(self.loop_start):
             h = self._apply_layer(idx, h, masks, ropes, past_key_values=past_key_values,
                                   cache_position=cache_position, virtual_idx=virtual_idx)
+            if self.engram_enabled:
+                if idx == 3:
+                    h = h + self.engram(
+                        input_ids, h.dtype, prev_ids=prev_ids, hidden_states=h,
+                        pass_idx=0, ngram_indices=ngram_indices,
+                    )
+                elif str(idx) in self.backbone_engrams:
+                    h = h + self.backbone_engrams[str(idx)](
+                        input_ids, h.dtype, prev_ids=prev_ids, hidden_states=h,
+                        pass_idx=0, ngram_indices=ngram_indices,
+                    )
             virtual_idx += 1
-        if self.engram_enabled:
+        if self.engram_enabled and 0 < self.loop_start <= 3:
             h = h + self.engram(
                 input_ids, h.dtype, prev_ids=prev_ids, hidden_states=h,
                 pass_idx=0, ngram_indices=ngram_indices,

@@ -1159,12 +1159,19 @@ def run_v03_four_stage_training(
     """Execute the 4-stage progressive sequence length & depth training loop with 22.5h budget & emergency recovery."""
     import importlib
     importlib.reload(_core_mod)
-    # Hot-bind latest checkpoint-safe ZipfianTieredMoEEngram methods onto already-instantiated modules in VRAM
+    # Hot-bind latest checkpoint-safe SparkXLoopV03 & ZipfianTieredMoEEngram methods onto already-instantiated modules in VRAM
+    model_cls = type(model)
+    model_cls.forward_hidden = _core_mod.SparkXLoopV03.forward_hidden
+    model_cls.forward = _core_mod.SparkXLoopV03.forward
+    model_cls.total_router_z_loss = _core_mod.SparkXLoopV03.total_router_z_loss
     for eng_mod in model.all_engram_modules():
         eng_cls = type(eng_mod)
         eng_cls.forward = _core_mod.ZipfianTieredMoEEngram.forward
         eng_cls.step_tier1b_sparse_adam = _core_mod.ZipfianTieredMoEEngram.step_tier1b_sparse_adam
         eng_mod._pending_expert_load = None
+        eng_mod.last_router_z_loss = None
+        eng_mod._active_z_losses = None
+    model.zero_grad(set_to_none=True)
 
     device = next(model.base.parameters()).device
     start_wall = time.time()
@@ -1172,6 +1179,7 @@ def run_v03_four_stage_training(
     grad_accum = int(cfg.get('GRAD_ACCUM', 8))
     save_every = int(cfg.get('SAVE_EVERY_STEPS', 250))
     log_every = int(cfg.get('LOG_EVERY_STEPS', 5))
+    ckpt_root = Path(cfg.get('CHECKPOINT_DIR', '/content/checkpoints_v03_en4b_a1b'))
 
     global_step = 0
     history: List[Dict[str, Any]] = []
@@ -1185,6 +1193,19 @@ def run_v03_four_stage_training(
             seq_len = int(stage_cfg['seq_len'])
             stage_steps = int(stage_cfg['steps'])
             freeze_bb = bool(stage_cfg.get('freeze_backbone', False))
+
+            expected_end_step = global_step + stage_steps
+            stage_ckpt_dir = ckpt_root / f"step_{expected_end_step:05d}_{stage_name}"
+            if stage_ckpt_dir.exists() and (stage_ckpt_dir / 'loop_v03_state.pt').exists():
+                print(
+                    f"\n[Auto-Resume] Found completed stage checkpoint {stage_ckpt_dir.name}; "
+                    f"restoring loop state and advancing global_step -> {expected_end_step}.",
+                    flush=True,
+                )
+                state_obj = torch.load(str(stage_ckpt_dir / 'loop_v03_state.pt'), map_location='cpu')
+                _core_mod.load_loop_v03_state_dict(model, state_obj, strict=False)
+                global_step = expected_end_step
+                continue
 
             if stage_cfg.get('upcycle_8_to_32', False):
                 print(f"\n[{stage_name}] Executing Coarse-to-Fine Expert Upcycling (8 -> 32 experts, top_k=7)...", flush=True)
