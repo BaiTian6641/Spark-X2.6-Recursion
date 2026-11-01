@@ -38,6 +38,7 @@ try:
 except Exception:
     LigerRMSNormFunction = None
     HAS_LIGER_RMSNORM = False
+HAS_LIGER = HAS_LIGER_RMSNORM
 
 try:
     from cut_cross_entropy import linear_cross_entropy as _cce_linear_cross_entropy
@@ -45,6 +46,12 @@ try:
 except Exception:
     _cce_linear_cross_entropy = None
     HAS_CCE = False
+
+try:
+    import unsloth_zoo  # noqa: F401
+    HAS_UNSLOTH = True
+except Exception:
+    HAS_UNSLOTH = False
 
 
 if HAS_TRITON:
@@ -214,6 +221,9 @@ class LoopV03Settings:
     sublayer_mhc: bool = True
     pass_adapter_rank: int = 16
     ce_chunk_tokens: int = 1024
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
 
 
 class _CacheLayersView:
@@ -1840,3 +1850,36 @@ def warm_start_from_v02_state(model: SparkXLoopV03, v02_state: dict) -> dict[str
             if sub_dict:
                 copied_eng += _copy_compatible_engram(mod, sub_dict)
     return {'copied_controller_tensors': copied_ctrl, 'copied_engram_tensors': copied_eng}
+
+
+patch_spark_for_loglinear_kv = patch_spark_attention_for_loglinear_kv
+
+
+@torch.no_grad()
+def verify_birkhoff_sinkhorn(ctrl: TwoStreamMHC) -> float:
+    """Return max absolute row/col deviation from doubly-stochastic 1.0 across random dynamic perturbations."""
+    device = ctrl.mix_logits.device
+    delta = torch.randn(4, 16, 2, 2, device=device, dtype=torch.float32) * 3.0
+    mat = ctrl.mixing_matrix(dynamic_delta=delta)
+    row_err = (mat.sum(dim=-1) - 1.0).abs().max().item()
+    col_err = (mat.sum(dim=-2) - 1.0).abs().max().item()
+    return float(max(row_err, col_err))
+
+
+@torch.no_grad()
+def verify_ngram_causality(model: SparkXLoopV03, vocab_size: int = 167168, device: Optional[torch.device] = None) -> float:
+    """Verify that mutating future tokens t >= prefix_len has zero effect on prefix_len logits."""
+    if device is None:
+        device = next(model.base.parameters()).device
+    seq_a = torch.randint(10, min(vocab_size, 50000), (1, 16), device=device)
+    seq_b = seq_a.clone()
+    seq_b[:, 8:] = torch.randint(10, min(vocab_size, 50000), (1, 8), device=device)
+
+    idx_a = model.engram.compute_ngram_indices(seq_a, model.engram.total_buckets)
+    idx_b = model.engram.compute_ngram_indices(seq_b, model.engram.total_buckets)
+    hash_diff = max(float((a[:, :8] - b[:, :8]).abs().max().item()) for a, b in zip(idx_a, idx_b))
+
+    logits_a = model.forward_logits(seq_a).float()[:, :8, :]
+    logits_b = model.forward_logits(seq_b).float()[:, :8, :]
+    logit_diff = float((logits_a - logits_b).abs().max().item())
+    return max(hash_diff, logit_diff)

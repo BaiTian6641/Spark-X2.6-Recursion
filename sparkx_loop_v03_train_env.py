@@ -29,18 +29,54 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import dataclasses
+import importlib
+import sparkx_loop_v03_core as _core_mod
+importlib.reload(_core_mod)
+
 from sparkx_loop_v03_core import (
     HAS_CCE,
-    HAS_LIGER,
     HAS_TRITON,
-    HAS_UNSLOTH,
     LoopV03Settings,
     SparkXLoopV03,
-    patch_spark_for_loglinear_kv,
+    TwoStreamMHC,
+    patch_spark_attention_for_loglinear_kv,
     patch_spark_for_unsloth_triton,
-    verify_birkhoff_sinkhorn,
-    verify_ngram_causality,
 )
+
+HAS_LIGER = bool(getattr(_core_mod, 'HAS_LIGER', getattr(_core_mod, 'HAS_LIGER_RMSNORM', False)))
+HAS_UNSLOTH = bool(getattr(_core_mod, 'HAS_UNSLOTH', False))
+patch_spark_for_loglinear_kv = getattr(_core_mod, 'patch_spark_for_loglinear_kv', patch_spark_attention_for_loglinear_kv)
+
+
+@torch.no_grad()
+def verify_birkhoff_sinkhorn(ctrl: TwoStreamMHC) -> float:
+    if hasattr(_core_mod, 'verify_birkhoff_sinkhorn'):
+        return float(_core_mod.verify_birkhoff_sinkhorn(ctrl))
+    device = ctrl.mix_logits.device
+    delta = torch.randn(4, 16, 2, 2, device=device, dtype=torch.float32) * 3.0
+    mat = ctrl.mixing_matrix(dynamic_delta=delta)
+    row_err = (mat.sum(dim=-1) - 1.0).abs().max().item()
+    col_err = (mat.sum(dim=-2) - 1.0).abs().max().item()
+    return float(max(row_err, col_err))
+
+
+@torch.no_grad()
+def verify_ngram_causality(model: SparkXLoopV03, vocab_size: int = 167168, device: Optional[torch.device] = None) -> float:
+    if hasattr(_core_mod, 'verify_ngram_causality'):
+        return float(_core_mod.verify_ngram_causality(model, vocab_size=vocab_size, device=device))
+    if device is None:
+        device = next(model.base.parameters()).device
+    seq_a = torch.randint(10, min(vocab_size, 50000), (1, 16), device=device)
+    seq_b = seq_a.clone()
+    seq_b[:, 8:] = torch.randint(10, min(vocab_size, 50000), (1, 8), device=device)
+    idx_a = model.engram.compute_ngram_indices(seq_a, model.engram.total_buckets)
+    idx_b = model.engram.compute_ngram_indices(seq_b, model.engram.total_buckets)
+    hash_diff = max(float((a[:, :8] - b[:, :8]).abs().max().item()) for a, b in zip(idx_a, idx_b))
+    logits_a = model.forward_logits(seq_a).float()[:, :8, :]
+    logits_b = model.forward_logits(seq_b).float()[:, :8, :]
+    logit_diff = float((logits_a - logits_b).abs().max().item())
+    return max(hash_diff, logit_diff)
 
 
 def build_default_cfg() -> Dict[str, Any]:
@@ -735,7 +771,7 @@ def save_and_push_v03_checkpoint(
         'stage_name': stage_name,
         'effective_layers': model.total_virtual_layers,
         'execution_plan': model.execution_plan,
-        'settings': model.settings.to_dict(),
+        'settings': model.settings.to_dict() if hasattr(model.settings, 'to_dict') else dataclasses.asdict(model.settings),
         'metrics': metrics,
         'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
     }
@@ -796,7 +832,7 @@ def export_final_v03_to_hub(
         'global_step': global_step,
         'effective_layers': model.total_virtual_layers,
         'execution_plan': model.execution_plan,
-        'settings': model.settings.to_dict(),
+        'settings': model.settings.to_dict() if hasattr(model.settings, 'to_dict') else dataclasses.asdict(model.settings),
         'metrics': metrics,
     }
     (out_dir / 'loop_config_v03.json').write_text(json.dumps(meta, indent=2))
