@@ -379,3 +379,58 @@ Curated specifically to counteract synthetic "AI slop" / "Claudish" phrasing (fo
 }
 ```
 
+---
+
+### 3.3 Long-Term Horizon (`Spark-X2.6-4B-En36B-A1B`): Ultra-Scale World-Knowledge Memory Networks & Parametric Knowledge Injection
+1. **Memory Layers at Scale (`128B` Product-Key Memory Layers)**
+   - **Authors:** Vincent-Pierre Berges, Barlas Oğuz, Daniel Haziza, Wen-tau Yih, Luke Zettlemoyer, Gargi Ghosh (*Meta FAIR*)
+   - **Preprint:** [arXiv:2412.09764](https://arxiv.org/abs/2412.09764) (December 2024) | Code: [`facebookresearch/memory`](https://github.com/facebookresearch/memory)
+   - **Relevance:** Demonstrates that scaling product-quantized key-value memory layers up to **128B parameters** on smaller (`1B–8B`) backbones outperforms dense models with **$>2\times$ the compute FLOPs** and fine-grained MoEs, with the largest gains on **factual world-knowledge benchmarks**.
+2. **UltraMemV2: Memory Networks Scaling to 120B Parameters with Superior Long-Context Learning**
+   - **Authors:** ByteDance Seed-Foundation-Model Team
+   - **Preprint:** [arXiv:2508.18756](https://arxiv.org/abs/2508.18756) (August 2025) & *UltraMem: Ultra-Sparse Memory Network* (*ICLR 2025*, [arXiv:2411.12364](https://arxiv.org/abs/2411.12364))
+   - **Relevance:** Scales ultra-sparse Tucker-decomposed product-key memory networks to **120B total parameters with only 2.5B active parameters (`2.1%` active sparsity)** across every transformer block, cutting memory-access cost (MAC) by **83%** vs. standard MoE while improving multi-round memorization (`+6.2 pt`) and in-context learning (`+7.9 pt`).
+3. **KBLaM: Knowledge Base Augmented Language Model (Direct Parametric Knowledge Injection)**
+   - **Authors:** Microsoft Research
+   - **Preprint:** [arXiv:2410.10450](https://arxiv.org/abs/2410.10450) (October 2024)
+   - **Relevance:** Encodes external world-knowledge corpora (encyclopedic triples, textbooks, scientific databases) directly into continuous key-value memory tables via frozen sentence encoders + lightweight linear adapters, enabling a `36B` Engram to be **pre-populated with world knowledge offline** without requiring trillions of tokens of from-scratch pretraining.
+4. **MemoryLLM & M+: Self-Updatable Long-Term Latent Memory Pools**
+   - **Authors:** Yu Wang et al. (*UCSD / MIT / IBM*)
+   - **Preprints:** *MemoryLLM* (*ICML 2024*, [arXiv:2402.04624](https://arxiv.org/abs/2402.04624)) & *M+: Extending MemoryLLM with Scalable Long-Term Memory* ([arXiv:2502.00592](https://arxiv.org/abs/2502.00592), February 2025)
+   - **Relevance:** Couples a compact Transformer backbone with a self-updatable latent memory pool and co-trained retriever so new world facts can be written into the memory bank continuously without catastrophic forgetting.
+
+```bibtex
+@article{berges2024memory,
+  title={Memory Layers at Scale},
+  author={Berges, Vincent-Pierre and O{\u{g}}uz, Barlas and Haziza, Daniel and Yih, Wen-tau and Zettlemoyer, Luke and Ghosh, Gargi},
+  journal={arXiv preprint arXiv:2412.09764},
+  year={2024},
+  url={https://arxiv.org/abs/2412.09764}
+}
+
+@article{bytedance2025ultramemv2,
+  title={UltraMemV2: Memory Networks Scaling to 120B Parameters with Superior Long-Context Learning},
+  author={{ByteDance Seed Team}},
+  journal={arXiv preprint arXiv:2508.18756},
+  year={2025},
+  url={https://arxiv.org/abs/2508.18756}
+}
+
+@article{microsoft2024kblam,
+  title={KBLaM: Knowledge Base Augmented Language Model},
+  author={{Microsoft Research}},
+  journal={arXiv preprint arXiv:2410.10450},
+  year={2024},
+  url={https://arxiv.org/abs/2410.10450}
+}
+
+@article{wang2025mplus,
+  title={M+: Extending MemoryLLM with Scalable Long-Term Memory},
+  author={Wang, Yu and others},
+  journal={arXiv preprint arXiv:2502.00592},
+  year={2025},
+  url={https://arxiv.org/abs/2502.00592}
+}
+```
+
+

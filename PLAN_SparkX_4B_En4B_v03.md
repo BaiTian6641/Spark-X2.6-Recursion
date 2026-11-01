@@ -173,3 +173,29 @@ Our analysis of `v0.2` revealed two distinct phenomena:
 | **Pillar 2 (35%)**<br>**Raw-Scratchpad STEM, Math & Code Execution** | Step-by-step symbolic algebra, PhD science derivations, and verifiable math/code calculation inside `<think>`. | • `nvidia/OpenScienceReasoning-2`<br>• `Jackrong/Kimi-K2.5-Reasoning-1M-Cleaned` (`PHD-Science`)<br>• `MegaScience/MegaScience` & `MegaScience/TextbookReasoning`<br>• `OpenDataArena/Spark-234K`<br>• `HuggingFaceTB/smoltalk2` (`OpenThoughts3_1.2M`)<br>• `openai/gsm8k` + **OpenCode Go** (`https://opencode.ai/zen/go/v1`: `deepseek-v4-pro`, `mimo-v2.6-pro`, `kimi-k3.1-pro`) verified CoT | Verified final answers (`\boxed{}` / `####`); preserves native RL arithmetic scratchpad fidelity. |
 | **Pillar 3 (25%)**<br>**Natural Human Language & Anti-Slop Prose** | Eliminates "Claudish / robotic AI" tone; grounds output fluency in authentic human essays, literature, and natural phrasing. | • `HuggingFaceH4/no_robots` (10k 100%-human-written texts)<br>• `OpenAssistant/oasst2` (human multilingual conversation trees)<br>• `SAA-Lab/LitBench` (debiased human literary prose)<br>• `ChaoticNeutrals/Creative_Writing-ShareGPT`<br>• `Pageshift-Entertainment/LongPage`<br>• `allenai/tulu-v2-sft-mixture` (`LIMA` human-authored split) | **100% Human / De-Slopped Prose**: Trained without synthetic `<think>` prefixes when `has_cot=False` so the model's surface language model stays crisp, varied, and human. |
 | **Pillar 4 (15%)**<br>**Multi-Turn Technical & Everyday Dialogue** | Long-horizon multi-turn instruction following and context retention. | • `nvidia/Nemotron-Instruction-Following-Chat-v1`<br>• `NousResearch/Hermes-3-Dataset`<br>• `HuggingFaceH4/ultrachat_200k`<br>• `DataCreatorAI/Multi-Turn-Conversational-SFT` | Multi-turn history packing (`up to 6 turns`) with assistant-only loss masking. |
+
+---
+
+## 7. Long-Term Horizon Roadmap: `Spark-X2.6-4B-En36B-A1B` (`40B` Total / `5.2B` Active)
+
+Once `Spark-X2.6-4B-En4B` (`8.2B` total) validates the 4B Engram scaling curve, the architecture scales naturally to **`Spark-X2.6-4B-En36B-A1B`** (`4.2B` Looped 72-Layer Backbone + `36.0B` Total / `1.0B` Active Mixture-of-Engrams = **`40.2B` Total Parameters with `5.2B` Active Parameters per Token**), synthesized from four 2024–2026 research breakthroughs:
+
+### 7.1 Four Research Pillars Enabling `En36B-A1B`
+1. **Meta FAIR — *Memory Layers at Scale* (*Berges et al., Dec 2024*, [arXiv:2412.09764](https://arxiv.org/abs/2412.09764))**:
+   - Proves that scaling product-quantized key-value memory layers up to **128B parameters** on smaller (`1B–8B`) backbones outperforms dense models with **$>2\times$ the compute FLOPs** and standard MoEs, with the largest gains on **factual world-knowledge benchmarks (TriviaQA, NaturalQuestions, MMLU)**.
+2. **ByteDance Seed — *UltraMemV2: Memory Networks Scaling to 120B Parameters* (*Aug 2025*, [arXiv:2508.18756](https://arxiv.org/abs/2508.18756))**:
+   - Demonstrates that **120B total / 2.5B active (`2.1%` sparsity)** memory networks match 8-expert MoEs while cutting memory-access cost (MAC) by **83%** and boosting long-context & multi-round memorization (`+6.2 pt`) when memory layers are integrated across **every block** rather than only sparse intervals.
+3. **Google DeepMind — *Mixture of A Million Experts (PEER)* (*He, July 2024*, [arXiv:2407.04153](https://arxiv.org/abs/2407.04153))**:
+   - Uses **Cartesian Product-Key Routing** ($N = \sqrt{N} \times \sqrt{N}$, e.g. $1024 \times 1024 = 1,048,576$ fine-grained memory slots) to reduce router scoring complexity from $O(N \cdot d)$ to **$O(\sqrt{N} \cdot d)$**, allowing a `36B` parameter bank to be routed in microseconds.
+4. **Microsoft Research — *KBLaM* ([arXiv:2410.10450](https://arxiv.org/abs/2410.10450)) & *MemoryLLM / M+* ([arXiv:2502.00592](https://arxiv.org/abs/2502.00592))**:
+   - Solves the **"Empty 36B Hard Drive" problem**: instead of needing 1 Trillion tokens of from-scratch pretraining to fill 36B parameters with world facts, external encyclopedic/scientific knowledge bases are encoded offline into the `36B` key-value memory slots using frozen representations + lightweight trainable linear adapters (`~1B` active adapter parameters).
+
+### 7.2 Architectural Blueprint of `Spark-X2.6-4B-En36B-A1B`
+Following **UltraMemV2**'s "every-block" principle, `En36B-A1B` places a **`1.0B`-parameter `TieredMoEEngram` across all 36 physical layers (`36 layers × 1.0B = 36.0B` total Engram parameters)** while keeping active Engram parameters to **`~27.8M` per layer (`1.00B` active across 36 layers)**:
+
+| Tier per Layer (× 36 Layers) | `En36B-A1B` Specification | Params / Layer | Total (36 Layers) | Active / Layer | Hardware Tier |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| **Tier 1 (Zipfian N-Gram Bank)** | `327,680` buckets × `512` dim × 3 scales | `503.3M` | **`18.12B`** | `0.006M` ($O(1)$) | **NVMe SSD `mmap` + Host DRAM Cache** |
+| **Tier 2 (Hot Shared Expert)** | SwiGLU `2560 -> 1536 -> 2560` | `11.8M` | **`0.42B`** | `11.80M` (`100%`) | **GPU HBM** |
+| **Tier 3 (Product-Key PEER/MoE)** | $N = 256 \times 256 = 65,536$ micro-experts (`Top-K = 64`), or `E = 256` experts (`Top-K = 8`) | `484.9M` | **`17.46B`** | `15.97M` (`3.3%`) | **Host DRAM / Multi-GPU Sharded HBM** |
+| **Total `En36B-A1B`** | **36 Physical Layers (`72` Virtual Layers)** | **`1.000B`** | **`36.00B`** | **`27.78M` (`1.00B` total)** | **`~10 GB` GPU HBM + `62 GB` Host DRAM/SSD** |
