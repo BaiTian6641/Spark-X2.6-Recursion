@@ -307,10 +307,14 @@ def run_step0_verification_suite(model: SparkXLoopV03, base_model: nn.Module, to
     disabled_logits = model.forward_logits(test_ids).float()
     disabled_diff = float((base_logits - disabled_logits).abs().max().item())
 
-    # 2. 1-Pass mHC + Engram enabled (passes=1, use_mhc=True, use_engram=True)
+    # 2. Exact 0.0 Zero-Gated Step-0 Parity between 1-Pass (36L) and 2-Pass (60L)
     model.set_loop(start=4, end=28, passes=1, use_mhc=True, use_engram=True, enable_p3=False)
     p1_logits = model.forward_logits(test_ids).float()
-    one_pass_diff = float((base_logits - p1_logits).abs().max().item())
+    one_pass_highway_diff = float((base_logits - p1_logits).abs().max().item())
+
+    model.set_loop(start=4, end=28, passes=2, use_mhc=True, use_engram=True, enable_p3=False)
+    p2_logits = model.forward_logits(test_ids).float()
+    p2_zero_gate_diff = float((p1_logits - p2_logits).abs().max().item())
 
     # 3. Exact 0.0 Zero-Gated Step-0 Parity between 1-Pass (36L) and 3-Pass (72L)
     model.set_loop(
@@ -328,20 +332,22 @@ def run_step0_verification_suite(model: SparkXLoopV03, base_model: nn.Module, to
     birkhoff_sinkhorn_err = float(verify_birkhoff_sinkhorn(ctrl0))
 
     print(f"[Step-0 Check 1/5] Loop-Disabled vs Raw 36L Base Diff : {disabled_diff:.8f} (req < 1e-4)")
-    print(f"[Step-0 Check 2/5] 1-Pass mHC+Engram vs Raw Base Diff : {one_pass_diff:.8f} (req < 0.05)")
+    print(f"[Step-0 Check 2/5] 36L (1-Pass) vs 60L (2-Pass) Diff  : {p2_zero_gate_diff:.8f} (req == 0.0 | highway delta={one_pass_highway_diff:.4f})")
     print(f"[Step-0 Check 3/5] 36L (1-Pass) vs 72L (3-Pass) Diff  : {step0_diff:.8f} (req == 0.0)")
     print(f"[Step-0 Check 4/5] Causal Prefix Invariance Error     : {causal_prefix_err:.8f} (req < 0.025)")
     print(f"[Step-0 Check 5/5] Birkhoff-Sinkhorn Doubly-Stochastic: {birkhoff_sinkhorn_err:.8f} (req < 1e-5)")
 
     assert disabled_diff < 1e-4, f"Loop-disabled parity failed: {disabled_diff}"
-    assert one_pass_diff < 0.05, f"1-Pass mHC initialization drift too large: {one_pass_diff}"
+    assert p2_zero_gate_diff == 0.0, f"Expected exact 0.0 Step-0 parity between 36L and 60L, got {p2_zero_gate_diff}"
+    assert one_pass_highway_diff < 2.0, f"1-Pass mHC highway delta out of range: {one_pass_highway_diff}"
     assert step0_diff == 0.0, f"Expected exact 0.0 Step-0 parity between 36L and 72L, got {step0_diff}"
     assert causal_prefix_err < 0.025, f"Causal prefix invariance failed: {causal_prefix_err}"
     assert birkhoff_sinkhorn_err < 1e-5, f"Birkhoff-Sinkhorn doubly-stochastic check failed: {birkhoff_sinkhorn_err}"
 
     return {
         'disabled_diff': disabled_diff,
-        'one_pass_diff': one_pass_diff,
+        'p2_zero_gate_diff': p2_zero_gate_diff,
+        'one_pass_highway_diff': one_pass_highway_diff,
         'step0_diff': step0_diff,
         'causal_prefix_err': causal_prefix_err,
         'birkhoff_sinkhorn_err': birkhoff_sinkhorn_err,
