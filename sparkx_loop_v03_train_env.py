@@ -1206,7 +1206,13 @@ def run_v03_four_stage_training(
 
             trainable_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
             frozen_p = sum(p.numel() for p in model.parameters() if not p.requires_grad)
-            plan_summary = ', '.join(f"{seg[0]}[{seg[1]}..{seg[2]})(p{seg[3]})" for seg in model.execution_plan)
+            spans = [f"prelude[0..{model.loop_start})"]
+            for p_idx in range(model.loop_passes):
+                spans.append(f"pass{p_idx + 1}[{model.loop_start}..{model.loop_end})")
+            if model.enable_p3 and model.loop_passes >= 2:
+                spans.append(f"pass3[{model.p3_start}..{model.p3_end})")
+            spans.append(f"coda[{model.loop_end}..{model.n_layers})")
+            plan_summary = ' -> '.join(spans)
 
             print('\n' + '=' * 108)
             print(
@@ -1263,7 +1269,8 @@ def run_v03_four_stage_training(
                 vram_alloc = torch.cuda.memory_allocated(device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
                 vram_peak = torch.cuda.max_memory_allocated(device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
                 ctrl_sample = next(iter(model.controllers.values()))
-                mhc_gain = float(ctrl_sample.attn_extra_gain.detach().abs().mean().item())
+                gain_param = getattr(ctrl_sample, 'extra_gain', getattr(ctrl_sample, 'attn_extra_gain', None))
+                mhc_gain = float(torch.tanh(gain_param.detach().float()).abs().mean().item()) if gain_param is not None else 0.0
 
                 metrics = {
                     'stage': stage_name,
@@ -1314,12 +1321,15 @@ def run_v03_four_stage_training(
                 torch.cuda.empty_cache()
 
     except BaseException as exc:
-        print(f"\n[Emergency Recovery Guard] Caught {type(exc).__name__}: {exc}. Saving recovery checkpoint...", flush=True)
-        save_and_push_v03_checkpoint(
-            model, tokenizer, cfg, 'EMERGENCY_RECOVERY', global_step,
-            history[-1] if history else {'loss': 0.0},
-            hf_token=hf_token, push_backbone=True,
-        )
+        if global_step > 0:
+            print(f"\n[Emergency Recovery Guard] Caught {type(exc).__name__}: {exc}. Saving recovery checkpoint at step {global_step}...", flush=True)
+            save_and_push_v03_checkpoint(
+                model, tokenizer, cfg, 'EMERGENCY_RECOVERY', global_step,
+                history[-1] if history else {'loss': 0.0},
+                hf_token=hf_token, push_backbone=True,
+            )
+        else:
+            print(f"\n[Emergency Recovery Guard] Caught {type(exc).__name__} at step 0 (skipping 8GB checkpoint upload): {exc}", flush=True)
         raise
 
     final_dir = export_final_v03_to_hub(
