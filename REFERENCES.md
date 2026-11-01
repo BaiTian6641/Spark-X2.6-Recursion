@@ -255,3 +255,127 @@ Used in [`patch_spark_attention_for_long_context`](file:///storage/emulated/10/D
   url={https://arxiv.org/abs/2110.14168}
 }
 ```
+
+---
+
+### 2.4 Natural Human Language, Literary Prose & Anti-Slop ("De-Claudification") Datasets (`SparkX-Loop v0.3 / En4B`)
+Curated specifically to counteract synthetic "AI slop" / "Claudish" phrasing (formulaic transitions, excessive bulleting, repetitive moralizing, and adjective bloat) and ground the model in authentic human prose and multilingual expression:
+
+| Dataset ID | Partition / Split | Description & Citation |
+| :--- | :--- | :--- |
+| [`HuggingFaceH4/no_robots`](https://huggingface.co/datasets/HuggingFaceH4/no_robots) | `default / train` | 10,000 instructions, essays, summaries, and creative texts written **100% by skilled human annotators** with zero synthetic LLM generation (*Rajani et al., 2023*). |
+| [`OpenAssistant/oasst2`](https://huggingface.co/datasets/OpenAssistant/oasst2) | `default / train` | Crowdsourced human-written multilingual conversation trees across 35+ languages (*Köpf et al., NeurIPS 2023*, [arXiv:2304.07327](https://arxiv.org/abs/2304.07327)). |
+| [`SAA-Lab/LitBench`](https://huggingface.co/datasets/SAA-Lab/LitBench) | `default / train` | Human-authored literary storytelling and debiased human preference corpus designed to eliminate synthetic "purple prose" and formulaic AI narrative tropes. |
+| [`ChaoticNeutrals/Creative_Writing-ShareGPT`](https://huggingface.co/datasets/ChaoticNeutrals/Creative_Writing-ShareGPT) | `default / train` | Multi-turn natural prose and literary style-adherence dialogues free of standard corporate assistant phrasing. |
+| [`Pageshift-Entertainment/LongPage`](https://huggingface.co/datasets/Pageshift-Entertainment/LongPage) | `default / train` | Long-form human narrative and structural pacing corpus for natural multi-page discourse. |
+| [`allenai/tulu-v2-sft-mixture`](https://huggingface.co/datasets/allenai/tulu-v2-sft-mixture) | `LIMA / human splits` | Curated human-authored instruction-response pairs from LIMA (*Zhou et al., NeurIPS 2023*, [arXiv:2305.11206](https://arxiv.org/abs/2305.11206)) and OpenAssistant. |
+
+```bibtex
+@misc{rajani2023norobots,
+  title={No Robots: 10,000 High-Quality Human-Written Instructions},
+  author={Rajani, Nazneen and Tunstall, Lewis and Beeching, Edward and Lambert, Nathan and Rush, Alexander M. and Wolf, Thomas},
+  year={2023},
+  publisher={Hugging Face},
+  howpublished={\url{https://huggingface.co/datasets/HuggingFaceH4/no_robots}}
+}
+
+@article{kopf2023openassistant,
+  title={OpenAssistant Conversations -- Democratizing Large Language Model Alignment},
+  author={K{\"o}pf, Andreas and Kilcher, Yannic and von R{\"u}tte, Dimitri and Anagnostidis, Sotiris and Tam, Zhi-Rui and Stevens, Keith and Barhoum, Abdullah and Duc, Nguyen Minh and Stanley, Oliver and Nagyfi, Rich{\'a}rd and others},
+  journal={Advances in Neural Information Processing Systems (NeurIPS)},
+  volume={36},
+  year={2023},
+  url={https://arxiv.org/abs/2304.07327}
+}
+
+@article{zhou2023lima,
+  title={LIMA: Less Is More for Alignment},
+  author={Zhou, Chunting and Liu, Pengfei and Xu, Puxin and Iyer, Srini and Sun, Jiao and Mao, Yuning and Ma, Xuezhe and Efrat, Avia and Yu, Ping and Yu, Lili and others},
+  journal={Advances in Neural Information Processing Systems (NeurIPS)},
+  volume={36},
+  year={2023},
+  url={https://arxiv.org/abs/2305.11206}
+}
+```
+
+---
+
+## 3. Research References for `Spark-X2.6-4B-En4B` (8B Total / 72-Layer Loop / $O(n \log n)$ KV Cache)
+
+### 3.1 MoE Routing Collapse & Representation Collapse Prevention
+1. **On the Representation Collapse of Sparse Mixture of Experts (`X-MoE` Hypersphere Cosine Routing)**
+   - **Authors:** Zewen Chi, Li Dong, Shaohan Huang, Damai Dai, Shuming Ma, Barun Patra, Saksham Singhal, Payal Bajaj, Xia Song, Xian-Ling Mao, Heyan Huang, Furu Wei (*Microsoft Research*)
+   - **Publication:** *NeurIPS 2022* ([arXiv:2204.09179](https://arxiv.org/abs/2204.09179))
+   - **Relevance:** Proves that linear dot-product MoE routers cause hidden states to collapse onto expert centroids; solved by projecting token hidden states and expert keys onto a low-dimensional $\ell_2$-normalized hypersphere (**Cosine Router**) with learnable temperature $\tau$.
+2. **ST-MoE: Designing Stable and Transferable Sparse Expert Models (`Router Z-Loss`)**
+   - **Authors:** Barret Zoph, Irwan Bello, Sameer Kumar, Nan Du, Yanping Huang, Jeff Dean, Noam Shazeer, William Fedus (*Google Brain*)
+   - **Preprint:** [arXiv:2202.08906](https://arxiv.org/abs/2202.08906) (2022)
+   - **Relevance:** Introduces **Router Z-Loss** $\mathcal{L}_z = \frac{1}{B}\sum_{t} \left(\log \sum_{i=1}^E \exp(z_{t,i})\right)^2$ to bound router logit magnitudes in `bfloat16` and prevent premature hard saturation into a few dominant experts.
+3. **Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-Experts (`Sigmoid Affinity + Dynamic Bias`)**
+   - **Authors:** Lean Wang, Huazuo Gao, Chenggang Zhao, Xu Sun, Damai Dai (*DeepSeek-AI*)
+   - **Preprint:** [arXiv:2408.15664](https://arxiv.org/abs/2408.15664) (2024)
+   - **Relevance:** Replaces softmax competition with independent **Sigmoid Affinity Scores** $s_{t,i} = \sigma(\hat{h}_t^\top e_i)$ and updates per-expert routing bias $b_i$ via sign-EMA load balancing without polluting language modeling gradients.
+4. **Zipfian Memory Hierarchy & Host DRAM / NVMe SSD Offloading in DeepSeek Engram**
+   - **Authors:** Xin Cheng et al. (*DeepSeek-AI & Peking University*)
+   - **Preprint:** [arXiv:2601.07372](https://arxiv.org/abs/2601.07372) (2026)
+   - **Relevance:** Exploits the Zipfian distribution of N-gram accesses and deterministic token-ID addressing to stratify multi-billion-parameter Engram tables across **GPU HBM (Hot Tier)**, **Host CPU DRAM (Warm Tier)**, and **NVMe SSD `mmap` (Cold Tier)** with asynchronous ahead-of-time PCIe prefetching during Prelude layers (`<3%` throughput overhead).
+
+```bibtex
+@inproceedings{chi2022representation,
+  title={On the Representation Collapse of Sparse Mixture of Experts},
+  author={Chi, Zewen and Dong, Li and Huang, Shaohan and Dai, Damai and Ma, Shuming and Patra, Barun and Singhal, Saksham and Bajaj, Payal and Song, Xia and Mao, Xian-Ling and others},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2022},
+  url={https://arxiv.org/abs/2204.09179}
+}
+
+@article{zoph2022stmoe,
+  title={ST-MoE: Designing Stable and Transferable Sparse Expert Models},
+  author={Zoph, Barret and Bello, Irwan and Kumar, Sameer and Du, Nan and Huang, Yanping and Dean, Jeff and Shazeer, Noam and Fedus, William},
+  journal={arXiv preprint arXiv:2202.08906},
+  year={2022},
+  url={https://arxiv.org/abs/2202.08906}
+}
+
+@article{wang2024auxiliary,
+  title={Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-Experts},
+  author={Wang, Lean and Gao, Huazuo and Zhao, Chenggang and Sun, Xu and Dai, Damai},
+  journal={arXiv preprint arXiv:2408.15664},
+  year={2024},
+  url={https://arxiv.org/abs/2408.15664}
+}
+```
+
+---
+
+### 3.2 $O(n \log n)$ Hierarchical Attention & Sub-Quadratic KV-Cache Compression
+1. **Log-Linear Attention**
+   - **Authors:** Han Guo, Yoon Kim, et al. (*MIT*)
+   - **Preprint:** [arXiv:2506.04761](https://arxiv.org/abs/2506.04761) (2025/2026) & *Adaptive Memory Decay for Log-Linear Attention* ([arXiv:2605.06946](https://arxiv.org/abs/2605.06946), 2026)
+   - **Relevance:** Replaces the $O(T)$ flat KV cache with a **Fenwick-tree (binary indexed tree) dyadic hierarchy** of $\lceil \log_2 T \rceil$ multiscale summary states per token, reducing full-attention time complexity from $O(T^2)$ to **$O(T \log T)$** and active KV footprint per query to **$O(\log T)$**.
+2. **HiP: Hierarchically Pruned Attention ($O(T \log T)$ Attention & KV Offloading)**
+   - **Authors:** Heejun Lee et al.
+   - **Preprint:** [arXiv:2406.09827](https://arxiv.org/abs/2406.09827) (2024/2025)
+   - **Relevance:** Uses hierarchical binary-tree block scoring to select top-$k$ KV blocks in $O(T \log T)$ prefill / $O(\log T)$ decode time while coordinating GPU-to-Host KV cache tiering.
+3. **HGA: Hierarchical Global Attention & HiKV: Hierarchical Importance-Aware KV Cache**
+   - **Preprints:** [arXiv:2606.30709](https://arxiv.org/abs/2606.30709) (2026) and [arXiv:2607.22389](https://arxiv.org/abs/2607.22389) (2026)
+   - **Relevance:** Two-level chunk-summary + fine-token KV routing for long-context NoPE global attention layers.
+
+```bibtex
+@article{guo2025loglinear,
+  title={Log-Linear Attention},
+  author={Guo, Han and Kim, Yoon and others},
+  journal={arXiv preprint arXiv:2506.04761},
+  year={2025},
+  url={https://arxiv.org/abs/2506.04761}
+}
+
+@article{lee2024hip,
+  title={HiP: Hierarchically Pruned Attention for Long-Context Large Language Models},
+  author={Lee, Heejun and others},
+  journal={arXiv preprint arXiv:2406.09827},
+  year={2024},
+  url={https://arxiv.org/abs/2406.09827}
+}
+```
+
