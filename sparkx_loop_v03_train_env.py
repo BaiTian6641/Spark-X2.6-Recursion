@@ -293,6 +293,7 @@ def auto_configure_vram_16k(cfg: Dict[str, Any]) -> Dict[str, Any]:
 @torch.no_grad()
 def run_step0_verification_suite(model: SparkXLoopV03, base_model: nn.Module, tokenizer: Any) -> Dict[str, float]:
     """Run all 5 Step-0 mathematical invariants before training begins."""
+    patch_spark_for_unsloth_triton(base_model)
     model.eval()
     device = next(base_model.parameters()).device
     test_text = (

@@ -292,21 +292,35 @@ def patch_spark_for_unsloth_triton(base_model: nn.Module) -> dict[str, bool]:
         mlp_cls._sparkx_triton_swiglu_patched = True
     status['patched_mlp_swiglu'] = True
 
-    # 2. Patch apply_rotary_pos_emb in modeling_spark2_5 so cos/sin never upcast q/k from BF16 to FP32
+    # 2. Patch apply_rotary_pos_emb in modeling_spark so rotated q/k are immediately cast back to BF16/FP16
     attn_mod = importlib.import_module(type(layers[0].self_attn).__module__)
-    orig_apply_rope = getattr(attn_mod, 'apply_rotary_pos_emb', None)
-    if orig_apply_rope is not None and not getattr(attn_mod, '_sparkx_bf16_rope_patched', False):
-        def _bf16_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-            if isinstance(cos, torch.Tensor) and cos.dtype != q.dtype:
-                cos = cos.to(q.dtype)
-            if isinstance(sin, torch.Tensor) and sin.dtype != q.dtype:
-                sin = sin.to(q.dtype)
-            q_emb, k_emb = orig_apply_rope(q, k, cos, sin, position_ids=position_ids, unsqueeze_dim=unsqueeze_dim)
-            if q_emb.dtype != q.dtype:
-                q_emb = q_emb.to(q.dtype)
-            if k_emb.dtype != k.dtype:
-                k_emb = k_emb.to(k.dtype)
+    orig_apply_rope = getattr(attn_mod, '_sparkx_orig_apply_rope', None)
+    if orig_apply_rope is None:
+        cur_fn = getattr(attn_mod, 'apply_rotary_pos_emb', None)
+        if getattr(attn_mod, '_sparkx_bf16_rope_patched', False) and getattr(cur_fn, '__closure__', None):
+            for cell in cur_fn.__closure__:
+                if callable(cell.cell_contents):
+                    orig_apply_rope = cell.cell_contents
+                    break
+        else:
+            orig_apply_rope = cur_fn
+        if orig_apply_rope is not None:
+            attn_mod._sparkx_orig_apply_rope = orig_apply_rope
+
+    if orig_apply_rope is not None:
+        def _bf16_apply_rotary_pos_emb(x_or_q, cos_or_k, sin_or_cos, *args, **kwargs):
+            # Spark modeling_spark.py 3-arg signature: apply_rotary_pos_emb(x, cos, sin, unsqueeze_dim=1)
+            if not args or not isinstance(args[0], torch.Tensor):
+                out = orig_apply_rope(x_or_q, cos_or_k, sin_or_cos, *args, **kwargs)
+                return out.to(x_or_q.dtype) if (isinstance(out, torch.Tensor) and out.dtype != x_or_q.dtype) else out
+            # 4-arg fallback signature: apply_rotary_pos_emb(q, k, cos, sin, ...)
+            q_emb, k_emb = orig_apply_rope(x_or_q, cos_or_k, sin_or_cos, *args, **kwargs)
+            if isinstance(q_emb, torch.Tensor) and q_emb.dtype != x_or_q.dtype:
+                q_emb = q_emb.to(x_or_q.dtype)
+            if isinstance(k_emb, torch.Tensor) and k_emb.dtype != cos_or_k.dtype:
+                k_emb = k_emb.to(cos_or_k.dtype)
             return q_emb, k_emb
+
         attn_mod.apply_rotary_pos_emb = _bf16_apply_rotary_pos_emb
         attn_mod._sparkx_bf16_rope_patched = True
     status['patched_bf16_rope'] = True
@@ -1401,16 +1415,11 @@ class SparkXLoopV03(nn.Module):
                 masks['sliding_attention'] = create_sliding_window_causal_mask(**kwargs)
         implementation = importlib.import_module(type(model.layers[0].self_attn).__module__)
         rope = {}
-        rope_dtype = embeds.dtype if embeds.dtype in (torch.bfloat16, torch.float16) else None
         for layer_type in set(cfg.layer_types):
-            cos, sin = implementation.compute_rope_cos_sin(
+            rope[layer_type] = implementation.compute_rope_cos_sin(
                 cache_position, cfg.head_dim, cfg.get_rope_theta(layer_type),
                 partial_rotary_factor=cfg.get_partial_rotary_factor(layer_type), device=device,
             )
-            if rope_dtype is not None:
-                cos = cos.to(rope_dtype)
-                sin = sin.to(rope_dtype)
-            rope[layer_type] = (cos, sin)
         return (masks, rope), cache_position
 
     def _apply_layer(self, idx, h, masks, ropes, past_key_values=None, cache_position=None, virtual_idx: Optional[int] = None):
