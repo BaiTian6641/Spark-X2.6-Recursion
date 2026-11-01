@@ -78,20 +78,30 @@ class _CacheLayersView:
 
 
 class _VisitCache:
-    """Redirects physical layer_idx KV cache updates to unique per-visit virtual_idx slots.
+    """Redirects physical layer_idx KV cache updates to unique per-visit virtual_idx slots,
+    and enforces BF16/FP16 KV cache storage so RoPE float32 intermediates never bloat KV memory.
 
     Mirrors the SenseNova-Loop-9B-Preview _VisitCache design so each recurrent pass
     over physical layers [loop_start, loop_end) maintains an independent KV cache slot.
     """
-    def __init__(self, cache, physical_idx: int, virtual_idx: int):
+    def __init__(self, cache, physical_idx: int, virtual_idx: int, kv_dtype: Optional[torch.dtype] = None):
         self.cache = cache
         self.physical_idx = physical_idx
         self.virtual_idx = virtual_idx
+        self.kv_dtype = kv_dtype
         if hasattr(cache, 'layers'):
             self.layers = _CacheLayersView(cache, physical_idx, virtual_idx)
 
     def update(self, key_states, value_states, layer_idx: int, cache_kwargs=None):
         target = self.virtual_idx if layer_idx == self.physical_idx else layer_idx
+        if self.kv_dtype is not None:
+            if isinstance(key_states, torch.Tensor) and key_states.dtype != self.kv_dtype:
+                key_states = key_states.to(self.kv_dtype)
+            if isinstance(value_states, torch.Tensor) and value_states.dtype != self.kv_dtype:
+                value_states = value_states.to(self.kv_dtype)
+        elif isinstance(key_states, torch.Tensor) and isinstance(value_states, torch.Tensor):
+            if key_states.dtype == torch.float32 and value_states.dtype in (torch.bfloat16, torch.float16):
+                key_states = key_states.to(value_states.dtype)
         return self.cache.update(key_states, value_states, target, cache_kwargs)
 
     def __getattr__(self, name):
@@ -99,17 +109,27 @@ class _VisitCache:
 
 
 def patch_spark_attention_for_long_context(base_model: nn.Module) -> int:
-    """Replace Spark2_5Attention's O(T^2) eager_attention_forward with fused PyTorch SDPA / GQA.
+    """Replace Spark2_5Attention's O(T^2) eager_attention_forward with fused BF16 PyTorch SDPA / GQA.
 
     Preserves Spark-X2.6-4B's 1M context window architecture (sliding_window=512 RoPE on
     local layers + NoPE on full_attention layers + headwise sigmoid g_proj gate) while
-    avoiding materializing the [B, 32, T, T] attention matrix and 4x repeat_kv expansion.
+    avoiding materializing the [B, 32, T, T] attention matrix, enforcing BF16 KV/SDPA execution,
+    and slicing sliding-window layers to `sliding_window` during single-token cached decoding.
     """
     if not hasattr(base_model, 'model') or not hasattr(base_model.model, 'layers'):
         return 0
     layers = base_model.model.layers
     if not layers or not hasattr(layers[0], 'self_attn'):
         return 0
+    default_sw = int(getattr(getattr(base_model, 'config', None), 'sliding_window', 512) or 512)
+    for lyr in layers:
+        is_sl = (
+            getattr(lyr, 'layer_type', '') == 'sliding_attention'
+            or bool(getattr(lyr.self_attn, 'sliding_window', None))
+            or bool(getattr(lyr.self_attn, 'is_sliding', False))
+        )
+        lyr.self_attn._sparkx_sliding_window = int(getattr(lyr.self_attn, 'sliding_window', None) or default_sw) if is_sl else None
+
     attn_mod = importlib.import_module(type(layers[0].self_attn).__module__)
     if not hasattr(attn_mod, 'eager_attention_forward'):
         return 0
@@ -130,10 +150,20 @@ def patch_spark_attention_for_long_context(base_model: nn.Module) -> int:
     ):
         if scaling is None:
             scaling = 1.0 / math.sqrt(query.shape[-1])
-        if key.dtype != query.dtype:
-            key = key.to(query.dtype)
-        if value.dtype != query.dtype:
-            value = value.to(query.dtype)
+        qkv_proj = getattr(module, 'q_k_v_proj', None)
+        target_dtype = getattr(qkv_proj, 'weight', value).dtype if qkv_proj is not None else value.dtype
+        if query.dtype != target_dtype:
+            query = query.to(target_dtype)
+        if key.dtype != target_dtype:
+            key = key.to(target_dtype)
+        if value.dtype != target_dtype:
+            value = value.to(target_dtype)
+
+        sw = getattr(module, '_sparkx_sliding_window', None) or getattr(module, 'sliding_window', None)
+        if sw is not None and attention_mask is None and query.shape[-2] == 1 and key.shape[-2] > int(sw):
+            key = key[:, :, -int(sw):, :]
+            value = value[:, :, -int(sw):, :]
+
         attn_mask = None
         if attention_mask is not None:
             attn_mask = attention_mask[:, :, :, : key.shape[-2]]
@@ -661,11 +691,15 @@ class SparkXLoop(nn.Module):
         return len(self.execution_plan)
 
     def _make_loop_cache_config(self):
+        plan = tuple(self.execution_plan)
+        if getattr(self, '_cached_loop_plan', None) == plan and getattr(self, '_cached_loop_cfg', None) is not None:
+            return self._cached_loop_cfg
         cfg = copy.deepcopy(self.base.config)
-        plan = self.execution_plan
         cfg.num_hidden_layers = len(plan)
         if hasattr(cfg, 'layer_types') and cfg.layer_types:
             cfg.layer_types = [cfg.layer_types[i] for i in plan]
+        self._cached_loop_plan = plan
+        self._cached_loop_cfg = cfg
         return cfg
 
     def _checkpoint_context(self):
@@ -676,6 +710,7 @@ class SparkXLoop(nn.Module):
     def set_loop(self, start: int, end: int, passes: int, use_mhc: bool = True, use_engram: bool = True):
         self.loop_start, self.loop_end, self.loop_passes = start, end, passes
         self.mhc_enabled, self.engram_enabled = use_mhc, use_engram
+        self._cached_loop_cfg = None
         self._validate_loop()
         for idx in range(start, end):
             if str(idx) not in self.controllers:
@@ -693,30 +728,46 @@ class SparkXLoop(nn.Module):
         # Test doubles can supply a minimal context without importing Transformers.
         if hasattr(model, 'make_loop_context'):
             return model.make_loop_context(embeds, attention_mask), cache_position
-        from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
-        mask_cfg = self._make_loop_cache_config() if past_key_values is not None else cfg
-        kwargs = dict(config=mask_cfg, input_embeds=embeds, attention_mask=attention_mask,
-                      cache_position=cache_position, past_key_values=past_key_values, position_ids=position_ids)
-        masks = {'full_attention': create_causal_mask(**kwargs)}
-        if getattr(model, 'has_sliding_layers', False):
-            masks['sliding_attention'] = create_sliding_window_causal_mask(**kwargs)
+        # Fast path for single-token KV-cached decoding: avoid building 60-layer 4D masks every token!
+        if past_key_values is not None and embeds.shape[1] == 1 and attention_mask is None:
+            masks = {'full_attention': None, 'sliding_attention': None}
+        else:
+            from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+            mask_cfg = self._make_loop_cache_config() if past_key_values is not None else cfg
+            kwargs = dict(config=mask_cfg, input_embeds=embeds, attention_mask=attention_mask,
+                          cache_position=cache_position, past_key_values=past_key_values, position_ids=position_ids)
+            masks = {'full_attention': create_causal_mask(**kwargs)}
+            if getattr(model, 'has_sliding_layers', False):
+                masks['sliding_attention'] = create_sliding_window_causal_mask(**kwargs)
         implementation = importlib.import_module(type(model.layers[0].self_attn).__module__)
         rope = {}
+        rope_dtype = embeds.dtype if (past_key_values is not None and embeds.dtype in (torch.bfloat16, torch.float16)) else None
         for layer_type in set(cfg.layer_types):
-            rope[layer_type] = implementation.compute_rope_cos_sin(
+            cos, sin = implementation.compute_rope_cos_sin(
                 cache_position, cfg.head_dim, cfg.get_rope_theta(layer_type),
                 partial_rotary_factor=cfg.get_partial_rotary_factor(layer_type), device=device,
             )
+            if rope_dtype is not None:
+                cos = cos.to(rope_dtype)
+                sin = sin.to(rope_dtype)
+            rope[layer_type] = (cos, sin)
         return (masks, rope), cache_position
 
     def _apply_layer(self, idx, h, masks, ropes, past_key_values=None, cache_position=None, virtual_idx: Optional[int] = None):
         layer = self.base.model.layers[idx]
         kind = layer.layer_type
         rp, mk = ropes[kind], masks[kind]
-        v_cache = _VisitCache(past_key_values, idx, virtual_idx if virtual_idx is not None else idx) if past_key_values is not None else None
-        def step(x, _layer=layer, _rp=rp, _mk=mk, _vc=v_cache, _cp=cache_position):
-            return _layer(x, position_embeddings=_rp, attention_mask=_mk,
-                          past_key_values=_vc, cache_position=_cp)
+        kv_dtype = self.base.model.embedding.weight.dtype
+        v_cache = (
+            _VisitCache(past_key_values, idx, virtual_idx if virtual_idx is not None else idx, kv_dtype=kv_dtype)
+            if past_key_values is not None else None
+        )
+        target_dtype = layer.mlp.gate_proj.weight.dtype
+        def step(x, _layer=layer, _rp=rp, _mk=mk, _vc=v_cache, _cp=cache_position, _dt=target_dtype):
+            x_in = x.to(_dt) if x.dtype != _dt else x
+            out = _layer(x_in, position_embeddings=_rp, attention_mask=_mk,
+                         past_key_values=_vc, cache_position=_cp)
+            return out.to(x.dtype) if out.dtype != x.dtype else out
         if v_cache is None and self.training and self.enable_checkpoint and (
             h.requires_grad or any(p.requires_grad for p in layer.parameters())
         ):
@@ -734,6 +785,7 @@ class SparkXLoop(nn.Module):
             embeds, attention_mask, past_key_values=past_key_values, cache_position=cache_position
         )
         h = embeds.float()  # matches upstream Spark 2.5 model forward
+        kv_dtype = embeds.dtype
         virtual_idx = 0
         ngram_indices = (
             self.engram.compute_ngram_indices(input_ids, self.settings.eng_buckets, prev_ids=prev_ids)
@@ -774,7 +826,7 @@ class SparkXLoop(nn.Module):
                     layer = self.base.model.layers[idx]
                     ctrl = self.controllers[str(idx)]
                     rp, mk = ropes[kind], masks[kind]
-                    v_cache = _VisitCache(past_key_values, idx, virtual_idx) if past_key_values is not None else None
+                    v_cache = _VisitCache(past_key_values, idx, virtual_idx, kv_dtype=kv_dtype) if past_key_values is not None else None
                     eng_mod = (
                         self.backbone_engrams[str(idx)]
                         if (self.engram_enabled and str(idx) in self.backbone_engrams)
@@ -805,7 +857,8 @@ class SparkXLoop(nn.Module):
             h = self._apply_layer(idx, h, masks, ropes, past_key_values=past_key_values,
                                   cache_position=cache_position, virtual_idx=virtual_idx)
             virtual_idx += 1
-        return self.base.model.norm(h).to(self.base.model.embedding.weight.dtype)
+        norm_in = h.to(kv_dtype) if (not self.training and kv_dtype in (torch.bfloat16, torch.float16)) else h
+        return self.base.model.norm(norm_in).to(kv_dtype)
 
     def _head_weight(self) -> torch.Tensor:
         if getattr(self.base.config, 'tie_word_embeddings', False):
@@ -1139,6 +1192,7 @@ def patch_spark_attention_for_loglinear_kv(
     """Runtime-only O(n^2) -> O(n log n) KV cache optimization for Spark-X2.6-4B's NoPE layers.
 
     - Requires ZERO checkpoint weight changes.
+    - Enforces BF16/FP16 KV & SDPA execution and slices sliding-window layers to `sliding_window` during single-token decoding.
     - For T <= exact_threshold (default 2048) or sliding-window RoPE layers, executes exact fused SDPA.
     - For T > exact_threshold on NoPE full-attention layers, compresses middle KV history via
       Pinned Sinks + Exact Local Window + HiP Top-M Exact Blocks + Log-Mass-Conserved Dyadic Fenwick Summaries.
@@ -1148,6 +1202,15 @@ def patch_spark_attention_for_loglinear_kv(
     layers = base_model.model.layers
     if not layers or not hasattr(layers[0], 'self_attn'):
         return 0
+    default_sw = int(getattr(getattr(base_model, 'config', None), 'sliding_window', 512) or 512)
+    for lyr in layers:
+        is_sl = (
+            getattr(lyr, 'layer_type', '') == 'sliding_attention'
+            or bool(getattr(lyr.self_attn, 'sliding_window', None))
+            or bool(getattr(lyr.self_attn, 'is_sliding', False))
+        )
+        lyr.self_attn._sparkx_sliding_window = int(getattr(lyr.self_attn, 'sliding_window', None) or default_sw) if is_sl else None
+
     attn_mod = importlib.import_module(type(layers[0].self_attn).__module__)
     orig_repeat_kv = getattr(attn_mod, 'repeat_kv', None)
 
@@ -1163,12 +1226,21 @@ def patch_spark_attention_for_loglinear_kv(
     ):
         if scaling is None:
             scaling = 1.0 / math.sqrt(query.shape[-1])
-        if key.dtype != query.dtype:
-            key = key.to(query.dtype)
-        if value.dtype != query.dtype:
-            value = value.to(query.dtype)
+        qkv_proj = getattr(module, 'q_k_v_proj', None)
+        target_dtype = getattr(qkv_proj, 'weight', value).dtype if qkv_proj is not None else value.dtype
+        if query.dtype != target_dtype:
+            query = query.to(target_dtype)
+        if key.dtype != target_dtype:
+            key = key.to(target_dtype)
+        if value.dtype != target_dtype:
+            value = value.to(target_dtype)
 
-        is_nope_full = (getattr(module, 'sliding_window', None) is None) and (not getattr(module, 'is_sliding', False))
+        sw = getattr(module, '_sparkx_sliding_window', None) or getattr(module, 'sliding_window', None)
+        is_nope_full = (sw is None) and (not getattr(module, 'is_sliding', False))
+        if sw is not None and attention_mask is None and query.shape[-2] == 1 and key.shape[-2] > int(sw):
+            key = key[:, :, -int(sw):, :]
+            value = value[:, :, -int(sw):, :]
+
         seq_q, seq_k = query.shape[-2], key.shape[-2]
 
         # Activate Log-Linear KV compression on NoPE full-attention layers when history exceeds threshold
