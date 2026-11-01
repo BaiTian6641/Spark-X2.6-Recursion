@@ -27,7 +27,7 @@ token = os.environ.get('HF_TOKEN') or os.environ.get('HF_TOKEM')
 enable_thinking = os.environ.get('ENABLE_THINKING', '1').lower() not in ('0', 'false', 'no')
 use_visit_cache = os.environ.get('USE_VISIT_CACHE', '1').lower() not in ('0', 'false', 'no')
 enable_loglinear_kv = os.environ.get('LOGLINEAR_KV', '0').lower() in ('1', 'true', 'yes')
-max_new_tokens = int(os.environ.get('MAX_NEW_TOKENS', '512' if enable_thinking else '128'))
+max_new_tokens = int(os.environ.get('MAX_NEW_TOKENS', '262144' if enable_thinking else '8192'))
 if not torch.cuda.is_available():
     raise RuntimeError('CUDA GPU required for default inference script')
 
@@ -42,7 +42,7 @@ base_rev = None if is_formal else meta.get('base_revision')
 
 base = AutoModelForCausalLM.from_pretrained(
     base_source, revision=base_rev, trust_remote_code=True,
-    torch_dtype=dtype, device_map={'': 'cuda:0'}, token=token, attn_implementation='eager'
+    dtype=dtype, device_map={'': 'cuda:0'}, token=token, attn_implementation='eager'
 )
 tok = AutoTokenizer.from_pretrained(
     base_source, revision=base_rev, trust_remote_code=True, token=token

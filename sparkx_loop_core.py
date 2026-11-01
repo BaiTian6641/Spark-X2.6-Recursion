@@ -1006,7 +1006,8 @@ def merge_lora_in_place(base_model: nn.Module) -> int:
             mod = getattr(parent, attr, None)
             if isinstance(mod, LoRALinear):
                 delta = (mod.lora_B.weight.float() @ mod.lora_A.weight.float()) * float(mod.scale)
-                mod.base.weight.data.add_(delta.to(mod.base.weight.dtype))
+                merged_w = mod.base.weight.data.float() + delta
+                mod.base.weight.data.copy_(merged_w.to(mod.base.weight.dtype))
                 setattr(parent, attr, mod.base)
                 merged += 1
     return merged

@@ -56,7 +56,7 @@ def load_sparkx_loop_v03(
     base = AutoModelForCausalLM.from_pretrained(
         backbone_source,
         trust_remote_code=True,
-        torch_dtype=dtype,
+        dtype=dtype,
         low_cpu_mem_usage=True,
         token=token,
     ).to(device)
