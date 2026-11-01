@@ -974,5 +974,264 @@ def trainable_state(model: SparkXLoop):
     return {name: p.detach().cpu().contiguous() for name, p in model.named_parameters() if p.requires_grad}
 
 
+def loop_modules_state(model: SparkXLoop) -> dict[str, torch.Tensor]:
+    """Export all parameters and buffers for Sublayer Dual-mHC controllers and 3-Tier MoE-Engrams."""
+    prefixes = ('controllers.', 'engram.', 'backbone_engrams.')
+    state: dict[str, torch.Tensor] = {}
+    for name, p in model.named_parameters():
+        if name.startswith(prefixes):
+            state[name] = p.detach().cpu().contiguous()
+    for name, b in model.named_buffers():
+        if name.startswith(prefixes):
+            state[name] = b.detach().cpu().contiguous()
+    return state
+
+
+@torch.no_grad()
+def merge_lora_in_place(base_model: nn.Module) -> int:
+    """Fold any attached LoRALinear adapters directly into the underlying nn.Linear weights."""
+    if not hasattr(base_model, 'model') or not hasattr(base_model.model, 'layers'):
+        return 0
+    merged = 0
+    for layer in base_model.model.layers:
+        paths = [
+            (layer.self_attn, 'q_k_v_proj'),
+            (layer.self_attn, 'out_proj'),
+            (layer.self_attn, 'g_proj'),
+            (layer.mlp, 'gate_proj'),
+            (layer.mlp, 'up_proj'),
+            (layer.mlp, 'down_proj'),
+        ]
+        for parent, attr in paths:
+            mod = getattr(parent, attr, None)
+            if isinstance(mod, LoRALinear):
+                delta = (mod.lora_B.weight.float() @ mod.lora_A.weight.float()) * float(mod.scale)
+                mod.base.weight.data.add_(delta.to(mod.base.weight.dtype))
+                setattr(parent, attr, mod.base)
+                merged += 1
+    return merged
+
+
+def _compress_nope_kv_loglinear(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    sink_tokens: int = 32,
+    local_window: int = 1024,
+    base_block: int = 32,
+    hip_top_blocks: int = 8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Log-Mass-Conserved Dyadic Fenwick Tree + HiP Top-M Exact Block selection for NoPE KV caches.
+
+    Returns (compressed_key, compressed_value, log_mass_bias) where log_mass_bias has shape
+    [B, 1, 1, K_eff] so that exp(q.k / sqrt(d) + ln(m)) = m * exp(q.k / sqrt(d)), strictly
+    preserving the softmax partition denominator without model collapse.
+    """
+    bsz, n_kv_heads, seq_k, head_dim = key.shape
+    device = key.device
+    dtype = query.dtype
+
+    mid_start = min(sink_tokens, seq_k)
+    mid_end = max(mid_start, seq_k - local_window)
+    mid_len = mid_end - mid_start
+    n_blocks = mid_len // base_block
+
+    if n_blocks <= hip_top_blocks + 2:
+        zeros = torch.zeros((bsz, 1, 1, seq_k), dtype=dtype, device=device)
+        return key, value, zeros
+
+    usable_mid_end = mid_start + n_blocks * base_block
+    k_sink = key[:, :, :mid_start, :]
+    v_sink = value[:, :, :mid_start, :]
+    k_local = key[:, :, usable_mid_end:, :]
+    v_local = value[:, :, usable_mid_end:, :]
+
+    k_mid = key[:, :, mid_start:usable_mid_end, :].view(bsz, n_kv_heads, n_blocks, base_block, head_dim)
+    v_mid = value[:, :, mid_start:usable_mid_end, :].view(bsz, n_kv_heads, n_blocks, base_block, head_dim)
+
+    # 1. Compute block centroids and norm-preserving key directions
+    k_mid_f = k_mid.float()
+    v_mid_f = v_mid.float()
+    block_mean_k = k_mid_f.mean(dim=3)  # [B, H_kv, n_blocks, D]
+    block_mean_norm = k_mid_f.norm(dim=-1, keepdim=True).mean(dim=3)  # [B, H_kv, n_blocks, 1]
+    centroid_k = block_mean_k * (block_mean_norm / (block_mean_k.norm(dim=-1, keepdim=True) + 1e-6))
+    centroid_v = v_mid_f.mean(dim=3)
+
+    # 2. HiP Top-M block selection using the latest query vector(s)
+    q_ref = query[:, :, -min(4, query.shape[2]):, :].float().mean(dim=2)  # [B, H_q, D]
+    if q_ref.shape[1] != n_kv_heads:
+        groups = q_ref.shape[1] // n_kv_heads
+        q_ref_kv = q_ref.view(bsz, n_kv_heads, groups, head_dim).mean(dim=2)
+    else:
+        q_ref_kv = q_ref
+    # Score blocks across heads: [B, n_blocks]
+    block_scores = torch.einsum('bhd,bhnd->bn', q_ref_kv, centroid_k) / math.sqrt(head_dim)
+    top_m = min(hip_top_blocks, n_blocks)
+    _, top_idx = torch.topk(block_scores, k=top_m, dim=-1, sorted=True)  # [B, top_m]
+
+    # For batch_size == 1 (standard inference/decoding), partition into exact Top-M blocks + dyadic summaries
+    top_set = set(top_idx[0].tolist())
+    exact_k_list = [k_sink]
+    exact_v_list = [v_sink]
+    for b_idx in sorted(top_set):
+        exact_k_list.append(k_mid[:, :, b_idx, :, :])
+        exact_v_list.append(v_mid[:, :, b_idx, :, :])
+
+    # 3. Group remaining non-selected contiguous blocks into dyadic power-of-2 Fenwick intervals
+    sum_k_list = []
+    sum_v_list = []
+    sum_log_mass = []
+    i = 0
+    while i < n_blocks:
+        if i in top_set:
+            i += 1
+            continue
+        # Find longest power-of-2 span starting at i that does not intersect top_set
+        span = 1
+        while (i + span * 2 <= n_blocks) and all((i + j) not in top_set for j in range(span * 2)):
+            # Fenwick alignment: prefer dyadic step sizes up to 16 blocks (512 tokens)
+            if span >= 16:
+                break
+            span *= 2
+        if span == 1:
+            sum_k_list.append(centroid_k[:, :, i : i + 1, :].to(key.dtype))
+            sum_v_list.append(centroid_v[:, :, i : i + 1, :].to(value.dtype))
+        else:
+            sub_k = centroid_k[:, :, i : i + span, :]
+            sub_norm = sub_k.norm(dim=-1, keepdim=True).mean(dim=2, keepdim=True)
+            sub_mean = sub_k.mean(dim=2, keepdim=True)
+            merged_k = sub_mean * (sub_norm / (sub_mean.norm(dim=-1, keepdim=True) + 1e-6))
+            merged_v = centroid_v[:, :, i : i + span, :].mean(dim=2, keepdim=True)
+            sum_k_list.append(merged_k.to(key.dtype))
+            sum_v_list.append(merged_v.to(value.dtype))
+        sum_log_mass.append(math.log(float(span * base_block)))
+        i += span
+
+    exact_k_list.append(k_local)
+    exact_v_list.append(v_local)
+
+    k_exact_all = torch.cat(exact_k_list, dim=2)
+    v_exact_all = torch.cat(exact_v_list, dim=2)
+    n_exact = k_exact_all.shape[2]
+
+    if sum_k_list:
+        k_sum_all = torch.cat(sum_k_list, dim=2)
+        v_sum_all = torch.cat(sum_v_list, dim=2)
+        k_out = torch.cat([k_exact_all, k_sum_all], dim=2)
+        v_out = torch.cat([v_exact_all, v_sum_all], dim=2)
+        bias = torch.zeros((bsz, 1, 1, n_exact + len(sum_log_mass)), dtype=dtype, device=device)
+        bias[:, :, :, n_exact:] = torch.tensor(sum_log_mass, dtype=dtype, device=device).view(1, 1, 1, -1)
+        return k_out, v_out, bias
+
+    bias = torch.zeros((bsz, 1, 1, n_exact), dtype=dtype, device=device)
+    return k_exact_all, v_exact_all, bias
+
+
+def patch_spark_attention_for_loglinear_kv(
+    base_model: nn.Module,
+    exact_threshold: int = 2048,
+    sink_tokens: int = 32,
+    local_window: int = 1024,
+    base_block: int = 32,
+    hip_top_blocks: int = 8,
+) -> int:
+    """Runtime-only O(n^2) -> O(n log n) KV cache optimization for Spark-X2.6-4B's NoPE layers.
+
+    - Requires ZERO checkpoint weight changes.
+    - For T <= exact_threshold (default 2048) or sliding-window RoPE layers, executes exact fused SDPA.
+    - For T > exact_threshold on NoPE full-attention layers, compresses middle KV history via
+      Pinned Sinks + Exact Local Window + HiP Top-M Exact Blocks + Log-Mass-Conserved Dyadic Fenwick Summaries.
+    """
+    if not hasattr(base_model, 'model') or not hasattr(base_model.model, 'layers'):
+        return 0
+    layers = base_model.model.layers
+    if not layers or not hasattr(layers[0], 'self_attn'):
+        return 0
+    attn_mod = importlib.import_module(type(layers[0].self_attn).__module__)
+    orig_repeat_kv = getattr(attn_mod, 'repeat_kv', None)
+
+    def loglinear_sdpa_attention_forward(
+        module: nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        scaling: Optional[float] = None,
+        dropout: float = 0.0,
+        **kwargs,
+    ):
+        if scaling is None:
+            scaling = 1.0 / math.sqrt(query.shape[-1])
+        if key.dtype != query.dtype:
+            key = key.to(query.dtype)
+        if value.dtype != query.dtype:
+            value = value.to(query.dtype)
+
+        is_nope_full = (getattr(module, 'sliding_window', None) is None) and (not getattr(module, 'is_sliding', False))
+        seq_q, seq_k = query.shape[-2], key.shape[-2]
+
+        # Activate Log-Linear KV compression on NoPE full-attention layers when history exceeds threshold
+        if (
+            not module.training
+            and is_nope_full
+            and seq_k > exact_threshold
+            and seq_q <= 64
+            and query.shape[0] == 1
+        ):
+            k_comp, v_comp, log_mass_bias = _compress_nope_kv_loglinear(
+                query, key, value,
+                sink_tokens=sink_tokens,
+                local_window=local_window,
+                base_block=base_block,
+                hip_top_blocks=hip_top_blocks,
+            )
+            use_gqa = _SDPA_SUPPORTS_GQA and (module.num_key_value_groups > 1)
+            if not use_gqa and orig_repeat_kv is not None and module.num_key_value_groups > 1:
+                k_comp = orig_repeat_kv(k_comp, module.num_key_value_groups)
+                v_comp = orig_repeat_kv(v_comp, module.num_key_value_groups)
+            sdpa_kwargs = {'scale': scaling}
+            if use_gqa:
+                sdpa_kwargs['enable_gqa'] = True
+            out = F.scaled_dot_product_attention(
+                query,
+                k_comp,
+                v_comp,
+                attn_mask=log_mass_bias.expand(query.shape[0], 1, seq_q, k_comp.shape[-2]),
+                dropout_p=0.0,
+                is_causal=False,
+                **sdpa_kwargs,
+            )
+            return out, None
+
+        attn_mask = None
+        if attention_mask is not None:
+            attn_mask = attention_mask[:, :, :, : key.shape[-2]]
+            if attn_mask.dtype != torch.bool and attn_mask.dtype != query.dtype:
+                attn_mask = attn_mask.to(query.dtype)
+        use_gqa = _SDPA_SUPPORTS_GQA and (module.num_key_value_groups > 1)
+        if not use_gqa and orig_repeat_kv is not None and module.num_key_value_groups > 1:
+            key = orig_repeat_kv(key, module.num_key_value_groups)
+            value = orig_repeat_kv(value, module.num_key_value_groups)
+        sdpa_kwargs = {'scale': scaling}
+        if use_gqa:
+            sdpa_kwargs['enable_gqa'] = True
+        out = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=dropout if module.training else 0.0,
+            is_causal=False,
+            **sdpa_kwargs,
+        )
+        return out, None
+
+    attn_mod.eager_attention_forward = loglinear_sdpa_attention_forward
+    attn_mod._sparkx_sdpa_patched = True
+    attn_mod._sparkx_loglinear_patched = True
+    return len(layers)
+
+
 def count_params(model: SparkXLoop):
     return sum(p.numel() for p in model.parameters()), sum(p.numel() for p in model.parameters() if p.requires_grad)
+

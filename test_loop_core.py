@@ -162,4 +162,34 @@ assert loop.backbone_engrams['7'].expert_up.grad is not None
 all_params = set_trainables(loop, full_finetune=True)
 assert base.model.layers[0].mlp.gate_proj.weight.requires_grad
 assert base.model.layers[7].mlp.gate_proj.base.weight.requires_grad
-print('PASS cpu: Dual-mHC, pass adapters, Backbone Tiered MoE-Engram, chunked CE, _VisitCache, full/hybrid train', count_params(loop))
+
+# Verify merge_lora_in_place preserves exact forward logits and loop_modules_state exports controllers + engrams + buffers
+from sparkx_loop_core import merge_lora_in_place, loop_modules_state, _compress_nope_kv_loglinear
+nn.init.normal_(base.model.layers[7].mlp.gate_proj.lora_B.weight, std=0.02)
+loop.eval()
+pre_merge_logits = loop.forward_logits(ids)
+merged_cnt = merge_lora_in_place(base)
+assert merged_cnt == 24
+post_merge_logits = loop.forward_logits(ids)
+assert torch.allclose(pre_merge_logits, post_merge_logits, rtol=1e-5, atol=1e-5), (pre_merge_logits - post_merge_logits).abs().max()
+
+lstate = loop_modules_state(loop)
+assert any(k.startswith('controllers.') for k in lstate)
+assert any(k.startswith('engram.') for k in lstate)
+assert any(k.startswith('backbone_engrams.') for k in lstate)
+assert 'engram.expert_load_ema' in lstate
+
+# Verify Log-Linear NoPE KV compression preserves shape and adds log-mass bias
+q_test = torch.randn(1, 4, 1, 16)
+k_test = torch.randn(1, 2, 1600, 16)
+v_test = torch.randn(1, 2, 1600, 16)
+k_comp, v_comp, log_bias = _compress_nope_kv_loglinear(
+    q_test, k_test, v_test, sink_tokens=16, local_window=256, base_block=16, hip_top_blocks=4
+)
+assert k_comp.shape[2] < k_test.shape[2]
+assert k_comp.shape == v_comp.shape
+assert log_bias.shape == (1, 1, 1, k_comp.shape[2])
+assert (log_bias >= 0).all() and (log_bias > 0).any()
+
+print('PASS cpu: Dual-mHC, pass adapters, Backbone Tiered MoE-Engram, LoRA merge, Log-Linear KV, _VisitCache', count_params(loop))
+
