@@ -300,7 +300,89 @@ Curated specifically to counteract synthetic "AI slop" / "Claudish" phrasing (fo
 
 ---
 
-## 3. Research References for `Spark-X2.6-4B-En4B` (8B Total / 72-Layer Loop / $O(n \log n)$ KV Cache)
+### 2.5 Agentic Tool Calling, Model Context Protocol (MCP) & Interleaved Thinking Datasets (`SparkX-Loop v0.3 / En4B-A1B`)
+Curated to train mid-reasoning tool invocation (`<think>...</think><tool_call>...</tool_call>` $\to$ `<tool_response>...</tool_response>` $\to$ `<think>...</think>`), strict JSON schema adherence, parallel/dependent function calling, and real-world MCP tool use:
+
+| Dataset ID | Partition / Split | Description & Citation |
+| :--- | :--- | :--- |
+| [`Agent-Ark/Toucan-1.5M`](https://huggingface.co/datasets/Agent-Ark/Toucan-1.5M) | `default / train` | **1.5M multi-turn, multi-tool agent trajectories** synthesized from ~500 real-world **Model Context Protocol (MCP)** environments spanning 2,000+ executable tools ([arXiv:2510.01179](https://arxiv.org/abs/2510.01179), Apache 2.0). |
+| [`Team-ACE/ToolACE`](https://huggingface.co/datasets/Team-ACE/ToolACE) | `default / train` | BFCL-leading function-calling dataset across **26,507 diverse APIs**, covering single, parallel, nested, and multi-turn dependent tool invocations (*Liu et al., ICLR 2025*, [arXiv:2409.00920](https://arxiv.org/abs/2409.00920), Apache 2.0). |
+| [`Salesforce/xlam-function-calling-60k`](https://huggingface.co/datasets/Salesforce/xlam-function-calling-60k) | `default / train` | 60,000 function-calling trajectories generated via **APIGen** and verified by a 3-tier pipeline (format check, live execution, semantic verification; *Liu et al., 2024*, [arXiv:2406.18518](https://arxiv.org/abs/2406.18518)). |
+| [`Salesforce/APIGen-MT-5k`](https://huggingface.co/datasets/Salesforce/APIGen-MT-5k) | `default / train` | 5,000 multi-turn agent-human interplay trajectories with executable ground-truth verification (*Salesforce AI Research, 2025*, [arXiv:2504.03601](https://arxiv.org/abs/2504.03601)). |
+| [`hxssgaa/xlam-interleave-thinking-40k`](https://huggingface.co/datasets/hxssgaa/xlam-interleave-thinking-40k) | `default / train` | 40,000 interleaved thinking trajectories where the assistant explicitly plans tool selection and argument deduction inside `<think>...</think>` prior to emitting `<tool_call>`. |
+| [`pyromind/agentic-tool-call-dataset-12k`](https://huggingface.co/datasets/pyromind/agentic-tool-call-dataset-12k) | `default / train` | 12,000 multi-step agentic tool-use traces pairing `<think>...</think>` internal deliberation with structured JSON `<tool_call>` blocks. |
+| [`NousResearch/hermes-function-calling-v1`](https://huggingface.co/datasets/NousResearch/hermes-function-calling-v1) | `default / train` | Multi-turn XML/JSON `<tools>`, `<tool_call>`, and `<tool_response>` structured function calling and JSON-schema extraction dataset. |
+| [`SWE-Gym/SWE-Gym`](https://huggingface.co/datasets/SWE-Gym/SWE-Gym) | `SWE-Gym-Lite` | Real-world executable Python software engineering (SWE) agent tasks and unit-test verification trajectories (*Pan et al., ICML 2025*, [arXiv:2412.21139](https://arxiv.org/abs/2412.21139)). |
+
+```bibtex
+@article{toucan2025mcp,
+  title={TOUCAN: Synthesizing 1.5M Tool-Agentic Data from Real-World MCP Environments},
+  author={{Agent-Ark Team}},
+  journal={arXiv preprint arXiv:2510.01179},
+  year={2025},
+  url={https://arxiv.org/abs/2510.01179}
+}
+
+@inproceedings{liu2025toolace,
+  title={ToolACE: Winning the Points of LLM Function Calling},
+  author={Liu, Weiwen and Huang, Xu and Zeng, Xingshan and Hao, Xinlong and Yu, Shuai and Li, Dexun and Wang, Shuai and Gan, Weinan and Liu, Zhengying and Yu, Yuanqing and others},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2025},
+  url={https://arxiv.org/abs/2409.00920}
+}
+
+@article{liu2024apigen,
+  title={APIGen: Automated Pipeline for Generating Verifiable and Diverse Function-Calling Datasets},
+  author={Liu, Zuxin and Hoang, Thai and Zhang, Jianguo and Zhu, Ming and Lan, Tian and Kokane, Shirley and Tan, Juntao and Yao, Weiran and Liu, Zhiwei and Feng, Yihao and others},
+  journal={arXiv preprint arXiv:2406.18518},
+  year={2024},
+  url={https://arxiv.org/abs/2406.18518}
+}
+
+@article{apigenmt2025,
+  title={APIGen-MT: Agentic Pipeline for Multi-Turn Data Generation via Simulated Agent-Human Interplay},
+  author={{Salesforce AI Research}},
+  journal={arXiv preprint arXiv:2504.03601},
+  year={2025},
+  url={https://arxiv.org/abs/2504.03601}
+}
+```
+
+---
+
+### 2.6 Verifiable Math, Code, World-Knowledge & Post-Training Datasets (`SparkX-Loop v0.3 / En4B-A1B`)
+Additional gold-standard 2024–2026 post-training corpora selected for **verifier-checked math/code execution**, **broad encyclopedic world knowledge** (to populate the `4.0B-A1B` MoE-Engram), and **decontaminated human preference alignment**:
+
+| Dataset ID | Partition / Split | Description & Citation |
+| :--- | :--- | :--- |
+| [`open-r1/OpenR1-Math-220k`](https://huggingface.co/datasets/open-r1/OpenR1-Math-220k) | `default / train` | 220,000 competition & university math problems (`NuminaMath 1.5`) with step-by-step `<think>` traces verified via `Math-Verify` and `Llama-3.3-70B-Instruct` (*Hugging Face Open-R1, 2025*, Apache 2.0). |
+| [`open-thoughts/OpenThoughts-114k`](https://huggingface.co/datasets/open-thoughts/OpenThoughts-114k) | `default / train` | 114,000 verifier-checked reasoning traces across math, science, algorithmic coding, and logic puzzles (*Bespoke Labs / OpenThoughts Team, 2025*, Apache 2.0). |
+| [`nvidia/Llama-Nemotron-Post-Training-Dataset`](https://huggingface.co/datasets/nvidia/Llama-Nemotron-Post-Training-Dataset) | `SFT` | NVIDIA's flagship post-training SFT dataset spanning verified math, software engineering, STEM reasoning, and tool calling (*Bercovich et al., NVIDIA, 2025*, CC-BY-4.0). |
+| [`allenai/tulu-3-sft-mixture`](https://huggingface.co/datasets/allenai/tulu-3-sft-mixture) | `default / train` | AI2's decontaminated open-science SFT mixture covering precise constraint following, humanities, coding, and factual QA (*Lambert et al., 2024*, [arXiv:2411.15124](https://arxiv.org/abs/2411.15124)). |
+| [`nvidia/HelpSteer2`](https://huggingface.co/datasets/nvidia/HelpSteer2) | `default / train` | Human-annotated multi-attribute preference dataset filtered for top-scoring (`helpfulness >= 4`, `correctness >= 4`, `coherence >= 4`) natural responses (*Wang et al., NeurIPS 2024*, [arXiv:2406.08673](https://arxiv.org/abs/2406.08673)). |
+| [`HuggingFaceTB/Cosmopedia-v2`](https://huggingface.co/datasets/HuggingFaceTB/Cosmopedia-v2) | `default / train` | Structured textbook chapters and conceptual world-knowledge syntheses across humanities, history, biology, chemistry, and engineering to populate the `En4B-A1B` memory experts. |
+
+```bibtex
+@article{lambert2024tulu3,
+  title={T{\"u}lu 3: Pushing Frontiers in Open Language Model Post-Training},
+  author={Lambert, Nathan and Morrison, Jacob and Pyatkin, Valentina andyi, Shengyi and Ivison, Hamish and Brahman, Faeze and Miranda, Lester James V. and Liu, Alisa and Dziri, Nouha and Lyu, Shane and others},
+  journal={arXiv preprint arXiv:2411.15124},
+  year={2024},
+  url={https://arxiv.org/abs/2411.15124}
+}
+
+@inproceedings{wang2024helpsteer2,
+  title={HelpSteer2: Open-source dataset for training top-performing reward models},
+  author={Wang, Zhilin and Dong, Yi and Olivier, Olivier and Zeng, Jiaqi and Rreed, Gerald and Shen, Makesh Narsimhan and Egert, Daniel and Zhang, Yang and Bukharin, Alexander and Delalleau, Olivier and others},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2024},
+  url={https://arxiv.org/abs/2406.08673}
+}
+```
+
+---
+
+## 3. Research References for `Spark-X2.6-4B-En4B-A1B` (8.2B Total / 5.2B Active / 72-Layer Loop / $O(n \log n)$ KV Cache)
 
 ### 3.1 MoE Routing Collapse & Representation Collapse Prevention
 1. **On the Representation Collapse of Sparse Mixture of Experts (`X-MoE` Hypersphere Cosine Routing)**
