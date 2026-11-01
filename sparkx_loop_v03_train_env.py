@@ -189,7 +189,7 @@ def build_default_cfg() -> Dict[str, Any]:
             'web_3d_ui': 0.20,
             'math_stem': 0.25,
             'tool_agent': 0.15,
-            ' concise_think': 0.05,
+            'concise_think': 0.05,
         },
 
         # OpenCode Go Multi-Model Teacher Augmentation
@@ -206,56 +206,65 @@ def build_default_cfg() -> Dict[str, Any]:
     }
 
 
-DATASET_SOURCES: Dict[str, List[Tuple[str, Optional[str], str]]] = {
+# Each entry is (repo_id, subset_config, split_name, verified_shard_path).
+# Providing `verified_shard_path` streams the exact .parquet/.jsonl shard directly via `hf://datasets/...`,
+# completely bypassing README.md parsing, dataset_infos.json, mixed .txt/.py/.png files, and 30-shard directory scans.
+DATASET_SOURCES: Dict[str, List[Tuple[str, Optional[str], str, Optional[str]]]] = {
     'code_swe': [
-        ('nvidia/OpenCodeReasoning', 'split_0', 'train'),
-        ('open-r1/verifiable-coding-problems-python_decontaminated', None, 'train'),
-        ('ise-uiuc/Magicoder-OSS-Instruct-75K', None, 'train'),
-        ('ise-uiuc/Magicoder-Evol-Instruct-110K', None, 'train'),
-        ('nickrosh/Evol-Instruct-Code-80k-v1', None, 'train'),
-        ('bigcode/self-oss-instruct-sc2-exec-filter-50k', None, 'train'),
-        ('TIGER-Lab/MathInstruct', None, 'train'),
-        ('m-a-p/CodeFeedback-Filtered-Instruction', None, 'train'),
-        ('m-a-p/Code-Feedback', None, 'train'),
-        (' GlaiveAI/glaive-code-assistant-v3', None, 'train'),
-        (' Sahil2801/CodeAlpaca-20k', None, 'train'),
-        ('iamtarun/python_code_instructions_18k_alpaca', None, 'train'),
+        ('nvidia/OpenCodeReasoning', 'split_0', 'split_0', 'split_0/train-00000-of-00030.parquet'),
+        ('open-r1/verifiable-coding-problems-python_decontaminated', None, 'train', 'data/train-00000-of-00006.parquet'),
+        ('bigcode/self-oss-instruct-sc2-exec-filter-50k', None, 'train', 'data/train-00000-of-00001.parquet'),
+        ('TeichAI/Claude-Opus-4.6-Reasoning-887x', None, 'train', 'data/train-00000-of-00001.parquet'),
+        ('iamtarun/python_code_instructions_18k_alpaca', None, 'train', 'data/train-00000-of-00001-8b6e212f3e1ece96.parquet'),
+        ('Roman1111111/claude-opus-4.6-10000x', None, 'train', 'opus46_final.jsonl'),
+        ('TeichAI/lordx64-claude-opus-4.7-max-cleaned', None, 'train', 'train.jsonl'),
+        ('ronaldcmz/claude_opus_4.8_max_thinking_5k_v2', None, 'train', 'opus_4_8_max_thinking_5k_v2.jsonl'),
+        ('ise-uiuc/Magicoder-OSS-Instruct-75K', None, 'train', 'data-oss_instruct-decontaminated.jsonl'),
+        ('ise-uiuc/Magicoder-Evol-Instruct-110K', None, 'train', 'data-evol_instruct-decontaminated.jsonl'),
+        ('m-a-p/CodeFeedback-Filtered-Instruction', None, 'train', 'CodeFeedback-Filtered-Instruction.jsonl'),
     ],
     'web_3d_ui': [
-        (' Tesslate/UIGEN-T1.5-Dataset', None, 'train'),
-        ('cfahlgren1/react-code-instructions', None, 'train'),
-        ('HuggingFaceH4/ultrachat_200k', None, 'train_sft'),
-        ('Open-Orca/SlimOrca-Dedup', None, 'train'),
-        ('teknium/OpenHermes-2.5', None, 'train'),
-        ('BAAI/Infinity-Instruct', '7M_core', 'train'),
+        ('Tesslate/UIGEN-T1.5-Dataset', None, 'train', 'output.parquet'),
+        ('kelexine/fable-5-sft-traces', None, 'train', 'data/train-00000-of-00001.parquet'),
+        ('HuggingFaceH4/ultrachat_200k', None, 'train_sft', 'data/train_sft-00000-of-00003-a3ecf92756993583.parquet'),
+        ('cfahlgren1/react-code-instructions', None, 'train', 'data/data_ed7e68fb-44fe-47fc-b603-0279f2f8a7ca.jsonl'),
+        ('HelioAI/Claude-Fable-5-5500x', None, 'train', 'Fable-5-Distill-5500x.jsonl'),
+        ('armand0e/Fable-5-Chat', None, 'train', 'train.jsonl'),
+        ('nvidia/Nemotron-Instruction-Following-Chat-v1', None, 'chat_if', 'data/chat_if.jsonl'),
+        ('NousResearch/Hermes-3-Dataset', None, 'train', 'hermes-3-dataset.jsonl'),
+        ('DataCreatorAI/Multi-Turn-Conversational-SFT', None, 'train', 'multi_turn_conversations.jsonl'),
     ],
     'math_stem': [
-        ('open-thoughts/OpenThoughts-114k', 'default', 'train'),
-        ('bespoke-stratos/Bespoke-Stratos-17k', None, 'train'),
-        ('nvidia/OpenMathInstruct-2', None, 'train'),
-        ('meta-math/MetaMathQA', None, 'train'),
-        ('openai/gsm8k', 'main', 'train'),
-        ('AI-MO/NuminaMath-CoT', None, 'train'),
-        ('TIGER-Lab/TheoremQA', None, 'test'),
-        ('camel-ai/math', None, 'train'),
-        ('camel-ai/physics', None, 'train'),
-        ('camel-ai/chemistry', None, 'train'),
+        ('open-thoughts/OpenThoughts-114k', 'default', 'train', 'data/train-00000-of-00006.parquet'),
+        ('bespokelabs/Bespoke-Stratos-17k', None, 'train', 'data/train-00000-of-00001.parquet'),
+        ('nvidia/OpenScienceReasoning-2', None, 'train', 'train/OpenScienceReasoning-2.parquet'),
+        ('MegaScience/MegaScience', None, 'train', 'data/train-00000-of-00001.parquet'),
+        ('MegaScience/TextbookReasoning', None, 'train', 'data/train-00000-of-00001.parquet'),
+        ('OpenDataArena/Spark-234K', None, 'train', 'Spark-234K-data.parquet'),
+        ('openai/gsm8k', 'main', 'train', 'main/train-00000-of-00001.parquet'),
+        ('AI-MO/NuminaMath-CoT', None, 'train', 'data/train-00000-of-00005.parquet'),
+        ('Jackrong/Kimi-K2.5-Reasoning-1M-Cleaned', 'PHD-Science', 'train', 'PHD-Science.jsonl'),
     ],
     'tool_agent': [
-        ('Salesforce/xlam-function-calling-60k', None, 'train'),
-        ('NousResearch/hermes-function-calling-v1', None, 'train'),
-        ('glaiveai/glaive-function-calling-v2', None, 'train'),
-        ('Trelis/function_calling_v3', None, 'train'),
-        (' Locutusque/function-calling-chatml', None, 'train'),
-        ('lilacai/glaive-function-calling-v2-sharegpt', None, 'train'),
+        ('Locutusque/function-calling-chatml', None, 'train', 'data/train-00000-of-00001-f0b56c6983b4a78f.parquet'),
+        ('lilacai/glaive-function-calling-v2-sharegpt', None, 'train', 'data/train-00000-of-00002-6f3344faa23e9b0a.parquet'),
+        ('lilacai/glaive-function-calling-v2-sharegpt', None, 'train', 'data/train-00001-of-00002-41f063cddf49c933.parquet'),
+        ('NousResearch/hermes-function-calling-v1', None, 'train', 'func-calling.json'),
+        ('NousResearch/hermes-function-calling-v1', None, 'train', 'func-calling-singleturn.json'),
+        ('NousResearch/hermes-function-calling-v1', None, 'train', 'json-mode-agentic.json'),
+        ('glaiveai/glaive-function-calling-v2', None, 'train', 'glaive-function-calling-v2.json'),
     ],
     'concise_think': [
-        ('Magpie-Align/Magpie-Reasoning-V2-250K-CoT-Deepseek-R1-Llama-70B', None, 'train'),
-        ('ServiceNow-AI/R1-Distill-SFT', 'v0', 'train'),
-        (' Skywork/Skywork-OR1-RL-Data', None, 'train'),
-        ('HuggingFaceH4/no_robots', None, 'train'),
+        ('ServiceNow-AI/R1-Distill-SFT', 'v0', 'train', 'v0/train-00000-of-00003.parquet'),
+        ('Skywork/Skywork-OR1-RL-Data', None, 'code', 'data/code-00000-of-00003.parquet'),
+        ('HuggingFaceH4/no_robots', None, 'train', 'data/train-00000-of-00001.parquet'),
+        ('MoreThought/Fable-5.1-Max-Reasoning-Filtered-10000x', None, 'train', '10k/train.jsonl'),
+        ('Roman1111111/gpt-5.4-step-by-step-reasoning', None, 'train', 'gpt5.4.jsonl'),
+        ('vanty120/Gpt-5.4-Xhigh-Reasoning-2000x', None, 'train', 'train.jsonl'),
+        ('TeichAI/gpt-5.1-high-reasoning-1000x', None, 'train', 'gpt-5.1-1000x.jsonl'),
     ],
 }
+
 
 
 def auto_configure_vram_16k(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -396,24 +405,45 @@ def _split_thought_and_answer(raw_assistant: str) -> Tuple[str, str]:
 
 def extract_record_fields(row: Dict[str, Any], pillar: str) -> Optional[Dict[str, Any]]:
     """Extract normalized (system, history_turns, user, thought, answer) from heterogeneous HF schemas."""
-    sys_prompt = str(row.get('system') or row.get('system_prompt') or '').strip()
+    sys_prompt = str(row.get('system') or row.get('system_prompt') or row.get('system_message') or '').strip()
     history_turns: List[Dict[str, str]] = []
+    top_thought = str(
+        row.get('thinking')
+        or row.get('reasoning')
+        or row.get('reasoning_content')
+        or row.get('step_by_step_trace')
+        or row.get('inverted_reasoning')
+        or ''
+    ).strip()
 
     conv = row.get('conversations') or row.get('messages')
+    if isinstance(conv, str):
+        try:
+            conv = json.loads(conv)
+        except Exception:
+            conv = None
     if isinstance(conv, list) and len(conv) >= 2:
         norm_msgs: List[Dict[str, str]] = []
         for m in conv:
+            if isinstance(m, str):
+                try:
+                    m = json.loads(m)
+                except Exception:
+                    continue
             if not isinstance(m, dict):
                 continue
-            role = str(m.get('role') or m.get('from') or '').lower()
+            role = str(m.get('role') or m.get('from') or '').lower().strip()
             content = str(m.get('content') or m.get('value') or '').strip()
+            m_think = str(m.get('reasoning_content') or m.get('thinking') or m.get('reasoning') or '').strip()
             if not content:
                 continue
-            if role in ('system',):
+            if role in ('system', 'sys'):
                 sys_prompt = content
-            elif role in ('user', 'human'):
+            elif role in ('user', 'human', 'prompter'):
                 norm_msgs.append({'role': 'user', 'content': _normalize_tool_tags(content)})
-            elif role in ('assistant', 'gpt', 'model'):
+            elif role in ('assistant', 'gpt', 'model', 'bot'):
+                if m_think and '<think>' not in content:
+                    content = f"<think>\n{m_think}\n</think>\n{content}"
                 norm_msgs.append({'role': 'assistant', 'content': _normalize_tool_tags(content)})
             elif role in ('tool', 'observation', 'function_response'):
                 norm_msgs.append({'role': 'user', 'content': f"<tool_response>\n{content}\n</tool_response>"})
@@ -423,8 +453,10 @@ def extract_record_fields(row: Dict[str, Any], pillar: str) -> Optional[Dict[str
             prev_msgs = norm_msgs[:-1]
             if prev_msgs and prev_msgs[-1]['role'] == 'user':
                 user_prompt = prev_msgs[-1]['content']
-                history_turns = prev_msgs[:-1]
+                history_turns = prev_msgs[max(0, len(prev_msgs) - 5):-1]
                 thought, answer = _split_thought_and_answer(last_asst)
+                if not thought and top_thought:
+                    thought = top_thought
                 return {
                     'pillar': pillar,
                     'system': sys_prompt,
@@ -434,6 +466,25 @@ def extract_record_fields(row: Dict[str, Any], pillar: str) -> Optional[Dict[str
                     'answer': answer,
                 }
 
+    # Support Glaive-style `chat` column ("USER: ... ASSISTANT: ...")
+    chat_raw = str(row.get('chat') or '').strip()
+    if chat_raw and 'USER:' in chat_raw and 'ASSISTANT:' in chat_raw:
+        u_part, a_part = chat_raw.split('ASSISTANT:', 1)
+        u_clean = u_part.replace('USER:', '').strip()
+        a_clean = a_part.replace('<|endoftext|>', '').strip()
+        if u_clean and a_clean:
+            thought, answer = _split_thought_and_answer(a_clean)
+            if not thought and top_thought:
+                thought = top_thought
+            return {
+                'pillar': pillar,
+                'system': sys_prompt,
+                'history_turns': [],
+                'user': _normalize_tool_tags(u_clean),
+                'thought': thought,
+                'answer': answer,
+            }
+
     user_prompt = str(
         row.get('instruction') or row.get('prompt') or row.get('question') or row.get('problem') or row.get('query') or ''
     ).strip()
@@ -442,14 +493,26 @@ def extract_record_fields(row: Dict[str, Any], pillar: str) -> Optional[Dict[str
         user_prompt = f"{user_prompt}\n\n{inp}".strip()
 
     raw_out = str(
-        row.get('output') or row.get('response') or row.get('solution') or row.get('answer') or row.get('completion') or ''
+        row.get('output')
+        or row.get('response')
+        or row.get('solution')
+        or row.get('final_solution')
+        or row.get('answer')
+        or row.get('completion')
+        or ''
     ).strip()
     if not user_prompt or not raw_out:
         return None
 
     thought, answer = _split_thought_and_answer(raw_out)
-    if not thought and row.get('reasoning'):
-        thought = str(row.get('reasoning')).strip()
+    if not thought and top_thought:
+        thought = top_thought
+
+    ref_ans = str(row.get('reference_answer') or row.get('expected_answer') or '').strip()
+    if not thought and ref_ans and len(answer) > 120 and ref_ans != answer:
+        thought = answer
+        answer = f"{answer}\n\n**Final Answer:** {ref_ans}"
+
     return {
         'pillar': pillar,
         'system': sys_prompt,
@@ -488,45 +551,160 @@ def passes_quality_filter(rec: Dict[str, Any]) -> bool:
     return True
 
 
-def curate_all_pillars_v03(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Stream and filter high-signal trajectories across all 5 pillars."""
+def _open_streaming_dataset(
+    ds_name: str,
+    subset: Optional[str],
+    split: str,
+    shard_path: Optional[str] = None,
+):
+    """Open a Hugging Face dataset in streaming mode.
+    When `shard_path` is provided, streams directly from `hf://datasets/{ds_name}/{shard_path}` via the
+    native `parquet` or `json` builder, completely bypassing `README.md`, `dataset_infos.json`,
+    extra `.txt`/`.py`/`.png` repo files, and slow multi-file directory resolution.
+    """
     from datasets import load_dataset
+    if shard_path:
+        builder = 'parquet' if shard_path.endswith('.parquet') else 'json'
+        hf_uri = f"hf://datasets/{ds_name}/{shard_path}"
+        try:
+            ds = load_dataset(builder, data_files=hf_uri, split='train', streaming=True)
+            return ds, f"direct:{shard_path}"
+        except Exception:
+            try:
+                ds = load_dataset(ds_name, data_files=shard_path, split='train', streaming=True)
+                return ds, f"file:{shard_path}"
+            except Exception:
+                pass
 
+    try:
+        return (
+            load_dataset(ds_name, subset, split=split, streaming=True)
+            if subset else load_dataset(ds_name, split=split, streaming=True)
+        ), split
+    except Exception as exc:
+        msg = str(exc)
+        m = re.search(r"Available splits:\s*\[([^\]]+)\]", msg)
+        if m:
+            avail = [s.strip().strip("'\"") for s in m.group(1).split(',') if s.strip()]
+            if avail:
+                alt_split = avail[0]
+                print(f"     [Auto-Split Resolve] {ds_name}: '{split}' -> '{alt_split}'", flush=True)
+                ds = (
+                    load_dataset(ds_name, subset, split=alt_split, streaming=True)
+                    if subset else load_dataset(ds_name, split=alt_split, streaming=True)
+                )
+                return ds, alt_split
+        raise
+
+
+def curate_all_pillars_v03(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Stream and filter high-signal trajectories across all 5 pillars with verbose real-time telemetry."""
     target_total = int(cfg.get('TARGET_TOTAL_SAMPLES', 2400))
     ratios = cfg.get('PILLAR_RATIOS', {})
     curated: List[Dict[str, Any]] = []
+    t_all = time.time()
 
-    for pillar_raw, ratio in ratios.items():
+    # Suppress Hugging Face Hub's internal README.md / dataset_infos.json progress bar spam
+    try:
+        import huggingface_hub.utils as hf_utils
+        hf_utils.disable_progress_bars()
+    except Exception:
+        pass
+    try:
+        import datasets.utils.logging as ds_logging
+        ds_logging.disable_progress_bar()
+    except Exception:
+        pass
+
+    print('=' * 98)
+    print(
+        f"[Dataset Curation Engine] Target: {target_total} verified trajectories across {len(ratios)} pillars "
+        f"(Direct Shard Streaming enabled — bypasses README.md & non-data files)"
+    )
+    print('=' * 98, flush=True)
+
+    pillar_items = list(ratios.items())
+    for p_idx, (pillar_raw, ratio) in enumerate(pillar_items, start=1):
         pillar = pillar_raw.strip()
         quota = max(20, int(target_total * float(ratio)))
         sources = DATASET_SOURCES.get(pillar, [])
         collected = 0
-        per_source_cap = max(25, math.ceil(quota / max(1, len(sources))) + 25)
+        per_source_cap = max(35, math.ceil(quota / max(1, len(sources))) + 45)
+        t_pillar = time.time()
 
-        for ds_name_raw, subset, split in sources:
+        print(
+            f"\n--- [Pillar {p_idx}/{len(pillar_items)}: {pillar}] "
+            f"Target Quota: {quota} ({float(ratio)*100:.1f}%) | Sources: {len(sources)} | Cap/Source: {per_source_cap} ---",
+            flush=True,
+        )
+
+        for s_idx, src_spec in enumerate(sources, start=1):
             if collected >= quota:
                 break
+            if len(src_spec) == 4:
+                ds_name_raw, subset, split, shard_path = src_spec
+            else:
+                ds_name_raw, subset, split = src_spec[:3]
+                shard_path = None
             ds_name = ds_name_raw.strip()
+            need = min(per_source_cap, quota - collected)
+            t_src = time.time()
+            shard_label = shard_path if shard_path else f"config={subset or 'default'}, split={split}"
+            print(f"  -> [{s_idx:2d}/{len(sources):2d}] Streaming {ds_name} ({shard_label} | target={need})...", flush=True)
             try:
-                ds = (
-                    load_dataset(ds_name, subset, split=split, streaming=True)
-                    if subset else load_dataset(ds_name, split=split, streaming=True)
-                )
+                ds, used_split = _open_streaming_dataset(ds_name, subset, split, shard_path=shard_path)
                 src_count = 0
+                scanned = 0
+                mt_count = 0
+                think_chars = 0
+                ans_chars = 0
                 for row in ds:
+                    scanned += 1
+                    if scanned > need * 12 + 200 and src_count == 0:
+                        break
+                    if (time.time() - t_src) > 35.0 and src_count >= 15:
+                        print(f"     [Time Cap 35s] {ds_name}: moving to next shard with +{src_count} samples.", flush=True)
+                        break
                     rec = extract_record_fields(row, pillar)
                     if rec and passes_quality_filter(rec):
+                        rec['source'] = ds_name
                         curated.append(rec)
                         collected += 1
                         src_count += 1
-                        if src_count >= per_source_cap or collected >= quota:
+                        if rec.get('history_turns'):
+                            mt_count += 1
+                        think_chars += len(rec.get('thought', ''))
+                        ans_chars += len(rec.get('answer', ''))
+                        if src_count % 50 == 0:
+                            print(
+                                f"     ... {ds_name}: +{src_count}/{need} accepted (scanned={scanned}) | "
+                                f"Pillar {pillar}: {collected}/{quota}",
+                                flush=True,
+                            )
+                        if src_count >= need or collected >= quota:
                             break
+                dt_src = time.time() - t_src
+                avg_t = int(think_chars / max(1, src_count))
+                avg_a = int(ans_chars / max(1, src_count))
+                print(
+                    f"     [OK] {ds_name} ({used_split}): +{src_count:3d} accepted (scanned={scanned:4d}, "
+                    f"multi_turn={mt_count:3d}, avg_think={avg_t:4d}c, avg_ans={avg_a:4d}c, {dt_src:.1f}s) | "
+                    f"Pillar Progress: {collected:4d}/{quota:4d}",
+                    flush=True,
+                )
             except Exception as exc:
-                print(f"[Dataset Stream Skip] {ds_name}: {str(exc)[:90]}")
-        print(f"[Pillar Curated] {pillar:15s}: {collected:4d} / {quota:4d} verified trajectories")
+                print(f"     [Skip] {ds_name}: {str(exc).splitlines()[0][:110]}", flush=True)
+
+        print(f"==> [Pillar Complete] {pillar:15s}: {collected:4d} / {quota:4d} verified trajectories in {time.time() - t_pillar:.1f}s", flush=True)
 
     random.shuffle(curated)
-    print(f"Total curated streaming records: {len(curated)}")
+    total_mt = sum(1 for r in curated if r.get('history_turns'))
+    print('=' * 98)
+    print(
+        f"[Dataset Curation Summary] Total Verified Records: {len(curated)} "
+        f"(Multi-Turn: {total_mt}) | Elapsed: {time.time() - t_all:.1f}s"
+    )
+    print('=' * 98, flush=True)
     return curated
 
 
@@ -548,13 +726,13 @@ def _extract_gsm8k_decimal(text: str) -> Optional[Decimal]:
 def generate_opencode_go_trajectories(cfg: Dict[str, Any], api_key: Optional[str] = None) -> List[Dict[str, Any]]:
     """Optional multi-model teacher synthesis via OpenCode Go with GSM8K exact Decimal verification."""
     if not cfg.get('ENABLE_OPENCODE_TEACHER', False) or not api_key:
-        print("[OpenCode Go Teacher] Skipped (no OPENCODE_API_KEY provided; using curated HF pillars).")
+        print("[OpenCode Go Teacher] Skipped (no OPENCODE_API_KEY provided; using curated HF pillars).", flush=True)
         return []
     try:
         from datasets import load_dataset
         from openai import OpenAI
     except Exception as exc:
-        print(f"[OpenCode Go Teacher] Skipped ({exc})")
+        print(f"[OpenCode Go Teacher] Skipped ({exc})", flush=True)
         return []
 
     client = OpenAI(base_url=cfg['OPENCODE_BASE_URL'], api_key=api_key, timeout=45.0)
@@ -562,6 +740,7 @@ def generate_opencode_go_trajectories(cfg: Dict[str, Any], api_key: Optional[str
     target_n = int(cfg.get('OPENCODE_TEACHER_SAMPLES', 60))
     prompts: List[Tuple[str, Optional[Decimal]]] = []
 
+    print(f"\n[OpenCode Go Teacher] Loading {target_n} GSM8K verification prompts for teacher ensemble {models}...", flush=True)
     try:
         gsm = load_dataset('openai/gsm8k', 'main', split='train', streaming=True)
         for idx, row in enumerate(gsm):
@@ -569,10 +748,12 @@ def generate_opencode_go_trajectories(cfg: Dict[str, Any], api_key: Optional[str
                 break
             gold = _extract_gsm8k_decimal(str(row.get('answer', '')))
             prompts.append((str(row['question']), gold))
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[OpenCode Go Teacher] Could not stream gsm8k prompts: {exc}", flush=True)
+        return []
 
     results: List[Dict[str, Any]] = []
+    t0 = time.time()
 
     def _query_one(item_idx: int, item: Tuple[str, Optional[Decimal]]) -> Optional[Dict[str, Any]]:
         q, gold = item
@@ -601,6 +782,7 @@ def generate_opencode_go_trajectories(cfg: Dict[str, Any], api_key: Optional[str
                     return None
             rec = {
                 'pillar': 'math_stem',
+                'source': f"opencode_go/{model_id}",
                 'system': 'You are Spark-X2.6, a rigorous mathematical and coding assistant.',
                 'history_turns': [],
                 'user': q,
@@ -611,14 +793,22 @@ def generate_opencode_go_trajectories(cfg: Dict[str, Any], api_key: Optional[str
         except Exception:
             return None
 
+    done_count = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
         futs = [ex.submit(_query_one, i, p) for i, p in enumerate(prompts)]
         for f in concurrent.futures.as_completed(futs):
+            done_count += 1
             r = f.result()
             if r is not None:
                 results.append(r)
+            if done_count % 10 == 0 or done_count == len(prompts):
+                print(
+                    f"  [OpenCode Go Teacher] Queried {done_count:3d}/{len(prompts):3d} | "
+                    f"Decimal-Verified: {len(results):3d} | Elapsed: {time.time() - t0:.1f}s",
+                    flush=True,
+                )
 
-    print(f"[OpenCode Go Teacher] Synthesized & Decimal-verified {len(results)} trajectories.")
+    print(f"[OpenCode Go Teacher] Complete: {len(results)}/{len(prompts)} exact Decimal-verified trajectories.", flush=True)
     return results
 
 
@@ -672,16 +862,45 @@ def build_16k_stage_pools(
     """Tokenize all trajectories in parallel and pack them into 4096, 8192, and 16384 sequence pools."""
     max_seq_len = int(cfg.get('MAX_SEQ_LENGTH', 16384))
     pad_id = int(tokenizer.pad_token_id if tokenizer.pad_token_id is not None else (tokenizer.eos_token_id or 0))
+    t0 = time.time()
+
+    print('\n' + '=' * 98)
+    print(f"[16K Parallel Tokenizer] Tokenizing {len(records)} trajectories (ceiling={max_seq_len} tokens, zero truncation)...")
+    print('=' * 98, flush=True)
 
     tokenized_items: List[Tuple[List[int], List[int]]] = []
+    dropped_len = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         futs = [ex.submit(tokenize_and_mask_record_16k, r, tokenizer, max_seq_len) for r in records]
-        for f in futs:
+        for idx, f in enumerate(futs, start=1):
             res = f.result()
             if res is not None:
                 tokenized_items.append(res)
+            else:
+                dropped_len += 1
+            if idx % 400 == 0 or idx == len(records):
+                avg_l = (
+                    sum(len(x[0]) for x in tokenized_items) / max(1, len(tokenized_items))
+                    if tokenized_items else 0.0
+                )
+                print(
+                    f"  [16K Tokenizer] Processed {idx:4d}/{len(records):4d} | "
+                    f"retained={len(tokenized_items):4d} | dropped_over_{max_seq_len}={dropped_len:3d} | "
+                    f"avg_len={avg_l:.1f} tok | {time.time() - t0:.1f}s",
+                    flush=True,
+                )
 
-    print(f"[16K Tokenizer] Retained {len(tokenized_items)}/{len(records)} complete trajectories with zero truncation.")
+    if tokenized_items:
+        lengths = sorted(len(x[0]) for x in tokenized_items)
+        n_l = len(lengths)
+        sup_toks = sum(sum(1 for y in x[1] if y != -100) for x in tokenized_items)
+        tot_toks = sum(lengths)
+        print(
+            f"[Token Length Distribution] min={lengths[0]} | p50={lengths[n_l//2]} | "
+            f"p90={lengths[int(n_l*0.9)]} | p99={lengths[int(n_l*0.99)]} | max={lengths[-1]} tokens | "
+            f"Supervised Ratio: {100.0 * sup_toks / max(1, tot_toks):.1f}%",
+            flush=True,
+        )
 
     stage_lengths = sorted({int(st['seq_len']) for st in cfg['STAGES']})
     stage_pools: Dict[int, List[Dict[str, torch.Tensor]]] = {}
@@ -690,16 +909,17 @@ def build_16k_stage_pools(
         pool: List[Dict[str, torch.Tensor]] = []
         cur_ids: List[int] = []
         cur_labels: List[int] = []
+        docs_packed = 0
 
         for ids, lbls in tokenized_items:
             if len(ids) > target_len:
                 continue
             if len(cur_ids) + len(ids) <= target_len:
                 if cur_ids:
-                    # Mask boundary transition token so packed sequences don't predict across document boundaries
                     lbls = [-100] + lbls[1:]
                 cur_ids.extend(ids)
                 cur_labels.extend(lbls)
+                docs_packed += 1
             else:
                 if len(cur_ids) >= 64:
                     pool.append({
@@ -708,6 +928,7 @@ def build_16k_stage_pools(
                     })
                 cur_ids = list(ids)
                 cur_labels = list(lbls)
+                docs_packed += 1
 
         if len(cur_ids) >= 64:
             pool.append({
@@ -715,7 +936,6 @@ def build_16k_stage_pools(
                 'labels': torch.tensor(cur_labels, dtype=torch.long),
             })
 
-        # Fallback if all samples exceeded target_len
         if not pool and tokenized_items:
             ids0, lbls0 = tokenized_items[0]
             pool.append({
@@ -724,8 +944,17 @@ def build_16k_stage_pools(
             })
 
         stage_pools[target_len] = pool
-        avg_tok = sum(x['input_ids'].numel() for x in pool) / max(1, len(pool))
-        print(f"[Stage Pool {target_len:5d}] Packed {len(pool):4d} sequences (avg length = {avg_tok:.1f} tokens, pad_id={pad_id})")
+        tot_pool_tok = sum(x['input_ids'].numel() for x in pool)
+        sup_pool_tok = sum(int((x['labels'] != -100).sum().item()) for x in pool)
+        avg_tok = tot_pool_tok / max(1, len(pool))
+        fill_pct = 100.0 * avg_tok / float(target_len)
+        docs_per_seq = docs_packed / max(1, len(pool))
+        print(
+            f"[Stage Pool {target_len:5d}] Packed {len(pool):4d} sequences | "
+            f"avg_len={avg_tok:7.1f} tok ({fill_pct:5.1f}% fill, ~{docs_per_seq:.1f} docs/seq) | "
+            f"supervised_tokens={sup_pool_tok:,d} (pad_id={pad_id})",
+            flush=True,
+        )
 
     return stage_pools
 
@@ -933,6 +1162,7 @@ def run_v03_four_stage_training(
     max_seconds = float(cfg.get('MAX_RUN_HOURS', 22.5)) * 3600.0
     grad_accum = int(cfg.get('GRAD_ACCUM', 8))
     save_every = int(cfg.get('SAVE_EVERY_STEPS', 250))
+    log_every = int(cfg.get('LOG_EVERY_STEPS', 5))
 
     global_step = 0
     history: List[Dict[str, Any]] = []
@@ -948,7 +1178,7 @@ def run_v03_four_stage_training(
             freeze_bb = bool(stage_cfg.get('freeze_backbone', False))
 
             if stage_cfg.get('upcycle_8_to_32', False):
-                print(f"\n[{stage_name}] Executing Coarse-to-Fine Expert Upcycling (8 -> 32 experts, top_k=7)...")
+                print(f"\n[{stage_name}] Executing Coarse-to-Fine Expert Upcycling (8 -> 32 experts, top_k=7)...", flush=True)
                 model.upcycle_all_engrams_8_to_32(noise_std=1e-3)
 
             model.set_loop(
@@ -974,31 +1204,42 @@ def run_v03_four_stage_training(
             optimizer = _build_stage_optimizer(model, cfg, lr_scale=float(stage_cfg.get('lr_scale', 1.0)))
             pool = stage_pools.get(seq_len) or next(iter(stage_pools.values()))
 
-            print('=' * 92)
+            trainable_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            frozen_p = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+            plan_summary = ', '.join(f"{seg[0]}[{seg[1]}..{seg[2]})(p{seg[3]})" for seg in model.execution_plan)
+
+            print('\n' + '=' * 108)
             print(
-                f"Starting {stage_name} | Effective Layers: {model.total_virtual_layers} | "
-                f"SeqLen: {seq_len} | Steps: {stage_steps} | Backbone Frozen: {freeze_bb}"
+                f"Starting {stage_name} | Virtual Layers: {model.total_virtual_layers}L ({plan_summary})\n"
+                f"  SeqLen: {seq_len} | GradAccum: {grad_accum} ({seq_len * grad_accum:,} tok/step) | "
+                f"Steps: {stage_steps} | Pool Sequences: {len(pool)}\n"
+                f"  Backbone Frozen: {freeze_bb} | Trainable Params: {trainable_p / 1e9:.2f}B (Frozen: {frozen_p / 1e9:.2f}B) | "
+                f"Active Experts: {model.engram.active_experts} (Top-{model.engram.active_top_k})"
             )
-            print('=' * 92)
+            print('=' * 108, flush=True)
 
             optimizer.zero_grad(set_to_none=True)
             pool_idx = 0
+            stage_t0 = time.time()
 
             for st_step in range(1, stage_steps + 1):
+                step_t0 = time.time()
                 accum_loss = 0.0
                 accum_ce = 0.0
                 accum_z = 0.0
+                step_sup_tokens = 0
 
                 for _ in range(grad_accum):
                     sample = pool[pool_idx % len(pool)]
                     pool_idx += 1
                     input_ids = sample['input_ids'].unsqueeze(0).to(device, non_blocking=True)
                     labels = sample['labels'].unsqueeze(0).to(device, non_blocking=True)
+                    step_sup_tokens += int((labels != -100).sum().item())
 
                     out = model(input_ids=input_ids, labels=labels, return_logits=False)
                     loss = out['loss'] / float(grad_accum)
                     if not torch.isfinite(loss):
-                        print(f"[Warn] Non-finite loss at step {global_step + 1}; skipping micro-step.")
+                        print(f"[Warn] Non-finite loss at step {global_step + 1}; skipping micro-step.", flush=True)
                         continue
                     loss.backward()
                     accum_loss += float(out['loss'].detach().item()) / float(grad_accum)
@@ -1013,7 +1254,17 @@ def run_v03_four_stage_training(
                 optimizer.zero_grad(set_to_none=True)
 
                 global_step += 1
+                step_dt = max(1e-3, time.time() - step_t0)
+                tok_per_s = (seq_len * grad_accum) / step_dt
                 elapsed_h = (time.time() - start_wall) / 3600.0
+                stage_elapsed = time.time() - stage_t0
+                stage_eta_m = ((stage_elapsed / st_step) * (stage_steps - st_step)) / 60.0
+
+                vram_alloc = torch.cuda.memory_allocated(device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
+                vram_peak = torch.cuda.max_memory_allocated(device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
+                ctrl_sample = next(iter(model.controllers.values()))
+                mhc_gain = float(ctrl_sample.attn_extra_gain.detach().abs().mean().item())
+
                 metrics = {
                     'stage': stage_name,
                     'step': global_step,
@@ -1022,15 +1273,23 @@ def run_v03_four_stage_training(
                     'ce_loss': round(accum_ce, 5),
                     'z_loss': round(accum_z, 6),
                     'grad_norm': round(grad_norm, 4),
+                    'tok_per_s': round(tok_per_s, 1),
+                    'step_time_s': round(step_dt, 2),
+                    'vram_peak_gb': round(vram_peak, 2),
+                    'mhc_gain': round(mhc_gain, 5),
                     'elapsed_hours': round(elapsed_h, 3),
                 }
                 history.append(metrics)
 
-                if st_step == 1 or st_step % 20 == 0 or st_step == stage_steps:
+                if st_step <= 3 or st_step % log_every == 0 or st_step == stage_steps:
                     print(
                         f"[{stage_name} {st_step:4d}/{stage_steps:4d} | Global {global_step:4d}] "
                         f"loss={accum_loss:.4f} (ce={accum_ce:.4f}, z={accum_z:.5f}) | "
-                        f"grad_norm={grad_norm:.3f} | elapsed={elapsed_h:.2f}h"
+                        f"gnorm={grad_norm:.3f} | mHC_gain={mhc_gain:.4f} | "
+                        f"{tok_per_s:6.0f} tok/s ({step_dt:4.1f}s/step, sup={step_sup_tokens:,}) | "
+                        f"VRAM={vram_alloc:.1f}/{vram_peak:.1f}GB | "
+                        f"elapsed={elapsed_h:.2f}h (stage ETA {stage_eta_m:.1f}m)",
+                        flush=True,
                     )
 
                 if save_every > 0 and (global_step % save_every == 0):
@@ -1040,7 +1299,7 @@ def run_v03_four_stage_training(
                     )
 
                 if (time.time() - start_wall) >= max_seconds:
-                    print(f"[Wall-Clock Guard] Reached {cfg['MAX_RUN_HOURS']}h limit at step {global_step}. Stopping cleanly.")
+                    print(f"[Wall-Clock Guard] Reached {cfg['MAX_RUN_HOURS']}h limit at step {global_step}. Stopping cleanly.", flush=True)
                     budget_reached = True
                     break
 
@@ -1055,7 +1314,7 @@ def run_v03_four_stage_training(
                 torch.cuda.empty_cache()
 
     except BaseException as exc:
-        print(f"\n[Emergency Recovery Guard] Caught {type(exc).__name__}: {exc}. Saving recovery checkpoint...")
+        print(f"\n[Emergency Recovery Guard] Caught {type(exc).__name__}: {exc}. Saving recovery checkpoint...", flush=True)
         save_and_push_v03_checkpoint(
             model, tokenizer, cfg, 'EMERGENCY_RECOVERY', global_step,
             history[-1] if history else {'loss': 0.0},
