@@ -18,6 +18,36 @@ from sparkx_loop_v03_core import (
 )
 
 
+def _patch_transformers_v5_tied_weights() -> None:
+    """Ensure `modeling_spark.py` (`_tied_weights_keys = ['lm_head.weight']`) works seamlessly on both
+    Transformers 4.x (list format) and Transformers 5.x (dict mapping format).
+    """
+    try:
+        from transformers.modeling_utils import PreTrainedModel
+    except Exception:
+        return
+    if hasattr(PreTrainedModel, 'get_expanded_tied_weights_keys') and not getattr(PreTrainedModel, '_sparkx_tied_patched', False):
+        orig_fn = PreTrainedModel.get_expanded_tied_weights_keys
+
+        def _safe_get_expanded_tied_weights_keys(self, *args, **kwargs):
+            try:
+                return orig_fn(self, *args, **kwargs)
+            except AttributeError:
+                tw = getattr(self, '_tied_weights_keys', None)
+                if isinstance(tw, (list, tuple, set)):
+                    mapped = {k: ('model.embedding.weight' if k == 'lm_head.weight' else k) for k in tw}
+                    try:
+                        setattr(type(self), '_tied_weights_keys', mapped)
+                    except Exception:
+                        pass
+                    self._tied_weights_keys = mapped
+                    return orig_fn(self, *args, **kwargs)
+                raise
+
+        PreTrainedModel.get_expanded_tied_weights_keys = _safe_get_expanded_tied_weights_keys
+        PreTrainedModel._sparkx_tied_patched = True
+
+
 def load_sparkx_loop_v03(
     repo_or_dir: str = 'TassP0lar/Spark-X2.6-4B-En4B-A1B',
     base_repo: Optional[str] = None,
@@ -31,6 +61,7 @@ def load_sparkx_loop_v03(
     token: Optional[str] = None,
 ):
     """Load the standalone Spark-X2.6-4B-En4B-A1B (v0.3) checkpoint (72 effective layers, 8.34B total / 5.33B active)."""
+    _patch_transformers_v5_tied_weights()
     if os.path.isdir(repo_or_dir):
         cfg_path = os.path.join(repo_or_dir, 'loop_config_v03.json')
         if not os.path.exists(cfg_path):
