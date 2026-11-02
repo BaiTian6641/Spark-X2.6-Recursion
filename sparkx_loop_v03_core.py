@@ -1405,8 +1405,6 @@ class SparkXLoopV03(nn.Module):
         return cfg
 
     def _checkpoint_context(self):
-        if self.training and self.enable_checkpoint and self.offload_checkpoint_to_cpu:
-            return torch.autograd.graph.save_on_cpu(pin_memory=True)
         return nullcontext()
 
     def set_loop(
@@ -1473,8 +1471,7 @@ class SparkXLoopV03(nn.Module):
         if v_cache is None and self.training and self.enable_checkpoint and (
             h.requires_grad or any(p.requires_grad for p in layer.parameters())
         ):
-            with self._checkpoint_context():
-                return checkpoint(step, h, use_reentrant=False)
+            return checkpoint(step, h, use_reentrant=False)
         return step(h)
 
     def forward_hidden(self, input_ids: torch.LongTensor, attention_mask=None,
@@ -1499,27 +1496,28 @@ class SparkXLoopV03(nn.Module):
         h = embeds.float()
         virtual_idx = 0
 
+        def _apply_engram_residual(h_in: torch.Tensor, _eng: ZipfianTieredMoEEngram, _p: int = 0) -> torch.Tensor:
+            def _eng_step(x, _m=_eng, _pass=_p):
+                return x + _m(
+                    input_ids, x.dtype, prev_ids=prev_ids, hidden_states=x,
+                    pass_idx=_pass, ngram_indices=ngram_indices,
+                )
+            if past_key_values is None and self.training and self.enable_checkpoint:
+                return checkpoint(_eng_step, h_in, use_reentrant=False)
+            return _eng_step(h_in)
+
         # 1. Prelude layers [0..loop_start) (includes Anchor 0 at Layer 3 + any backbone anchors < loop_start)
         for idx in range(self.loop_start):
             h = self._apply_layer(idx, h, masks, ropes, past_key_values=past_key_values,
                                   cache_position=cache_position, virtual_idx=virtual_idx)
             if self.engram_enabled:
                 if idx == 3:
-                    h = h + self.engram(
-                        input_ids, h.dtype, prev_ids=prev_ids, hidden_states=h,
-                        pass_idx=0, ngram_indices=ngram_indices,
-                    )
+                    h = _apply_engram_residual(h, self.engram, _p=0)
                 elif str(idx) in self.backbone_engrams:
-                    h = h + self.backbone_engrams[str(idx)](
-                        input_ids, h.dtype, prev_ids=prev_ids, hidden_states=h,
-                        pass_idx=0, ngram_indices=ngram_indices,
-                    )
+                    h = _apply_engram_residual(h, self.backbone_engrams[str(idx)], _p=0)
             virtual_idx += 1
         if self.engram_enabled and 0 < self.loop_start <= 3:
-            h = h + self.engram(
-                input_ids, h.dtype, prev_ids=prev_ids, hidden_states=h,
-                pass_idx=0, ngram_indices=ngram_indices,
-            )
+            h = _apply_engram_residual(h, self.engram, _p=0)
 
         # Build pass schedule: Pass 0..loop_passes-1 over [loop_start, loop_end), plus optional Pass 2 over [p3_start, p3_end)
         pass_spans = [(p, self.loop_start, self.loop_end) for p in range(self.loop_passes)]
@@ -1540,7 +1538,10 @@ class SparkXLoopV03(nn.Module):
                             h = h + eng_delta
                     virtual_idx += 1
         else:
-            streams = torch.stack((h, h), dim=0)
+            # At >=8K training, store between-layer checkpoint boundary streams in BF16 (saves >10GB VRAM at 16K/60L-72L)
+            # while TwoStreamMHC.forward executes all internal Sinkhorn & residual math in FP32.
+            stream_dtype = kv_dtype if (self.training and self.enable_checkpoint and input_ids.shape[1] >= 8192) else h.dtype
+            streams = torch.stack((h.to(stream_dtype), h.to(stream_dtype)), dim=0)
             for p, s_idx, e_idx in pass_spans:
                 for idx in range(s_idx, e_idx):
                     kind = self.base.model.layers[idx].layer_type
@@ -1568,21 +1569,17 @@ class SparkXLoopV03(nn.Module):
                             s_out = torch.stack((s_out[0] + eng_delta, s_out[1]), dim=0)
                         return s_out
                     if v_cache is None and self.training and self.enable_checkpoint:
-                        with self._checkpoint_context():
-                            streams = checkpoint(step, streams, use_reentrant=False)
+                        streams = checkpoint(step, streams, use_reentrant=False)
                     else:
                         streams = step(streams)
-            h = streams[0]
+            h = streams[0].float()
 
         # 3. Coda layers [loop_end..n_layers) (includes Anchor 7 at Layer 31!)
         for idx in range(self.loop_end, self.n_layers):
             h = self._apply_layer(idx, h, masks, ropes, past_key_values=past_key_values,
                                   cache_position=cache_position, virtual_idx=virtual_idx)
             if self.engram_enabled and str(idx) in self.backbone_engrams:
-                h = h + self.backbone_engrams[str(idx)](
-                    input_ids, h.dtype, prev_ids=prev_ids, hidden_states=h,
-                    pass_idx=0, ngram_indices=ngram_indices,
-                )
+                h = _apply_engram_residual(h, self.backbone_engrams[str(idx)], _p=0)
             virtual_idx += 1
         return self.base.model.norm(h).to(kv_dtype)
 

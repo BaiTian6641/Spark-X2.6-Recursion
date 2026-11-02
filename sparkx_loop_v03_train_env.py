@@ -1178,6 +1178,43 @@ def _build_stage_cosine_scheduler(optimizer: Any, total_steps: int, warmup_ratio
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
 
 
+def _reset_autograd_hooks_and_vram(model: Optional[nn.Module] = None) -> int:
+    """Pop any dangling C++ autograd saved_tensors_default_hooks left by an interrupted checkpoint block
+    and release IPython traceback references holding 16K GPU activation tensors.
+    """
+    import sys
+    popped = 0
+    if hasattr(torch._C, '_autograd') and hasattr(torch._C._autograd, '_pop_saved_tensors_default_hooks'):
+        for _ in range(1024):
+            try:
+                if hasattr(torch._C._autograd, '_top_saved_tensors_default_hooks'):
+                    top_h = torch._C._autograd._top_saved_tensors_default_hooks(True)
+                    if top_h is None or top_h == (None, None):
+                        break
+                torch._C._autograd._pop_saved_tensors_default_hooks()
+                popped += 1
+            except BaseException:
+                break
+    for attr in ('last_traceback', 'last_value', 'last_exc'):
+        if hasattr(sys, attr):
+            try:
+                delattr(sys, attr)
+            except BaseException:
+                pass
+    try:
+        ip = get_ipython()  # type: ignore[name-defined]
+        if ip is not None and hasattr(ip, 'InteractiveTB'):
+            ip.InteractiveTB.tb_offset = 0
+    except BaseException:
+        pass
+    if model is not None:
+        model.zero_grad(set_to_none=True)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return popped
+
+
 def run_v03_four_stage_training(
     model: SparkXLoopV03,
     tokenizer: Any,
@@ -1188,10 +1225,16 @@ def run_v03_four_stage_training(
     """Execute the 4-stage progressive sequence length & depth training loop with anti-overfitting & emergency recovery."""
     import importlib
     importlib.reload(_core_mod)
+    popped_hooks = _reset_autograd_hooks_and_vram(model)
+    if popped_hooks > 0:
+        print(f"[Autograd Hook Guard] Cleared {popped_hooks} dangling C++ checkpoint saved_tensors hook(s) and freed trapped VRAM.", flush=True)
+
     # Hot-bind latest checkpoint-safe SparkXLoopV03 & ZipfianTieredMoEEngram methods onto already-instantiated modules in VRAM
     model_cls = type(model)
     model_cls.forward_hidden = _core_mod.SparkXLoopV03.forward_hidden
     model_cls.forward = _core_mod.SparkXLoopV03.forward
+    model_cls._apply_layer = _core_mod.SparkXLoopV03._apply_layer
+    model_cls._checkpoint_context = _core_mod.SparkXLoopV03._checkpoint_context
     model_cls.total_router_z_loss = _core_mod.SparkXLoopV03.total_router_z_loss
     for eng_mod in model.all_engram_modules():
         eng_cls = type(eng_mod)
@@ -1200,13 +1243,15 @@ def run_v03_four_stage_training(
         eng_mod._pending_expert_load = None
         eng_mod.last_router_z_loss = None
         eng_mod._active_z_losses = None
-    model.zero_grad(set_to_none=True)
 
     device = next(model.base.parameters()).device
     vram_total_gb = (
         torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
         if torch.cuda.is_available() else 0.0
     )
+    if torch.cuda.is_available():
+        vram_now_gb = torch.cuda.memory_allocated(device) / (1024 ** 3)
+        print(f"[VRAM Status] Ready before resume: {vram_now_gb:.1f} GB allocated / {vram_total_gb:.1f} GB total", flush=True)
     start_wall = time.time()
     max_seconds = float(cfg.get('MAX_RUN_HOURS', 22.5)) * 3600.0
     grad_accum = int(cfg.get('GRAD_ACCUM', 8))
@@ -1499,6 +1544,7 @@ def run_v03_four_stage_training(
                 torch.cuda.empty_cache()
 
     except BaseException as exc:
+        _reset_autograd_hooks_and_vram(model)
         is_kbd = isinstance(exc, KeyboardInterrupt)
         if global_step > max(0, best_ckpt_step):
             print(
