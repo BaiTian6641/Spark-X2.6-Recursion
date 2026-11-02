@@ -82,20 +82,20 @@ def verify_ngram_causality(model: SparkXLoopV03, vocab_size: int = 167168, devic
 def build_default_cfg() -> Dict[str, Any]:
     """Return the default v0.3 16K Unsloth/Triton configuration dictionary."""
     return {
-        # Base & Target Repositories
+        # Base & Target Repositories (MUST use post-trained XHToken/Spark-X2.6-4B, never -Base)
         'BASE_MODEL_ID': 'XHToken/Spark-X2.6-4B',
         'V02_WARM_START_REPO': 'TassP0lar/Spark-X2.6-4B-Loop-mHC-R24',
-        # Clean initialization from 1M-context XHToken/Spark-X2.6-4B avoids inheriting v0.2's 2K truncation bias
         'ENABLE_V02_WARM_START': False,
+        'CURRICULUM_VERSION': 'v03_r2_3phase',
         'HF_REPO_ID': 'TassP0lar/Spark-X2.6-4B-En4B-A1B',
         'HF_PRIVATE': False,
         'PUSH_TO_HUB': True,
 
-        # Checkpoint Retention & Periodic Save Policy
-        'CHECKPOINT_DIR': '/content/checkpoints_v03_en4b_a1b',
+        # Checkpoint Retention & Periodic Save Policy (isolated r2_3phase directory so Run 1 collapsed ckpts are ignored)
+        'CHECKPOINT_DIR': '/content/checkpoints_v03_r2_3phase',
         'FINAL_EXPORT_DIR': '/content/Spark-X2.6-4B-En4B-A1B-Final',
         'MAX_LOCAL_CHECKPOINTS': 3,
-        'SAVE_EVERY_STEPS': 250,
+        'SAVE_EVERY_STEPS': 100,
 
         # Unattended Wall-Clock Budget (Colab Pro+ 24h ceiling with 1.5h safety margin)
         'MAX_RUN_HOURS': 22.5,
@@ -129,56 +129,85 @@ def build_default_cfg() -> Dict[str, Any]:
         'BATCH_SIZE': 1,
         'GRAD_ACCUM': 8,
         'CE_CHUNK_TOKENS': 1024,
-        'WARMUP_RATIO': 0.06,
+        'WARMUP_RATIO': 0.08,
         'WEIGHT_DECAY': 0.01,
         'MAX_GRAD_NORM': 1.0,
+        'STAGE_CE_LOSS_FLOOR': 0.30,
         'SEED': 42,
 
-        # Differential Learning Rates
-        'LR_BACKBONE': 1.2e-5,
-        'LR_MHC': 2.0e-4,
+        # Differential Learning Rates (calibrated for post-trained Spark-X2.6-4B preservation)
+        'LR_BACKBONE': 1.0e-5,
+        'LR_MHC_GATE': 3.0e-3,
+        'LR_MHC': 5.0e-4,
         'LR_ENGRAM': 1.5e-4,
         'LR_ROUTER': 2.5e-4,
-        'LR_TIER1B_SPARSE': 2.0e-4,
+        'LR_TIER1B_SPARSE': 5.0e-5,
 
-        # 4-Stage Progressive Context & Depth Curriculum (3,000 Optimizer Steps Total)
+        # 3-Phase / 4-Stage Progressive Curriculum:
+        #   Phase 1 (Stage 1): Adapt 72L Looped Transformer (mHC only; Backbone FROZEN, MoE-Engram DISABLED)
+        #   Phase 2A (Stage 2): Introduce 8-Expert MoE-Engram at 8K (Backbone FROZEN, mHC + Engram-8 trainable)
+        #   Phase 2B (Stage 3): Upcycle MoE-Engram 8 -> 32 (Top-7) at 16K (Backbone FROZEN, mHC + Engram-32 trainable)
+        #   Phase 3 (Stage 4): Joint Full-Finetuning at 16K (Backbone UNFROZEN at gentle 0.25x mult + mHC + Engram-32)
         'STAGES': [
             {
-                'name': 'Stage1_Warmup_36L_4K',
-                'start': 4, 'end': 28, 'passes': 1, 'enable_p3': False,
-                'seq_len': 4096,
-                'steps': 200,
-                'freeze_backbone': True,
-                'upcycle_8_to_32': False,
-                'lr_scale': 1.2,
-            },
-            {
-                'name': 'Stage2_R12_48L_8K',
-                'start': 12, 'end': 24, 'passes': 2, 'enable_p3': False,
-                'seq_len': 8192,
-                'steps': 400,
-                'freeze_backbone': False,
-                'upcycle_8_to_32': False,
-                'lr_scale': 1.0,
-            },
-            {
-                'name': 'Stage3_R24_Upcycle32_60L_16K',
-                'start': 4, 'end': 28, 'passes': 2, 'enable_p3': False,
-                'seq_len': 16384,
-                'steps': 38,
-                'freeze_backbone': True,
-                'upcycle_8_to_32': True,
-                'lr_scale': 0.85,
-            },
-            {
-                'name': 'Stage4_R72_Telescoping_72L_16K',
+                'name': 'Stage1_Loop_mHC_Adapt_72L_8K',
                 'start': 4, 'end': 28, 'passes': 2, 'enable_p3': True,
                 'p3_start': 12, 'p3_end': 24,
+                'use_mhc': True, 'use_engram': False,
+                'seq_len': 8192,
+                'steps': 65,
+                'freeze_backbone': True,
+                'freeze_engram': True,
+                'upcycle_8_to_32': False,
+                'lr_scale': 1.0,
+                'mhc_lr_mult': 1.0,
+                'backbone_lr_mult': 0.0,
+                'loss_floor': 0.34,
+            },
+            {
+                'name': 'Stage2_Engram8_Adapt_72L_8K',
+                'start': 4, 'end': 28, 'passes': 2, 'enable_p3': True,
+                'p3_start': 12, 'p3_end': 24,
+                'use_mhc': True, 'use_engram': True,
+                'seq_len': 8192,
+                'steps': 65,
+                'freeze_backbone': True,
+                'freeze_engram': False,
+                'upcycle_8_to_32': False,
+                'lr_scale': 1.0,
+                'mhc_lr_mult': 0.50,
+                'backbone_lr_mult': 0.0,
+                'loss_floor': 0.32,
+            },
+            {
+                'name': 'Stage3_Engram32_Upcycle_72L_16K',
+                'start': 4, 'end': 28, 'passes': 2, 'enable_p3': True,
+                'p3_start': 12, 'p3_end': 24,
+                'use_mhc': True, 'use_engram': True,
+                'seq_len': 16384,
+                'steps': 40,
+                'freeze_backbone': True,
+                'freeze_engram': False,
+                'upcycle_8_to_32': True,
+                'lr_scale': 0.85,
+                'mhc_lr_mult': 0.40,
+                'backbone_lr_mult': 0.0,
+                'loss_floor': 0.31,
+            },
+            {
+                'name': 'Stage4_Joint_FullFT_72L_16K',
+                'start': 4, 'end': 28, 'passes': 2, 'enable_p3': True,
+                'p3_start': 12, 'p3_end': 24,
+                'use_mhc': True, 'use_engram': True,
                 'seq_len': 16384,
                 'steps': 38,
-                'freeze_backbone': True,
+                'freeze_backbone': False,
+                'freeze_engram': False,
                 'upcycle_8_to_32': False,
-                'lr_scale': 0.70,
+                'lr_scale': 0.50,
+                'mhc_lr_mult': 0.35,
+                'backbone_lr_mult': 0.25,
+                'loss_floor': 0.30,
             },
         ],
 
@@ -1005,6 +1034,7 @@ def save_and_push_v03_checkpoint(
 
     meta = {
         'architecture': 'Spark-X2.6-4B-En4B-A1B (v0.3)',
+        'curriculum_version': cfg.get('CURRICULUM_VERSION', 'v03_r2_3phase'),
         'base_model': cfg.get('BASE_MODEL_ID', 'XHToken/Spark-X2.6-4B'),
         'merged_standalone': bool(push_backbone),
         'global_step': global_step,
@@ -1012,6 +1042,7 @@ def save_and_push_v03_checkpoint(
         'effective_layers': model.total_virtual_layers,
         'execution_plan': model.execution_plan,
         'active_meta': {
+            'engram_enabled': bool(model.engram_enabled),
             'engram_active_experts': model.engram.active_experts,
             'engram_active_top_k': model.engram.active_top_k,
         },
@@ -1083,12 +1114,14 @@ def export_final_v03_to_hub(
 
     meta = {
         'architecture': 'Spark-X2.6-4B-En4B-A1B (v0.3)',
+        'curriculum_version': cfg.get('CURRICULUM_VERSION', 'v03_r2_3phase'),
         'base_model': cfg.get('BASE_MODEL_ID', 'XHToken/Spark-X2.6-4B'),
         'merged_standalone': True,
         'global_step': global_step,
         'effective_layers': model.total_virtual_layers,
         'execution_plan': model.execution_plan,
         'active_meta': {
+            'engram_enabled': bool(model.engram_enabled),
             'engram_active_experts': model.engram.active_experts,
             'engram_active_top_k': model.engram.active_top_k,
         },
@@ -1126,7 +1159,8 @@ def _build_stage_optimizer(
     model: SparkXLoopV03,
     cfg: Dict[str, Any],
     lr_scale: float = 1.0,
-    backbone_lr_mult: float = 1.0,
+    backbone_lr_mult: float = 0.0,
+    mhc_lr_mult: float = 1.0,
 ):
     try:
         import bitsandbytes as bnb
@@ -1134,13 +1168,25 @@ def _build_stage_optimizer(
     except Exception:
         opt_cls = torch.optim.AdamW
 
-    bb_params, mhc_params, eng_params, router_params = [], [], [], []
+    bb_params, mhc_gate_params, mhc_adapter_params, eng_params, router_params = [], [], [], [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
         if name.startswith('controllers.'):
-            mhc_params.append(p)
-        elif 'router' in name or 'expert_centroids' in name:
+            if (
+                'extra_gain' in name
+                or 'logits' in name
+                or 'pass_routing_bias' in name
+            ):
+                mhc_gate_params.append(p)
+            else:
+                mhc_adapter_params.append(p)
+        elif (
+            'router' in name
+            or 'expert_centroids' in name
+            or name.endswith('.gain')
+            or name.endswith('.scale_weights')
+        ):
             router_params.append(p)
         elif name.startswith('engram.') or name.startswith('backbone_engrams.'):
             eng_params.append(p)
@@ -1148,18 +1194,36 @@ def _build_stage_optimizer(
             bb_params.append(p)
 
     groups = []
-    if bb_params:
+    if bb_params and backbone_lr_mult > 0.0:
         groups.append({
             'params': bb_params,
-            'lr': cfg['LR_BACKBONE'] * lr_scale * backbone_lr_mult,
-            'weight_decay': cfg['WEIGHT_DECAY'],
+            'lr': float(cfg['LR_BACKBONE']) * lr_scale * backbone_lr_mult,
+            'weight_decay': float(cfg['WEIGHT_DECAY']),
         })
-    if mhc_params:
-        groups.append({'params': mhc_params, 'lr': cfg['LR_MHC'] * lr_scale, 'weight_decay': 0.0})
+    if mhc_gate_params:
+        groups.append({
+            'params': mhc_gate_params,
+            'lr': float(cfg.get('LR_MHC_GATE', 3.0e-3)) * lr_scale * mhc_lr_mult,
+            'weight_decay': 0.0,
+        })
+    if mhc_adapter_params:
+        groups.append({
+            'params': mhc_adapter_params,
+            'lr': float(cfg['LR_MHC']) * lr_scale * mhc_lr_mult,
+            'weight_decay': 0.0,
+        })
     if eng_params:
-        groups.append({'params': eng_params, 'lr': cfg['LR_ENGRAM'] * lr_scale, 'weight_decay': cfg['WEIGHT_DECAY']})
+        groups.append({
+            'params': eng_params,
+            'lr': float(cfg['LR_ENGRAM']) * lr_scale,
+            'weight_decay': float(cfg['WEIGHT_DECAY']),
+        })
     if router_params:
-        groups.append({'params': router_params, 'lr': cfg['LR_ROUTER'] * lr_scale, 'weight_decay': 0.0})
+        groups.append({
+            'params': router_params,
+            'lr': float(cfg['LR_ROUTER']) * lr_scale,
+            'weight_decay': 0.0,
+        })
 
     return opt_cls(groups, betas=(0.9, 0.95), eps=1e-8)
 
@@ -1233,6 +1297,62 @@ def _reset_autograd_hooks_and_vram(model: Optional[nn.Module] = None) -> int:
     return popped
 
 
+@torch.no_grad()
+def reload_fresh_posttrained_spark_x26(
+    model: SparkXLoopV03,
+    cfg: Dict[str, Any],
+    hf_token: Optional[str] = None,
+) -> None:
+    """Restore pristine post-trained `XHToken/Spark-X2.6-4B` checkpoint weights into `model.base` in-place
+    (using CPU staging so GPU VRAM never spikes) and reset all 24 `TwoStreamMHC` controllers + 8 `MoE-Engram`
+    anchors to exact Step-0 initialization.
+    """
+    from transformers import AutoModelForCausalLM
+
+    base_model_id = str(cfg.get('BASE_MODEL_ID', 'XHToken/Spark-X2.6-4B'))
+    if 'base' in base_model_id.lower():
+        raise ValueError(
+            f"Refusing to load `{base_model_id}`: curriculum requires the post-trained `XHToken/Spark-X2.6-4B` checkpoint, not Base."
+        )
+    print(
+        f"\n[Fresh Start] Reloading clean post-trained `{base_model_id}` weights into `model.base` "
+        f"and resetting 24 mHC controllers + 8 MoE-Engram anchors to Step-0...",
+        flush=True,
+    )
+    t0 = time.time()
+    clean_cpu_base = AutoModelForCausalLM.from_pretrained(
+        base_model_id,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+        token=hf_token,
+    )
+    clean_sd = clean_cpu_base.state_dict()
+    copied_tensors = 0
+    for name, param in model.base.named_parameters():
+        if name in clean_sd:
+            param.data.copy_(clean_sd[name].to(device=param.device, dtype=param.dtype, non_blocking=True))
+            copied_tensors += 1
+    for name, buf in model.base.named_buffers():
+        if name in clean_sd:
+            buf.data.copy_(clean_sd[name].to(device=buf.device, dtype=buf.dtype, non_blocking=True))
+    del clean_sd, clean_cpu_base
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+    model.reset_all_loop_and_engram_to_step0(
+        initial_active_experts=int(cfg.get('ENG_INITIAL_ACTIVE_EXPERTS', 8)),
+        initial_top_k=int(cfg.get('ENG_INITIAL_TOP_K', 2)),
+    )
+    model.base._sparkx_clean_posttrained = True
+    print(
+        f"[Fresh Start Complete] Restored {copied_tensors} post-trained `{base_model_id}` tensors + Step-0 mHC/Engram in {time.time() - t0:.1f}s.",
+        flush=True,
+    )
+
+
 def run_v03_four_stage_training(
     model: SparkXLoopV03,
     tokenizer: Any,
@@ -1240,9 +1360,28 @@ def run_v03_four_stage_training(
     cfg: Dict[str, Any],
     hf_token: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Execute the 4-stage progressive sequence length & depth training loop with anti-overfitting & emergency recovery."""
+    """Execute the 3-Phase / 4-Stage progressive training curriculum:
+    - Stage 1 (Phase 1): Adapt 72L Looped Transformer (`mHC` only, Backbone FROZEN, MoE-Engram DISABLED)
+    - Stage 2 (Phase 2A): Introduce 8-Expert MoE-Engram at 8K (Backbone FROZEN, `mHC` + `Engram-8` trainable)
+    - Stage 3 (Phase 2B): Upcycle MoE-Engram 8 -> 32 (`Top-7`) at 16K (Backbone FROZEN, `mHC` + `Engram-32` trainable)
+    - Stage 4 (Phase 3): Joint Full-Finetuning at 16K (Backbone UNFROZEN at gentle 0.25x mult + `mHC` + `Engram-32`)
+    """
     import importlib
     importlib.reload(_core_mod)
+    fresh_defaults = build_default_cfg()
+    if cfg.get('CURRICULUM_VERSION') != fresh_defaults['CURRICULUM_VERSION']:
+        print(
+            f"[Curriculum Upgrade] Refreshing in-memory CFG from `{cfg.get('CURRICULUM_VERSION', 'v03_r1')}` "
+            f"to `{fresh_defaults['CURRICULUM_VERSION']}` (3-Phase / 4-Stage progressive adaptation).",
+            flush=True,
+        )
+        for k in (
+            'BASE_MODEL_ID', 'CURRICULUM_VERSION', 'CHECKPOINT_DIR', 'SAVE_EVERY_STEPS',
+            'WARMUP_RATIO', 'STAGE_CE_LOSS_FLOOR',
+            'LR_BACKBONE', 'LR_MHC_GATE', 'LR_MHC', 'LR_ENGRAM', 'LR_ROUTER', 'LR_TIER1B_SPARSE',
+            'STAGES',
+        ):
+            cfg[k] = fresh_defaults[k]
     popped_hooks = _reset_autograd_hooks_and_vram(model)
     if popped_hooks > 0:
         print(f"[Autograd Hook Guard] Cleared {popped_hooks} dangling C++ checkpoint saved_tensors hook(s) and freed trapped VRAM.", flush=True)
@@ -1257,11 +1396,17 @@ def run_v03_four_stage_training(
     model_cls._checkpoint_context = _core_mod.SparkXLoopV03._checkpoint_context
     model_cls.total_router_z_loss = _core_mod.SparkXLoopV03.total_router_z_loss
     model_cls.upcycle_all_engrams_8_to_32 = _core_mod.SparkXLoopV03.upcycle_all_engrams_8_to_32
+    model_cls.reset_all_loop_and_engram_to_step0 = _core_mod.SparkXLoopV03.reset_all_loop_and_engram_to_step0
+    for ctrl_mod in model.controllers.values():
+        ctrl_cls = type(ctrl_mod)
+        ctrl_cls.forward = _core_mod.TwoStreamMHC.forward
+        ctrl_cls.reset_parameters_to_step0 = _core_mod.TwoStreamMHC.reset_parameters_to_step0
     for eng_mod in model.all_engram_modules():
         eng_cls = type(eng_mod)
         eng_cls.forward = _core_mod.ZipfianTieredMoEEngram.forward
         eng_cls.step_tier1b_sparse_adam = _core_mod.ZipfianTieredMoEEngram.step_tier1b_sparse_adam
         eng_cls.upcycle_experts_8_to_32 = _core_mod.ZipfianTieredMoEEngram.upcycle_experts_8_to_32
+        eng_cls.reset_parameters_to_step0 = _core_mod.ZipfianTieredMoEEngram.reset_parameters_to_step0
         eng_mod._pending_expert_load = None
         eng_mod.last_router_z_loss = None
         eng_mod._active_z_losses = None
@@ -1278,32 +1423,35 @@ def run_v03_four_stage_training(
     start_wall = time.time()
     max_seconds = float(cfg.get('MAX_RUN_HOURS', 22.5)) * 3600.0
     grad_accum = int(cfg.get('GRAD_ACCUM', 8))
-    save_every = int(cfg.get('SAVE_EVERY_STEPS', 250))
+    save_every = int(cfg.get('SAVE_EVERY_STEPS', 100))
     log_every = int(cfg.get('LOG_EVERY_STEPS', 5))
-    max_unfrozen_epochs = float(cfg.get('MAX_UNFROZEN_EPOCHS_PER_STAGE', 2.4))
-    loss_floor = float(cfg.get('STAGE_CE_LOSS_FLOOR', 0.165))
-    ckpt_root = Path(cfg.get('CHECKPOINT_DIR', '/content/checkpoints_v03_en4b_a1b'))
+    default_loss_floor = float(cfg.get('STAGE_CE_LOSS_FLOOR', 0.30))
+    req_curriculum_ver = str(cfg.get('CURRICULUM_VERSION', 'v03_r2_3phase'))
+    ckpt_root = Path(cfg.get('CHECKPOINT_DIR', '/content/checkpoints_v03_r2_3phase'))
 
     global_step = 0
     history: List[Dict[str, Any]] = []
     budget_reached = False
 
-    # 1. Discover the HIGHEST-STEP valid checkpoint across local disk AND Hugging Face Hub
+    # 1. Discover the HIGHEST-STEP valid checkpoint matching `CURRICULUM_VERSION == 'v03_r2_3phase'`
     best_ckpt_step = 0
     best_state_path: Optional[Path] = None
     best_ckpt_label = ''
     best_stage_hint = ''
 
     if ckpt_root.exists():
-        # Prefer completed Stage checkpoints over early EMERGENCY_RECOVERY checkpoints within 40 steps
         candidates: List[Tuple[int, int, Path, str]] = []
         for d in ckpt_root.glob('step_*'):
             st_file = d / 'loop_v03_state.pt'
-            if d.is_dir() and st_file.exists():
+            cfg_file = d / 'loop_config_v03.json'
+            if d.is_dir() and st_file.exists() and cfg_file.exists():
                 try:
+                    c_meta = json.loads(cfg_file.read_text())
+                    if c_meta.get('curriculum_version') != req_curriculum_ver:
+                        continue
                     st_num = int(d.name.split('_')[1])
                 except Exception:
-                    st_num = 0
+                    continue
                 is_clean_stage = 1 if ('Stage' in d.name and 'EMERGENCY' not in d.name) else 0
                 candidates.append((st_num, is_clean_stage, st_file, d.name))
         if candidates:
@@ -1311,14 +1459,14 @@ def run_v03_four_stage_training(
             max_any = max(candidates, key=lambda c: (c[0], c[1]))
             if clean_cands:
                 max_clean = max(clean_cands, key=lambda c: c[0])
-                chosen = max_clean if (max_any[1] == 0 and (max_any[0] - max_clean[0]) <= 40) else max_any
+                chosen = max_clean if (max_any[1] == 0 and (max_any[0] - max_clean[0]) <= 20) else max_any
             else:
                 chosen = max_any
             best_ckpt_step, _, best_state_path, best_ckpt_label = chosen
             best_stage_hint = best_ckpt_label
 
-    # Fallback / cross-check with Hugging Face Hub if local highest step < 250
-    if best_ckpt_step < 250 and cfg.get('HF_REPO_ID'):
+    # Fallback / cross-check with Hugging Face Hub ONLY if the Hub checkpoint matches `CURRICULUM_VERSION == 'v03_r2_3phase'`
+    if best_ckpt_step == 0 and cfg.get('HF_REPO_ID') and not bool(cfg.get('FORCE_FRESH_START', False)):
         try:
             from huggingface_hub import hf_hub_download
             hub_cache = ckpt_root / '_hub_resume_cache'
@@ -1330,8 +1478,9 @@ def run_v03_four_stage_training(
                 local_dir=str(hub_cache),
             ))
             hub_meta = json.loads(cfg_path.read_text())
+            hub_ver = str(hub_meta.get('curriculum_version', ''))
             hub_step = int(hub_meta.get('global_step', 0))
-            if hub_step > best_ckpt_step:
+            if hub_ver == req_curriculum_ver and hub_step > best_ckpt_step:
                 st_path = Path(hf_hub_download(
                     repo_id=cfg['HF_REPO_ID'],
                     filename='loop_v03_state.pt',
@@ -1342,13 +1491,19 @@ def run_v03_four_stage_training(
                 best_state_path = st_path
                 best_stage_hint = str(hub_meta.get('stage_name', ''))
                 best_ckpt_label = f"HF_Hub:{cfg['HF_REPO_ID']}@step_{hub_step:05d}({best_stage_hint})"
+            elif hub_ver != req_curriculum_ver:
+                print(
+                    f"[Fresh Curriculum Guard] Ignoring legacy Hub checkpoint (version='{hub_ver or 'v03_r1'}' != '{req_curriculum_ver}'). "
+                    f"Starting fresh from post-trained `{cfg.get('BASE_MODEL_ID', 'XHToken/Spark-X2.6-4B')}`!",
+                    flush=True,
+                )
         except Exception as exc:
             print(f"[Auto-Resume Info] Hub checkpoint check skipped: {exc}", flush=True)
 
     resume_stage_idx = 0
-    if best_state_path is not None and best_ckpt_step >= 200:
+    if best_state_path is not None and best_ckpt_step > 0:
         print(
-            f"\n[Auto-Resume] Restoring highest checkpoint {best_ckpt_label} (global_step={best_ckpt_step})...",
+            f"\n[Auto-Resume] Restoring `{req_curriculum_ver}` checkpoint {best_ckpt_label} (global_step={best_ckpt_step})...",
             flush=True,
         )
         state_obj = torch.load(str(best_state_path), map_location='cpu')
@@ -1358,11 +1513,22 @@ def run_v03_four_stage_training(
             resume_stage_idx = 4
         elif 'Stage3' in best_stage_hint:
             resume_stage_idx = 3
-        elif 'Stage2' in best_stage_hint or best_ckpt_step >= 250:
-            # Stage 1 and Stage 2 are both converged -> jump straight to Stage 3 (Upcycle 8 -> 32 at 16K)!
+        elif 'Stage2' in best_stage_hint:
             resume_stage_idx = 2
-        else:
+        elif 'Stage1' in best_stage_hint:
             resume_stage_idx = 1
+    else:
+        # Starting fresh at Step 0: guarantee `model.base` has pristine post-trained `XHToken/Spark-X2.6-4B` weights
+        # and `mHC` + `MoE-Engram` are at exact Step-0 initialization!
+        first_ctrl = next(iter(model.controllers.values()))
+        is_dirty = (
+            not getattr(model.base, '_sparkx_clean_posttrained', False)
+            or float(model.engram.project.weight.detach().abs().max().item()) > 0.0
+            or float(first_ctrl.extra_gain.detach().abs().item()) > 0.0
+            or model.engram.active_experts != int(cfg.get('ENG_INITIAL_ACTIVE_EXPERTS', 8))
+        )
+        if is_dirty:
+            reload_fresh_posttrained_spark_x26(model, cfg, hf_token=hf_token)
 
     try:
         for stage_idx, stage_cfg in enumerate(cfg['STAGES']):
@@ -1370,25 +1536,15 @@ def run_v03_four_stage_training(
                 break
             stage_name = stage_cfg['name']
             seq_len = int(stage_cfg['seq_len'])
-            raw_stage_steps = int(stage_cfg['steps'])
+            stage_steps = int(stage_cfg['steps'])
             pool = stage_pools.get(seq_len) or next(iter(stage_pools.values()))
             steps_per_epoch = max(1, len(pool) // grad_accum)
 
-            # Anti-Overfitting Architecture Policy:
-            # Stage 2 already full-finetuned the 36L dense backbone for 4.5 epochs (ce_loss -> 0.21).
-            # In Stage 3 (60L Upcycle32 16K) and Stage 4 (72L Telescoping 16K), we LOCK the 36L dense backbone
-            # (`freeze_bb = True`) and cap each stage to 1.00 epoch (`38` steps over 307 16K sequences) so only
-            # the newly upcycled 32-expert Engrams and 60L/72L mHC recurrence gates calibrate with ZERO backbone memorization!
-            if stage_idx >= 2:
-                freeze_bb = True
-                stage_steps = min(raw_stage_steps, steps_per_epoch)
-            else:
-                freeze_bb = bool(stage_cfg.get('freeze_backbone', False))
-                if not freeze_bb:
-                    capped_steps = max(80, int(round(max_unfrozen_epochs * steps_per_epoch)))
-                    stage_steps = min(raw_stage_steps, capped_steps)
-                else:
-                    stage_steps = raw_stage_steps
+            freeze_bb = bool(stage_cfg.get('freeze_backbone', True))
+            use_mhc = bool(stage_cfg.get('use_mhc', True))
+            use_engram = bool(stage_cfg.get('use_engram', True))
+            freeze_eng = bool(stage_cfg.get('freeze_engram', not use_engram))
+            stage_loss_floor = float(stage_cfg.get('loss_floor', default_loss_floor))
 
             if stage_idx < resume_stage_idx:
                 print(
@@ -1406,8 +1562,8 @@ def run_v03_four_stage_training(
                 start=int(stage_cfg['start']),
                 end=int(stage_cfg['end']),
                 passes=int(stage_cfg['passes']),
-                use_mhc=True,
-                use_engram=True,
+                use_mhc=use_mhc,
+                use_engram=use_engram,
                 enable_p3=bool(stage_cfg.get('enable_p3', False)),
                 p3_start=int(stage_cfg.get('p3_start', 12)),
                 p3_end=int(stage_cfg.get('p3_end', 24)),
@@ -1417,21 +1573,24 @@ def run_v03_four_stage_training(
             if seq_len >= 16384 and 0.0 < vram_total_gb <= 85.0:
                 model.offload_checkpoint_to_cpu = True
 
-            for p in model.base.parameters():
-                p.requires_grad = (not freeze_bb)
-            for p in model.controllers.parameters():
-                p.requires_grad = True
-            for mod in model.all_engram_modules():
-                for p in mod.parameters():
-                    p.requires_grad = True
+            _core_mod.set_trainables_v03(
+                model,
+                full_finetune=(not freeze_bb),
+                freeze_backbone=freeze_bb,
+                freeze_engram=freeze_eng,
+            )
+            if not freeze_bb:
+                model.base._sparkx_clean_posttrained = False
 
-            bb_lr_mult = 0.0 if freeze_bb else (0.20 if stage_idx >= 2 else 1.0)
+            bb_lr_mult = 0.0 if freeze_bb else float(stage_cfg.get('backbone_lr_mult', 0.25))
+            mhc_lr_mult = float(stage_cfg.get('mhc_lr_mult', 1.0))
 
             model.train()
             optimizer = _build_stage_optimizer(
                 model, cfg,
                 lr_scale=float(stage_cfg.get('lr_scale', 1.0)),
-                backbone_lr_mult=max(0.20, bb_lr_mult),
+                backbone_lr_mult=bb_lr_mult,
+                mhc_lr_mult=mhc_lr_mult,
             )
             scheduler = _build_stage_cosine_scheduler(optimizer, total_steps=stage_steps)
 
@@ -1445,16 +1604,19 @@ def run_v03_four_stage_training(
             spans.append(f"coda[{model.loop_end}..{model.n_layers})")
             plan_summary = ' -> '.join(spans)
             est_epochs = (stage_steps * grad_accum) / float(max(1, len(pool)))
+            eng_status = (
+                f"ON (Active={model.engram.active_experts}, Top-{model.engram.active_top_k}, Frozen={freeze_eng})"
+                if use_engram else "OFF (Phase 1: Pure Looped Transformer mHC Adaptation)"
+            )
 
             print('\n' + '=' * 108)
             print(
                 f"Starting {stage_name} | Virtual Layers: {model.total_virtual_layers}L ({plan_summary})\n"
                 f"  SeqLen: {seq_len} | GradAccum: {grad_accum} ({seq_len * grad_accum:,} tok/step) | "
-                f"Steps: {stage_steps} (~{est_epochs:.2f} epochs over {len(pool)} seqs)\n"
-                f"  Backbone Frozen: {freeze_bb} (BB_LR_Mult={bb_lr_mult:.2f}) | "
-                f"Trainable Params: {trainable_p / 1e9:.2f}B (Frozen: {frozen_p / 1e9:.2f}B) | "
-                f"Active Experts: {model.engram.active_experts} (Top-{model.engram.active_top_k}) | "
-                f"CPU_Ckpt_Stream: {model.offload_checkpoint_to_cpu}"
+                f"Steps: {stage_steps} (~{est_epochs:.2f} epochs over {len(pool)} seqs) | LossFloor: {stage_loss_floor:.2f}\n"
+                f"  Backbone Frozen: {freeze_bb} (BB_LR_Mult={bb_lr_mult:.2f}, mHC_LR_Mult={mhc_lr_mult:.2f}) | "
+                f"Trainable Params: {trainable_p / 1e9:.3f}B (Frozen: {frozen_p / 1e9:.2f}B)\n"
+                f"  MoE-Engram: {eng_status}"
             )
             print('=' * 108, flush=True)
 
@@ -1498,9 +1660,10 @@ def run_v03_four_stage_training(
                 lr_mult_now = float(scheduler.get_last_lr()[0]) / max(1e-12, init_lr0)
                 if math.isfinite(grad_norm):
                     optimizer.step()
-                    model.step_all_tier1b_sparse_adam(
-                        lr=float(cfg['LR_TIER1B_SPARSE']) * float(stage_cfg.get('lr_scale', 1.0)) * lr_mult_now
-                    )
+                    if use_engram and not freeze_eng:
+                        model.step_all_tier1b_sparse_adam(
+                            lr=float(cfg['LR_TIER1B_SPARSE']) * float(stage_cfg.get('lr_scale', 1.0)) * lr_mult_now
+                        )
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -1513,12 +1676,21 @@ def run_v03_four_stage_training(
 
                 vram_alloc = torch.cuda.memory_allocated(device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
                 vram_peak = torch.cuda.max_memory_allocated(device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
-                active_gains = []
+                p2_gains, p3_gains = [], []
                 for l_idx in range(model.loop_start, model.loop_end):
                     c_mod = model.controllers[str(l_idx)]
-                    g_p = c_mod.p3_extra_gain if model.enable_p3 else c_mod.extra_gain
-                    active_gains.append(float(torch.tanh(g_p.detach().float()).abs().item()))
-                mhc_gain = sum(active_gains) / float(max(1, len(active_gains)))
+                    p2_gains.append(0.5 * (
+                        float(torch.tanh(c_mod.extra_gain.detach().float()).abs().item())
+                        + float(torch.tanh(c_mod.ffn_extra_gain.detach().float()).abs().item())
+                    ))
+                    if model.enable_p3 and (model.p3_start <= l_idx < model.p3_end):
+                        p3_gains.append(0.5 * (
+                            float(torch.tanh(c_mod.p3_extra_gain.detach().float()).abs().item())
+                            + float(torch.tanh(c_mod.p3_ffn_extra_gain.detach().float()).abs().item())
+                        ))
+                mhc_p2 = sum(p2_gains) / float(max(1, len(p2_gains)))
+                mhc_p3 = (sum(p3_gains) / float(len(p3_gains))) if p3_gains else 0.0
+                mhc_gain = 0.5 * (mhc_p2 + mhc_p3) if p3_gains else mhc_p2
 
                 metrics = {
                     'stage': stage_name,
@@ -1532,6 +1704,8 @@ def run_v03_four_stage_training(
                     'step_time_s': round(step_dt, 2),
                     'vram_peak_gb': round(vram_peak, 2),
                     'mhc_gain': round(mhc_gain, 5),
+                    'mhc_p2_gain': round(mhc_p2, 5),
+                    'mhc_p3_gain': round(mhc_p3, 5),
                     'elapsed_hours': round(elapsed_h, 3),
                 }
                 history.append(metrics)
@@ -1543,10 +1717,10 @@ def run_v03_four_stage_training(
                     print(
                         f"[{stage_name} {st_step:4d}/{stage_steps:4d} | Global {global_step:4d}] "
                         f"loss={accum_loss:.4f} (ce={accum_ce:.4f}, z={accum_z:.5f}) | "
-                        f"gnorm={grad_norm:.3f} | mHC_gain={mhc_gain:.4f} | "
+                        f"gnorm={grad_norm:.3f} | mHC={mhc_gain:.4f}(p2={mhc_p2:.4f},p3={mhc_p3:.4f}) | "
                         f"{tok_per_s:6.0f} tok/s ({step_dt:4.1f}s/step, sup={step_sup_tokens:,}) | "
                         f"VRAM={vram_alloc:.1f}/{vram_peak:.1f}GB | "
-                        f"elapsed={elapsed_h:.2f}h (stage ETA {stage_eta_m:.1f}m)",
+                        f"elapsed={elapsed_h:.2f}h (ETA {stage_eta_m:.1f}m)",
                         flush=True,
                     )
 
@@ -1556,14 +1730,14 @@ def run_v03_four_stage_training(
                         hf_token=hf_token, push_backbone=False,
                     )
 
-                # Anti-overfitting early stage graduation if 6-step rolling CE drops below floor after half-epoch warmup
-                min_warmup_steps = max(18, steps_per_epoch // 2)
-                if stage_idx >= 1 and st_step >= min_warmup_steps and len(recent_ce) == 6:
+                # Anti-overfitting early stage graduation if 6-step rolling CE drops below stage_loss_floor after warmup
+                min_warmup_steps = max(12, min(20, stage_steps // 3))
+                if st_step >= min_warmup_steps and len(recent_ce) == 6:
                     avg_ce = sum(recent_ce) / 6.0
-                    if avg_ce < loss_floor:
+                    if avg_ce < stage_loss_floor:
                         print(
-                            f"[Anti-Overfit Guard] 6-step mean ce_loss={avg_ce:.4f} < {loss_floor:.4f} at step {st_step}/{stage_steps}; "
-                            f"graduating {stage_name} early to preserve generalization.",
+                            f"[Anti-Overfit Guard] 6-step mean ce_loss={avg_ce:.4f} < {stage_loss_floor:.4f} at step {st_step}/{stage_steps}; "
+                            f"graduating {stage_name} early to preserve general-purpose capability.",
                             flush=True,
                         )
                         break
@@ -1576,7 +1750,7 @@ def run_v03_four_stage_training(
             save_and_push_v03_checkpoint(
                 model, tokenizer, cfg, stage_name, global_step,
                 history[-1] if history else {'loss': 0.0},
-                hf_token=hf_token, push_backbone=False,
+                hf_token=hf_token, push_backbone=(not freeze_bb),
             )
             del optimizer
             gc.collect()

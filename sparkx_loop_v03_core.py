@@ -973,6 +973,43 @@ class ZipfianTieredMoEEngram(nn.Module):
         self._pending_tier1b_leaf = None
         self._pending_tier1b_rows = None
 
+    @torch.no_grad()
+    def reset_parameters_to_step0(self, initial_active_experts: int = 8, initial_top_k: int = 2):
+        """Re-initialize all Tier-1A/1B tables, Shared Expert, Routed Experts, and Zero-Gate to fresh Step-0 state."""
+        self.active_experts = min(int(initial_active_experts), self.num_experts)
+        self.active_top_k = min(int(initial_top_k), self.active_experts)
+        nn.init.zeros_(self.tier1a_hot.weight)
+        self.scale_weights.zero_()
+        if self.cold_buckets > 0 and self.offload_tier1b_cpu and self.tier1b_cold_weight is not None:
+            self.tier1b_cold_weight.zero_()
+            self.tier1b_exp_avg.zero_()
+            self.tier1b_exp_avg_sq.zero_()
+            self.tier1b_step = 0
+            self._pending_tier1b_rows = None
+            self._pending_tier1b_leaf = None
+        elif self.cold_buckets > 0 and hasattr(self, 'tier1b_cold'):
+            nn.init.zeros_(self.tier1b_cold.weight)
+        self.norm_weight.fill_(1.0)
+        nn.init.normal_(self.lexical_up.weight, mean=0.0, std=0.02)
+        nn.init.kaiming_uniform_(self.shared_gate.weight, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.shared_up.weight, a=math.sqrt(5))
+        nn.init.normal_(self.shared_down.weight, mean=0.0, std=0.01)
+        nn.init.orthogonal_(self.router_proj.weight)
+        nn.init.orthogonal_(self.expert_centroids)
+        self.router_log_temp.fill_(math.log(0.15))
+        self.pass_router_bias.zero_()
+        self.expert_bias.zero_()
+        self.expert_load_ema.fill_(1.0 / self.num_experts)
+        nn.init.kaiming_uniform_(self.query_proj.weight, a=math.sqrt(5))
+        self._init_orthogonal_experts()
+        nn.init.zeros_(self.ctx_gate.weight)
+        nn.init.zeros_(self.ctx_gate.bias)
+        nn.init.zeros_(self.project.weight)
+        self.gain.fill_(-2.0)
+        self.last_router_z_loss = torch.tensor(0.0)
+        self._active_z_losses = None
+        self._pending_expert_load = None
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -986,8 +1023,10 @@ class ZipfianTieredMoEEngram(nn.Module):
         if ngram_indices is None:
             ngram_indices = self.compute_ngram_indices(input_ids, self.total_buckets, prev_ids=prev_ids)
 
-        # 1. Tier 1A + 1B Lexical N-gram Lookup
+        # 1. Tier 1A + 1B Lexical N-gram Lookup (with 20% training dropout to prevent verbatim 3-gram memorization)
         e_lexical = self._lookup_tier1_lexical(ngram_indices, input_ids.device, param_dtype)
+        if self.training:
+            e_lexical = F.dropout(e_lexical, p=0.20, training=True)
         lex_hidden = self.lexical_up(e_lexical)
 
         if hidden_states is not None:
@@ -1074,7 +1113,7 @@ class ZipfianTieredMoEEngram(nn.Module):
                     routed_flat.index_add_(0, token_rows, torch.cat(out_chunks, dim=0))
 
             routed_out = routed_flat.view_as(shared_out)
-            combined = lex_hidden + shared_out + routed_out
+            combined = 0.5 * lex_hidden + shared_out + routed_out
             ctx = 2.0 * torch.sigmoid(self.ctx_gate(h_norm).float()).to(param_dtype)
             combined = combined * ctx
         else:
@@ -1163,6 +1202,30 @@ class TwoStreamMHC(nn.Module):
         else:
             self.pass_down = None
             self.pass_up = None
+
+    @torch.no_grad()
+    def reset_parameters_to_step0(self):
+        """Restore TwoStreamMHC to exact Step-0 zero-gated identity initialization."""
+        self.mix_logits.copy_(torch.tensor([[4.0, -4.0], [-4.0, 4.0]], dtype=torch.float32, device=self.mix_logits.device))
+        self.read_logits.copy_(torch.tensor([5.0, -5.0], dtype=torch.float32, device=self.read_logits.device))
+        self.write_logits.copy_(torch.tensor([5.0, -5.0], dtype=torch.float32, device=self.write_logits.device))
+        self.extra_gain.zero_()
+        self.p3_extra_gain.zero_()
+        self.ffn_mix_logits.copy_(torch.tensor([[4.0, -4.0], [-4.0, 4.0]], dtype=torch.float32, device=self.ffn_mix_logits.device))
+        self.ffn_read_logits.copy_(torch.tensor([5.0, -5.0], dtype=torch.float32, device=self.ffn_read_logits.device))
+        self.ffn_write_logits.copy_(torch.tensor([5.0, -5.0], dtype=torch.float32, device=self.ffn_write_logits.device))
+        self.ffn_extra_gain.zero_()
+        self.p3_ffn_extra_gain.zero_()
+        self.pass_routing_bias.zero_()
+        if self.dynamic and self.dynamic_proj is not None:
+            self.norm_weight.fill_(1.0)
+            nn.init.zeros_(self.dynamic_proj.weight)
+            self.ffn_norm_weight.fill_(1.0)
+            nn.init.zeros_(self.ffn_dynamic_proj.weight)
+        if self.pass_down is not None and self.pass_up is not None:
+            for p_idx in range(self.max_passes):
+                nn.init.kaiming_uniform_(self.pass_down[p_idx].weight, a=math.sqrt(5))
+                nn.init.zeros_(self.pass_up[p_idx].weight)
 
     def mixing_matrix(self, dynamic_delta: Optional[torch.Tensor] = None, base_logits: Optional[torch.Tensor] = None) -> torch.Tensor:
         base = (self.mix_logits if base_logits is None else base_logits).float()
@@ -1409,6 +1472,17 @@ class SparkXLoopV03(nn.Module):
     def all_engram_modules(self) -> list[ZipfianTieredMoEEngram]:
         return [self.engram] + [mod for mod in self.backbone_engrams.values()]
 
+    @torch.no_grad()
+    def reset_all_loop_and_engram_to_step0(self, initial_active_experts: int = 8, initial_top_k: int = 2):
+        """Re-initialize all 24 TwoStreamMHC controllers and all 8 ZipfianTieredMoEEngram anchors to Step 0."""
+        for ctrl in self.controllers.values():
+            ctrl.reset_parameters_to_step0()
+        for eng_mod in self.all_engram_modules():
+            eng_mod.reset_parameters_to_step0(
+                initial_active_experts=initial_active_experts,
+                initial_top_k=initial_top_k,
+            )
+
     def upcycle_all_engrams_8_to_32(self, noise_std: float = 1e-3):
         for mod in self.all_engram_modules():
             mod.upcycle_experts_8_to_32(noise_std=noise_std)
@@ -1574,8 +1648,11 @@ class SparkXLoopV03(nn.Module):
                     input_ids, x.dtype, prev_ids=prev_ids, hidden_states=x,
                     pass_idx=_pass, ngram_indices=ngram_indices,
                 )
-            if past_key_values is None and self.training and self.enable_checkpoint:
-                return checkpoint(_eng_step, h_in, use_reentrant=False)
+            if past_key_values is None and self.training and self.enable_checkpoint and (
+                h_in.requires_grad or any(p.requires_grad for p in _eng.parameters())
+            ):
+                ckpt_in = h_in if h_in.requires_grad else h_in.detach().requires_grad_(True)
+                return checkpoint(_eng_step, ckpt_in, use_reentrant=False)
             return _eng_step(h_in)
 
         # 1. Prelude layers [0..loop_start) (includes Anchor 0 at Layer 3 + any backbone anchors < loop_start)
@@ -1614,6 +1691,17 @@ class SparkXLoopV03(nn.Module):
             # while TwoStreamMHC.forward executes all internal Sinkhorn & residual math in FP32.
             stream_dtype = kv_dtype if (self.training and self.enable_checkpoint and input_ids.shape[1] >= 8192) else h.dtype
             streams = torch.stack((h.to(stream_dtype), h.to(stream_dtype)), dim=0)
+            if (
+                past_key_values is None
+                and self.training
+                and torch.is_grad_enabled()
+                and not streams.requires_grad
+                and (
+                    any(p.requires_grad for p in self.controllers.parameters())
+                    or (self.engram_enabled and any(p.requires_grad for p in self.backbone_engrams.parameters()))
+                )
+            ):
+                streams = streams.detach().requires_grad_(True)
             for p, s_idx, e_idx in pass_spans:
                 for idx in range(s_idx, e_idx):
                     kind = self.base.model.layers[idx].layer_type
@@ -1816,7 +1904,14 @@ class SparkXLoopV03(nn.Module):
         return out
 
 
-def set_trainables_v03(model: SparkXLoopV03, full_finetune: bool = True, freeze_backbone: bool = False):
+def set_trainables_v03(
+    model: SparkXLoopV03,
+    full_finetune: bool = True,
+    freeze_backbone: bool = False,
+    freeze_engram: Optional[bool] = None,
+):
+    if freeze_engram is None:
+        freeze_engram = not bool(model.engram_enabled)
     for p in model.base.parameters():
         p.requires_grad_(bool(full_finetune and not freeze_backbone))
     # Always keep embeddings frozen to protect 167,168 vocabulary geometry
@@ -1826,11 +1921,11 @@ def set_trainables_v03(model: SparkXLoopV03, full_finetune: bool = True, freeze_
         for p in model.base.model.norm.parameters():
             p.requires_grad_(True)
     for p in model.controllers.parameters():
-        p.requires_grad_(True)
+        p.requires_grad_(bool(model.mhc_enabled))
     for p in model.engram.parameters():
-        p.requires_grad_(True)
+        p.requires_grad_(not bool(freeze_engram))
     for p in model.backbone_engrams.parameters():
-        p.requires_grad_(True)
+        p.requires_grad_(not bool(freeze_engram))
     return {n: p for n, p in model.named_parameters() if p.requires_grad}
 
 
