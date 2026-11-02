@@ -734,11 +734,21 @@ class SparkXLoop(nn.Module):
         else:
             from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
             mask_cfg = self._make_loop_cache_config() if past_key_values is not None else cfg
-            kwargs = dict(config=mask_cfg, input_embeds=embeds, attention_mask=attention_mask,
-                          cache_position=cache_position, past_key_values=past_key_values, position_ids=position_ids)
-            masks = {'full_attention': create_causal_mask(**kwargs)}
+            common_kwargs = dict(
+                config=mask_cfg,
+                attention_mask=attention_mask,
+                cache_position=cache_position,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+            )
+            def _call_mask_fn(fn):
+                try:
+                    return fn(inputs_embeds=embeds, **common_kwargs)
+                except TypeError:
+                    return fn(input_embeds=embeds, **common_kwargs)
+            masks = {'full_attention': _call_mask_fn(create_causal_mask)}
             if getattr(model, 'has_sliding_layers', False):
-                masks['sliding_attention'] = create_sliding_window_causal_mask(**kwargs)
+                masks['sliding_attention'] = _call_mask_fn(create_sliding_window_causal_mask)
         implementation = importlib.import_module(type(model.layers[0].self_attn).__module__)
         rope = {}
         rope_dtype = embeds.dtype if (past_key_values is not None and embeds.dtype in (torch.bfloat16, torch.float16)) else None

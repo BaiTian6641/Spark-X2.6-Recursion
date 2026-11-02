@@ -325,6 +325,25 @@ def patch_spark_for_unsloth_triton(base_model: nn.Module) -> dict[str, bool]:
         attn_mod.apply_rotary_pos_emb = _bf16_apply_rotary_pos_emb
         attn_mod._sparkx_bf16_rope_patched = True
     status['patched_bf16_rope'] = True
+
+    # 3. Patch create_causal_mask / create_sliding_window_causal_mask in modeling_spark for Transformers 5.x (inputs_embeds vs input_embeds)
+    for _mask_fn_name in ('create_causal_mask', 'create_sliding_window_causal_mask'):
+        _orig_mask_fn = getattr(attn_mod, _mask_fn_name, None)
+        if callable(_orig_mask_fn) and not getattr(_orig_mask_fn, '_sparkx_v5_patched', False):
+            def _make_mask_wrapper(_fn):
+                def _wrapped(*args, **kwargs):
+                    try:
+                        return _fn(*args, **kwargs)
+                    except TypeError:
+                        kw2 = dict(kwargs)
+                        if 'input_embeds' in kw2 and 'inputs_embeds' not in kw2:
+                            kw2['inputs_embeds'] = kw2.pop('input_embeds')
+                        elif 'inputs_embeds' in kw2 and 'input_embeds' not in kw2:
+                            kw2['input_embeds'] = kw2.pop('inputs_embeds')
+                        return _fn(*args, **kw2)
+                _wrapped._sparkx_v5_patched = True
+                return _wrapped
+            setattr(attn_mod, _mask_fn_name, _make_mask_wrapper(_orig_mask_fn))
     return status
 
 
@@ -1573,7 +1592,13 @@ class SparkXLoopV03(nn.Module):
         cfg = self.base.config
         device = embeds.device
         if cache_position is None:
-            past_seen = past_key_values.get_seq_length(0) if past_key_values is not None else 0
+            if past_key_values is not None:
+                try:
+                    past_seen = past_key_values.get_seq_length(0)
+                except TypeError:
+                    past_seen = past_key_values.get_seq_length()
+            else:
+                past_seen = 0
             cache_position = torch.arange(past_seen, past_seen + embeds.shape[1], device=device)
         position_ids = cache_position.unsqueeze(0)
         if hasattr(model, 'make_loop_context'):
@@ -1585,11 +1610,21 @@ class SparkXLoopV03(nn.Module):
         else:
             from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
             mask_cfg = self._make_loop_cache_config() if past_key_values is not None else cfg
-            kwargs = dict(config=mask_cfg, input_embeds=embeds, attention_mask=attention_mask,
-                          cache_position=cache_position, past_key_values=past_key_values, position_ids=position_ids)
-            masks = {'full_attention': create_causal_mask(**kwargs)}
+            common_kwargs = dict(
+                config=mask_cfg,
+                attention_mask=attention_mask,
+                cache_position=cache_position,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+            )
+            def _call_mask_fn(fn):
+                try:
+                    return fn(inputs_embeds=embeds, **common_kwargs)
+                except TypeError:
+                    return fn(input_embeds=embeds, **common_kwargs)
+            masks = {'full_attention': _call_mask_fn(create_causal_mask)}
             if getattr(model, 'has_sliding_layers', False):
-                masks['sliding_attention'] = create_sliding_window_causal_mask(**kwargs)
+                masks['sliding_attention'] = _call_mask_fn(create_sliding_window_causal_mask)
         implementation = importlib.import_module(type(model.layers[0].self_attn).__module__)
         rope = {}
         for layer_type in set(cfg.layer_types):
