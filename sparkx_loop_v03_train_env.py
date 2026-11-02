@@ -1027,8 +1027,14 @@ def save_and_push_v03_checkpoint(
         model.base.save_pretrained(str(ckpt_dir), safe_serialization=True, max_shard_size='4GB')
         tokenizer.save_pretrained(str(ckpt_dir))
 
-    # Enforce rolling MAX_LOCAL_CHECKPOINTS retention
-    all_ckpts = sorted([d for d in ckpt_root.iterdir() if d.is_dir()], key=lambda d: d.stat().st_mtime)
+    # Enforce rolling MAX_LOCAL_CHECKPOINTS retention (keep highest step numbers, never evict higher steps!)
+    def _ckpt_sort_key(d: Path):
+        try:
+            return (int(d.name.split('_')[1]), d.stat().st_mtime)
+        except Exception:
+            return (0, d.stat().st_mtime)
+
+    all_ckpts = sorted([d for d in ckpt_root.iterdir() if d.is_dir() and d.name.startswith('step_')], key=_ckpt_sort_key)
     max_keep = int(cfg.get('MAX_LOCAL_CHECKPOINTS', 3))
     while len(all_ckpts) > max_keep:
         old = all_ckpts.pop(0)
@@ -1214,8 +1220,72 @@ def run_v03_four_stage_training(
     history: List[Dict[str, Any]] = []
     budget_reached = False
 
-    # Discover all existing local checkpoints so interrupted mid-stage runs can graduate cleanly without re-running
-    existing_ckpts = sorted(ckpt_root.glob('step_*')) if ckpt_root.exists() else []
+    # 1. Discover the HIGHEST-STEP valid checkpoint across local disk AND Hugging Face Hub
+    best_ckpt_step = 0
+    best_state_path: Optional[Path] = None
+    best_ckpt_label = ''
+    best_stage_hint = ''
+
+    if ckpt_root.exists():
+        for d in ckpt_root.glob('step_*'):
+            st_file = d / 'loop_v03_state.pt'
+            if d.is_dir() and st_file.exists():
+                try:
+                    st_num = int(d.name.split('_')[1])
+                except Exception:
+                    st_num = 0
+                if st_num >= best_ckpt_step:
+                    best_ckpt_step = st_num
+                    best_state_path = st_file
+                    best_ckpt_label = d.name
+                    best_stage_hint = d.name
+
+    # Fallback / cross-check with Hugging Face Hub if local highest step < 250
+    if best_ckpt_step < 250 and cfg.get('HF_REPO_ID'):
+        try:
+            from huggingface_hub import hf_hub_download
+            hub_cache = ckpt_root / '_hub_resume_cache'
+            hub_cache.mkdir(parents=True, exist_ok=True)
+            cfg_path = Path(hf_hub_download(
+                repo_id=cfg['HF_REPO_ID'],
+                filename='loop_config_v03.json',
+                token=hf_token,
+                local_dir=str(hub_cache),
+            ))
+            hub_meta = json.loads(cfg_path.read_text())
+            hub_step = int(hub_meta.get('global_step', 0))
+            if hub_step > best_ckpt_step:
+                st_path = Path(hf_hub_download(
+                    repo_id=cfg['HF_REPO_ID'],
+                    filename='loop_v03_state.pt',
+                    token=hf_token,
+                    local_dir=str(hub_cache),
+                ))
+                best_ckpt_step = hub_step
+                best_state_path = st_path
+                best_stage_hint = str(hub_meta.get('stage_name', ''))
+                best_ckpt_label = f"HF_Hub:{cfg['HF_REPO_ID']}@step_{hub_step:05d}({best_stage_hint})"
+        except Exception as exc:
+            print(f"[Auto-Resume Info] Hub checkpoint check skipped: {exc}", flush=True)
+
+    resume_stage_idx = 0
+    if best_state_path is not None and best_ckpt_step >= 200:
+        print(
+            f"\n[Auto-Resume] Restoring highest checkpoint {best_ckpt_label} (global_step={best_ckpt_step})...",
+            flush=True,
+        )
+        state_obj = torch.load(str(best_state_path), map_location='cpu')
+        _core_mod.load_loop_v03_state_dict(model, state_obj, strict=False)
+        global_step = best_ckpt_step
+        if 'Stage4' in best_stage_hint:
+            resume_stage_idx = 4
+        elif 'Stage3' in best_stage_hint:
+            resume_stage_idx = 3
+        elif 'Stage2' in best_stage_hint or best_ckpt_step >= 250:
+            # Stage 1 and Stage 2 are both converged -> jump straight to Stage 3 (Upcycle 8 -> 32 at 16K)!
+            resume_stage_idx = 2
+        else:
+            resume_stage_idx = 1
 
     try:
         for stage_idx, stage_cfg in enumerate(cfg['STAGES']):
@@ -1235,44 +1305,13 @@ def run_v03_four_stage_training(
             else:
                 stage_steps = raw_stage_steps
 
-            expected_end_step = global_step + stage_steps
-            raw_expected_end_step = global_step + raw_stage_steps
-            stage_ckpt_candidates = [
-                ckpt_root / f"step_{expected_end_step:05d}_{stage_name}",
-                ckpt_root / f"step_{raw_expected_end_step:05d}_{stage_name}",
-            ] + [
-                d for d in existing_ckpts
-                if d.is_dir() and d.name.endswith(f"_{stage_name}") and (d / 'loop_v03_state.pt').exists()
-            ]
-            # Also allow an EMERGENCY_RECOVERY checkpoint taken after >= 140 steps into Stage 2 to graduate Stage 2
-            if stage_idx == 1:
-                for d in reversed(existing_ckpts):
-                    if d.is_dir() and 'EMERGENCY_RECOVERY' in d.name and (d / 'loop_v03_state.pt').exists():
-                        try:
-                            st_num = int(d.name.split('_')[1])
-                            if st_num >= 340:
-                                stage_ckpt_candidates.insert(0, d)
-                                break
-                        except Exception:
-                            pass
-
-            matched_ckpt = next((d for d in stage_ckpt_candidates if d.exists() and (d / 'loop_v03_state.pt').exists()), None)
-            if matched_ckpt is not None:
-                try:
-                    ckpt_step = int(matched_ckpt.name.split('_')[1])
-                except Exception:
-                    ckpt_step = expected_end_step
-                # Only auto-skip if the checkpoint represents >= 1.8 epochs (or full stage completion)
-                if ckpt_step >= global_step + min(stage_steps, max(50, int(1.8 * steps_per_epoch))):
-                    print(
-                        f"\n[Auto-Resume] Found converged checkpoint {matched_ckpt.name} for {stage_name}; "
-                        f"restoring loop state and advancing global_step -> {ckpt_step}.",
-                        flush=True,
-                    )
-                    state_obj = torch.load(str(matched_ckpt / 'loop_v03_state.pt'), map_location='cpu')
-                    _core_mod.load_loop_v03_state_dict(model, state_obj, strict=False)
-                    global_step = ckpt_step
-                    continue
+            if stage_idx < resume_stage_idx:
+                print(
+                    f"[Auto-Resume] Skipping already-converged {stage_name} "
+                    f"(resuming at Stage {resume_stage_idx + 1} from global_step={global_step}).",
+                    flush=True,
+                )
+                continue
 
             if stage_cfg.get('upcycle_8_to_32', False):
                 print(f"\n[{stage_name}] Executing Coarse-to-Fine Expert Upcycling (8 -> 32 experts, top_k=7)...", flush=True)
@@ -1460,15 +1499,25 @@ def run_v03_four_stage_training(
                 torch.cuda.empty_cache()
 
     except BaseException as exc:
-        if global_step > 0:
-            print(f"\n[Emergency Recovery Guard] Caught {type(exc).__name__}: {exc}. Saving recovery checkpoint at step {global_step}...", flush=True)
+        is_kbd = isinstance(exc, KeyboardInterrupt)
+        if global_step > max(0, best_ckpt_step):
+            print(
+                f"\n[Emergency Recovery Guard] Caught {type(exc).__name__} at step {global_step}. "
+                f"Saving fast recovery checkpoint...",
+                flush=True,
+            )
             save_and_push_v03_checkpoint(
                 model, tokenizer, cfg, 'EMERGENCY_RECOVERY', global_step,
                 history[-1] if history else {'loss': 0.0},
-                hf_token=hf_token, push_backbone=True,
+                hf_token=(None if is_kbd else hf_token),
+                push_backbone=(not is_kbd),
             )
         else:
-            print(f"\n[Emergency Recovery Guard] Caught {type(exc).__name__} at step 0 (skipping 8GB checkpoint upload): {exc}", flush=True)
+            print(
+                f"\n[Emergency Recovery Guard] Caught {type(exc).__name__} at step {global_step} "
+                f"(preserving existing higher checkpoint at step {best_ckpt_step}).",
+                flush=True,
+            )
         raise
 
     final_dir = export_final_v03_to_hub(
