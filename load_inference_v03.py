@@ -68,6 +68,7 @@ def _patch_transformers_v5_tied_weights() -> None:
 
 def load_sparkx_loop_v03(
     repo_or_dir: str = 'TassP0lar/Spark-X2.6-4B-En4B-A1B',
+    repo_id: Optional[str] = None,
     base_repo: Optional[str] = None,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
     dtype: torch.dtype = torch.bfloat16,
@@ -77,9 +78,21 @@ def load_sparkx_loop_v03(
     loglinear_sink_tokens: int = 32,
     offload_tier1b_cpu: bool = True,
     token: Optional[str] = None,
+    return_meta: bool = False,
 ):
-    """Load the standalone Spark-X2.6-4B-En4B-A1B (v0.3) checkpoint (72 effective layers, 8.34B total / 5.33B active)."""
+    """Load the standalone Spark-X2.6-4B-En4B-A1B (v0.3) checkpoint (72 effective layers, 8.23B total / 5.23B active)."""
     _patch_transformers_v5_tied_weights()
+    if repo_id is not None:
+        repo_or_dir = repo_id
+    if token is None:
+        token = os.environ.get('HF_TOKEN') or None
+        if token is None:
+            try:
+                from google.colab import userdata
+                token = userdata.get('HF_TOKEN')
+            except Exception:
+                pass
+
     if os.path.isdir(repo_or_dir):
         cfg_path = os.path.join(repo_or_dir, 'loop_config_v03.json')
         if not os.path.exists(cfg_path):
@@ -159,6 +172,7 @@ def load_sparkx_loop_v03(
             sink_tokens=loglinear_sink_tokens,
         )
 
+    model.loaded_meta = meta
     model.eval()
     p_stats = count_en4b_a1b_params(model)
     m_info = meta.get('metrics', {})
@@ -170,5 +184,7 @@ def load_sparkx_loop_v03(
         f"  Final Train Loss: ce_loss={m_info.get('ce_loss')}, z_loss={m_info.get('z_loss')}, "
         f"mHC_gain={m_info.get('mhc_gain')} (p2={m_info.get('mhc_p2_gain')}, p3={m_info.get('mhc_p3_gain')})"
     )
-    return model, tok, meta
+    if return_meta:
+        return model, tok, meta
+    return model, tok
 

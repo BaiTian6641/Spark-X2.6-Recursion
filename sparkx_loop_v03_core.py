@@ -879,6 +879,25 @@ class ZipfianTieredMoEEngram(nn.Module):
         nn.init.zeros_(self.project.weight)
         self.gain = nn.Parameter(torch.tensor(-2.0, dtype=torch.float32))
         self.last_router_z_loss: torch.Tensor = torch.tensor(0.0)
+        self._gate_override_tensor: Optional[torch.Tensor] = None
+        self._gate_override_ref_val: Optional[float] = None
+
+    @property
+    def proj(self) -> nn.Linear:
+        return self.project
+
+    @property
+    def ngram_order_logits(self) -> nn.Parameter:
+        return self.scale_weights
+
+    @property
+    def gate(self) -> torch.Tensor:
+        cur_gain = float(self.gain.detach().float().item())
+        if self._gate_override_tensor is None or self._gate_override_ref_val != cur_gain:
+            sig = torch.sigmoid(self.gain.detach().float()).clamp(1e-6, 1.0 - 1e-6)
+            self._gate_override_tensor = torch.atanh(sig)
+            self._gate_override_ref_val = cur_gain
+        return self._gate_override_tensor
 
     @torch.no_grad()
     def _init_orthogonal_experts(self):
@@ -1210,7 +1229,10 @@ class ZipfianTieredMoEEngram(nn.Module):
             combined = F.silu(lex_hidden)
 
         projected = self.project(combined)
-        gate = torch.sigmoid(self.gain).to(dtype)
+        if not self.training and self._gate_override_tensor is not None:
+            gate = torch.tanh(self._gate_override_tensor.to(device=projected.device, dtype=torch.float32)).abs().to(dtype)
+        else:
+            gate = torch.sigmoid(self.gain).to(dtype)
         if not self.training and input_ids.shape[1] == 1:
             gate = gate * float(getattr(self, 'decode_engram_scale', 0.25))
         return projected.to(dtype) * gate
@@ -1292,6 +1314,14 @@ class TwoStreamMHC(nn.Module):
         else:
             self.pass_down = None
             self.pass_up = None
+
+    @property
+    def attn_extra_gain(self) -> nn.Parameter:
+        return self.extra_gain
+
+    @property
+    def p3_attn_extra_gain(self) -> nn.Parameter:
+        return self.p3_extra_gain
 
     @torch.no_grad()
     def reset_parameters_to_step0(self):
@@ -1602,6 +1632,9 @@ class SparkXLoopV03(nn.Module):
 
     def all_engram_modules(self) -> list[ZipfianTieredMoEEngram]:
         return [self.engram] + [mod for mod in self.backbone_engrams.values()]
+
+    def iter_engram_anchors(self) -> list[tuple[int, ZipfianTieredMoEEngram]]:
+        return [(3, self.engram)] + [(int(k), mod) for k, mod in self.backbone_engrams.items()]
 
     @torch.no_grad()
     def reset_all_loop_and_engram_to_step0(self, initial_active_experts: int = 8, initial_top_k: int = 2):
@@ -2239,20 +2272,66 @@ def warm_start_from_v02_state(model: SparkXLoopV03, v02_state: dict) -> dict[str
 patch_spark_for_loglinear_kv = patch_spark_attention_for_loglinear_kv
 
 
+class _MetricFloat(float):
+    """A float value that also supports dict-style indexing (`['max_row_err']`, `['causal_prefix_unchanged']`)."""
+
+    def __new__(cls, val: float, meta: dict):
+        obj = super().__new__(cls, float(val))
+        obj._meta = dict(meta)
+        return obj
+
+    def __getitem__(self, key):
+        return self._meta[key]
+
+    def get(self, key, default=None):
+        return self._meta.get(key, default)
+
+    def keys(self):
+        return self._meta.keys()
+
+    def items(self):
+        return self._meta.items()
+
+
 @torch.no_grad()
-def verify_birkhoff_sinkhorn(ctrl: TwoStreamMHC) -> float:
+def verify_birkhoff_sinkhorn(ctrl: Optional[TwoStreamMHC] = None) -> _MetricFloat:
     """Return max absolute row/col deviation from doubly-stochastic 1.0 across random dynamic perturbations."""
+    if ctrl is None:
+        ctrl = TwoStreamMHC(width=64, dynamic=False, pass_adapter_rank=0)
     device = ctrl.mix_logits.device
     delta = torch.randn(4, 16, 2, 2, device=device, dtype=torch.float32) * 3.0
     mat = ctrl.mixing_matrix(dynamic_delta=delta)
-    row_err = (mat.sum(dim=-1) - 1.0).abs().max().item()
-    col_err = (mat.sum(dim=-2) - 1.0).abs().max().item()
-    return float(max(row_err, col_err))
+    row_err = float((mat.sum(dim=-1) - 1.0).abs().max().item())
+    col_err = float((mat.sum(dim=-2) - 1.0).abs().max().item())
+    max_err = max(row_err, col_err)
+    return _MetricFloat(max_err, {'max_row_err': row_err, 'max_col_err': col_err, 'max_err': max_err})
 
 
 @torch.no_grad()
-def verify_ngram_causality(model: SparkXLoopV03, vocab_size: int = 167168, device: Optional[torch.device] = None) -> float:
-    """Verify that mutating future tokens t >= prefix_len has zero effect on prefix_len logits."""
+def verify_ngram_causality(
+    model_or_engram: Any,
+    vocab_size: int = 167168,
+    device: Optional[torch.device] = None,
+) -> _MetricFloat:
+    """Verify that mutating future tokens t >= prefix_len has zero effect on prefix_len hashes/outputs."""
+    if isinstance(model_or_engram, ZipfianTieredMoEEngram):
+        engram = model_or_engram
+        if device is None:
+            device = engram.project.weight.device
+        seq_a = torch.randint(10, min(vocab_size, 50000), (1, 16), device=device)
+        seq_b = seq_a.clone()
+        seq_b[:, 8:] = torch.randint(10, min(vocab_size, 50000), (1, 8), device=device)
+        idx_a = engram.compute_ngram_indices(seq_a, engram.total_buckets)
+        idx_b = engram.compute_ngram_indices(seq_b, engram.total_buckets)
+        hash_diff = max(float((a[:, :8] - b[:, :8]).abs().max().item()) for a, b in zip(idx_a, idx_b))
+        h_in = torch.randn(1, 16, engram.width, device=device, dtype=engram.project.weight.dtype)
+        out_a = engram(seq_a, dtype=engram.project.weight.dtype, hidden_states=h_in).float()[:, :8, :]
+        out_b = engram(seq_b, dtype=engram.project.weight.dtype, hidden_states=h_in).float()[:, :8, :]
+        out_diff = float((out_a - out_b).abs().max().item())
+        max_diff = max(hash_diff, out_diff)
+        return _MetricFloat(max_diff, {'causal_prefix_unchanged': (max_diff == 0.0), 'max_diff': max_diff})
+
+    model = model_or_engram
     if device is None:
         device = next(model.base.parameters()).device
     seq_a = torch.randint(10, min(vocab_size, 50000), (1, 16), device=device)
@@ -2266,4 +2345,6 @@ def verify_ngram_causality(model: SparkXLoopV03, vocab_size: int = 167168, devic
     logits_a = model.forward_logits(seq_a).float()[:, :8, :]
     logits_b = model.forward_logits(seq_b).float()[:, :8, :]
     logit_diff = float((logits_a - logits_b).abs().max().item())
-    return max(hash_diff, logit_diff)
+    max_diff = max(hash_diff, logit_diff)
+    return _MetricFloat(max_diff, {'causal_prefix_unchanged': (max_diff < 1e-4), 'max_diff': max_diff})
+
