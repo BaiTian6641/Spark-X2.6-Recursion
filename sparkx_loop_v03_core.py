@@ -813,21 +813,27 @@ class ZipfianTieredMoEEngram(nn.Module):
 
     @torch.no_grad()
     def upcycle_experts_8_to_32(self, noise_std: float = 1e-3):
-        """Clone the 8 trained coarse macro-experts into 32 fine-grained experts with orthogonal perturbations."""
+        """Clone the 8 trained coarse macro-experts into 32 fine-grained experts in reverse index order
+        (`7 -> 28..31`, ..., `0 -> 0..3`) so coarse experts `1..7` are never overwritten before cloning.
+        """
         if self.active_experts >= self.num_experts:
             self.active_top_k = self.target_top_k
             return
         coarse = self.active_experts
         factor = self.num_experts // coarse
-        for m in range(coarse):
-            for sub in range(factor):
+        src_gate = self.expert_gate.data[:coarse].clone()
+        src_up = self.expert_up.data[:coarse].clone()
+        src_down = self.expert_down.data[:coarse].clone()
+        src_cent = self.expert_centroids.data[:coarse].clone()
+        src_pbias = self.pass_router_bias.data[:, :coarse].clone()
+        for m in range(coarse - 1, -1, -1):
+            for sub in range(factor - 1, -1, -1):
                 dst = m * factor + sub
-                if dst == m:
-                    continue
-                self.expert_gate.data[dst].copy_(self.expert_gate.data[m])
-                self.expert_up.data[dst].copy_(self.expert_up.data[m])
-                self.expert_down.data[dst].copy_(self.expert_down.data[m])
-                self.expert_centroids.data[dst].copy_(self.expert_centroids.data[m])
+                self.expert_gate.data[dst].copy_(src_gate[m])
+                self.expert_up.data[dst].copy_(src_up[m])
+                self.expert_down.data[dst].copy_(src_down[m])
+                self.expert_centroids.data[dst].copy_(src_cent[m])
+                self.pass_router_bias.data[:, dst].copy_(src_pbias[:, m])
                 if sub > 0:
                     self.expert_gate.data[dst].add_(torch.randn_like(self.expert_gate.data[dst]) * noise_std)
                     self.expert_up.data[dst].add_(torch.randn_like(self.expert_up.data[dst]) * noise_std)

@@ -165,8 +165,8 @@ def build_default_cfg() -> Dict[str, Any]:
                 'name': 'Stage3_R24_Upcycle32_60L_16K',
                 'start': 4, 'end': 28, 'passes': 2, 'enable_p3': False,
                 'seq_len': 16384,
-                'steps': 800,
-                'freeze_backbone': False,
+                'steps': 38,
+                'freeze_backbone': True,
                 'upcycle_8_to_32': True,
                 'lr_scale': 0.85,
             },
@@ -175,8 +175,8 @@ def build_default_cfg() -> Dict[str, Any]:
                 'start': 4, 'end': 28, 'passes': 2, 'enable_p3': True,
                 'p3_start': 12, 'p3_end': 24,
                 'seq_len': 16384,
-                'steps': 1600,
-                'freeze_backbone': False,
+                'steps': 38,
+                'freeze_backbone': True,
                 'upcycle_8_to_32': False,
                 'lr_scale': 0.70,
             },
@@ -1256,10 +1256,12 @@ def run_v03_four_stage_training(
     model_cls._apply_layer = _core_mod.SparkXLoopV03._apply_layer
     model_cls._checkpoint_context = _core_mod.SparkXLoopV03._checkpoint_context
     model_cls.total_router_z_loss = _core_mod.SparkXLoopV03.total_router_z_loss
+    model_cls.upcycle_all_engrams_8_to_32 = _core_mod.SparkXLoopV03.upcycle_all_engrams_8_to_32
     for eng_mod in model.all_engram_modules():
         eng_cls = type(eng_mod)
         eng_cls.forward = _core_mod.ZipfianTieredMoEEngram.forward
         eng_cls.step_tier1b_sparse_adam = _core_mod.ZipfianTieredMoEEngram.step_tier1b_sparse_adam
+        eng_cls.upcycle_experts_8_to_32 = _core_mod.ZipfianTieredMoEEngram.upcycle_experts_8_to_32
         eng_mod._pending_expert_load = None
         eng_mod.last_router_z_loss = None
         eng_mod._active_z_losses = None
@@ -1293,6 +1295,8 @@ def run_v03_four_stage_training(
     best_stage_hint = ''
 
     if ckpt_root.exists():
+        # Prefer completed Stage checkpoints over early EMERGENCY_RECOVERY checkpoints within 40 steps
+        candidates: List[Tuple[int, int, Path, str]] = []
         for d in ckpt_root.glob('step_*'):
             st_file = d / 'loop_v03_state.pt'
             if d.is_dir() and st_file.exists():
@@ -1300,11 +1304,18 @@ def run_v03_four_stage_training(
                     st_num = int(d.name.split('_')[1])
                 except Exception:
                     st_num = 0
-                if st_num >= best_ckpt_step:
-                    best_ckpt_step = st_num
-                    best_state_path = st_file
-                    best_ckpt_label = d.name
-                    best_stage_hint = d.name
+                is_clean_stage = 1 if ('Stage' in d.name and 'EMERGENCY' not in d.name) else 0
+                candidates.append((st_num, is_clean_stage, st_file, d.name))
+        if candidates:
+            clean_cands = [c for c in candidates if c[1] == 1]
+            max_any = max(candidates, key=lambda c: (c[0], c[1]))
+            if clean_cands:
+                max_clean = max(clean_cands, key=lambda c: c[0])
+                chosen = max_clean if (max_any[1] == 0 and (max_any[0] - max_clean[0]) <= 40) else max_any
+            else:
+                chosen = max_any
+            best_ckpt_step, _, best_state_path, best_ckpt_label = chosen
+            best_stage_hint = best_ckpt_label
 
     # Fallback / cross-check with Hugging Face Hub if local highest step < 250
     if best_ckpt_step < 250 and cfg.get('HF_REPO_ID'):
@@ -1360,16 +1371,24 @@ def run_v03_four_stage_training(
             stage_name = stage_cfg['name']
             seq_len = int(stage_cfg['seq_len'])
             raw_stage_steps = int(stage_cfg['steps'])
-            freeze_bb = bool(stage_cfg.get('freeze_backbone', False))
             pool = stage_pools.get(seq_len) or next(iter(stage_pools.values()))
-
-            # Epoch-aware anti-overfitting step cap for unfrozen backbone stages
             steps_per_epoch = max(1, len(pool) // grad_accum)
-            if not freeze_bb:
-                capped_steps = max(80, int(round(max_unfrozen_epochs * steps_per_epoch)))
-                stage_steps = min(raw_stage_steps, capped_steps)
+
+            # Anti-Overfitting Architecture Policy:
+            # Stage 2 already full-finetuned the 36L dense backbone for 4.5 epochs (ce_loss -> 0.21).
+            # In Stage 3 (60L Upcycle32 16K) and Stage 4 (72L Telescoping 16K), we LOCK the 36L dense backbone
+            # (`freeze_bb = True`) and cap each stage to 1.00 epoch (`38` steps over 307 16K sequences) so only
+            # the newly upcycled 32-expert Engrams and 60L/72L mHC recurrence gates calibrate with ZERO backbone memorization!
+            if stage_idx >= 2:
+                freeze_bb = True
+                stage_steps = min(raw_stage_steps, steps_per_epoch)
             else:
-                stage_steps = raw_stage_steps
+                freeze_bb = bool(stage_cfg.get('freeze_backbone', False))
+                if not freeze_bb:
+                    capped_steps = max(80, int(round(max_unfrozen_epochs * steps_per_epoch)))
+                    stage_steps = min(raw_stage_steps, capped_steps)
+                else:
+                    stage_steps = raw_stage_steps
 
             if stage_idx < resume_stage_idx:
                 print(
@@ -1406,14 +1425,13 @@ def run_v03_four_stage_training(
                 for p in mod.parameters():
                     p.requires_grad = True
 
-            # Preserve pretrained & Stage-2 backbone fluency during Stage 3 (Upcycle32) & Stage 4 (72L Telescoping)
-            bb_lr_mult = 0.20 if (stage_idx >= 2 and not freeze_bb) else 1.0
+            bb_lr_mult = 0.0 if freeze_bb else (0.20 if stage_idx >= 2 else 1.0)
 
             model.train()
             optimizer = _build_stage_optimizer(
                 model, cfg,
                 lr_scale=float(stage_cfg.get('lr_scale', 1.0)),
-                backbone_lr_mult=bb_lr_mult,
+                backbone_lr_mult=max(0.20, bb_lr_mult),
             )
             scheduler = _build_stage_cosine_scheduler(optimizer, total_steps=stage_steps)
 
@@ -1518,7 +1536,7 @@ def run_v03_four_stage_training(
                 }
                 history.append(metrics)
                 recent_ce.append(accum_ce)
-                if len(recent_ce) > 10:
+                if len(recent_ce) > 6:
                     recent_ce.pop(0)
 
                 if st_step <= 3 or st_step % log_every == 0 or st_step == stage_steps:
@@ -1538,12 +1556,13 @@ def run_v03_four_stage_training(
                         hf_token=hf_token, push_backbone=False,
                     )
 
-                # Anti-overfitting early stage graduation if 10-step rolling CE drops below floor after warmup
-                if (not freeze_bb) and st_step >= max(45, steps_per_epoch) and len(recent_ce) == 10:
-                    avg_ce = sum(recent_ce) / 10.0
+                # Anti-overfitting early stage graduation if 6-step rolling CE drops below floor after half-epoch warmup
+                min_warmup_steps = max(18, steps_per_epoch // 2)
+                if stage_idx >= 1 and st_step >= min_warmup_steps and len(recent_ce) == 6:
+                    avg_ce = sum(recent_ce) / 6.0
                     if avg_ce < loss_floor:
                         print(
-                            f"[Anti-Overfit Guard] 10-step mean ce_loss={avg_ce:.4f} < {loss_floor:.4f} at step {st_step}/{stage_steps}; "
+                            f"[Anti-Overfit Guard] 6-step mean ce_loss={avg_ce:.4f} < {loss_floor:.4f} at step {st_step}/{stage_steps}; "
                             f"graduating {stage_name} early to preserve generalization.",
                             flush=True,
                         )
