@@ -1627,21 +1627,14 @@ SPARK_X26_SYSTEM_PROMPTS: Dict[str, str] = {
         'Execution Protocol:\n'
         '1. Outline your scene architecture concisely in 4-6 bullet points inside <think>...</think> and close `</think>` immediately.\n'
         '2. Never reference local host paths (`C:\\Users\\...`) or external local files; use CDN scripts (`https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js`).\n'
-        '3. Immediately after `</think>`, emit the complete, self-contained, runnable `<!DOCTYPE html> ... </html>` document inside a ```html ... ``` block.'
+        '3. Keep `<style>` concise (under 15 lines: `body { margin: 0; overflow: hidden; }` and HUD controls; no decorative mouse-hover circles) and go straight into `<script>`.\n'
+        '4. Immediately after `</think>`, emit the complete, self-contained, runnable `<!DOCTYPE html> ... </html>` document inside a ```html ... ``` block.'
     ),
 }
 
 
-def set_loglinear_kv_runtime(
-    model: SparkXLoopV03,
-    enabled: bool = True,
-    exact_threshold: int = 2048,
-    sink_tokens: int = 8,
-    local_window: int = 1024,
-    base_block: int = 16,
-    hip_top_blocks: int = 8,
-):
-    """Toggle runtime O(n log n) Log-Linear KV Cache on a SparkXLoopV03 instance and hot-bind latest generate_cached."""
+def _hotbind_v03_runtime_methods(model: SparkXLoopV03) -> None:
+    """Hot-bind reloaded SparkXLoopV03 and ZipfianTieredMoEEngram methods onto an already-instantiated GPU model."""
     import importlib
     importlib.reload(_core_mod)
     model_cls = type(model)
@@ -1649,12 +1642,32 @@ def set_loglinear_kv_runtime(
     model_cls._forward_context = _core_mod.SparkXLoopV03._forward_context
     model_cls.forward_hidden = _core_mod.SparkXLoopV03.forward_hidden
     model_cls.forward_logits = _core_mod.SparkXLoopV03.forward_logits
+    for eng_mod in model.all_engram_modules():
+        eng_cls = type(eng_mod)
+        eng_cls._lookup_tier1_lexical = _core_mod.ZipfianTieredMoEEngram._lookup_tier1_lexical
+        eng_cls.forward = _core_mod.ZipfianTieredMoEEngram.forward
+        eng_mod.decode_engram_scale = 0.25
+        eng_mod._eval_tier1b_gpu = None
+
+
+def set_loglinear_kv_runtime(
+    model: SparkXLoopV03,
+    enabled: bool = True,
+    exact_threshold: int = 32768,
+    sink_tokens: int = 8,
+    local_window: int = 1024,
+    base_block: int = 16,
+    hip_top_blocks: int = 8,
+):
+    """Toggle runtime O(n log n) Log-Linear KV Cache on a SparkXLoopV03 instance and hot-bind latest generate_cached."""
+    _hotbind_v03_runtime_methods(model)
+    safe_exact_threshold = max(int(exact_threshold), 32768)
     attn_mod = __import__(type(model.base.model.layers[0].self_attn).__module__, fromlist=['*'])
     attn_mod._sparkx_sdpa_patched = False
     if enabled:
         _core_mod.patch_spark_attention_for_loglinear_kv(
             model.base,
-            exact_threshold=exact_threshold,
+            exact_threshold=safe_exact_threshold,
             sink_tokens=sink_tokens,
             local_window=local_window,
             base_block=base_block,
@@ -1702,9 +1715,8 @@ class SparkXAgenticWorkspace:
         max_turns: int = 3,
         max_new_tokens_per_turn: int = DEFAULT_MAX_NEW_TOKENS,
     ) -> Dict[str, Any]:
-        import importlib
-        importlib.reload(_core_mod)
-        type(self.model).generate_cached = _core_mod.SparkXLoopV03.generate_cached
+        _hotbind_v03_runtime_methods(self.model)
+        set_loglinear_kv_runtime(self.model, enabled=True, exact_threshold=32768)
         self.model.eval()
         device = next(self.model.base.parameters()).device
         messages = [
@@ -1731,12 +1743,12 @@ class SparkXAgenticWorkspace:
             out_ids = self.model.generate_cached(
                 prompt_ids,
                 max_new_tokens=turn_token_cap,
-                temperature=0.35,
-                top_p=0.92,
-                repetition_penalty=1.06,
+                temperature=0.32,
+                top_p=0.90,
+                repetition_penalty=1.05,
                 eos_token_id=self.tokenizer.eos_token_id,
                 tokenizer=self.tokenizer,
-                think_budget_tokens=384,
+                think_budget_tokens=320,
             )
             gen_ids = out_ids[0, prompt_ids.shape[1]:]
             reply = self.tokenizer.decode(gen_ids, skip_special_tokens=True)

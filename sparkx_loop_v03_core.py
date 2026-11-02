@@ -505,9 +505,7 @@ def _compress_nope_kv_loglinear(
 
     k_mid_f = k_mid.float()
     v_mid_f = v_mid.float()
-    block_mean_k = k_mid_f.mean(dim=3)
-    block_mean_norm = k_mid_f.norm(dim=-1, keepdim=True).mean(dim=3)
-    centroid_k = block_mean_k * (block_mean_norm / (block_mean_k.norm(dim=-1, keepdim=True) + 1e-6))
+    centroid_k = k_mid_f.mean(dim=3)
     centroid_v = v_mid_f.mean(dim=3)
 
     q_ref = query[:, :, -min(4, query.shape[2]):, :].float().mean(dim=2)
@@ -542,10 +540,7 @@ def _compress_nope_kv_loglinear(
             sum_k_list.append(centroid_k[:, :, i : i + 1, :].to(key.dtype))
             sum_v_list.append(centroid_v[:, :, i : i + 1, :].to(value.dtype))
         else:
-            sub_k = centroid_k[:, :, i : i + span, :]
-            sub_norm = sub_k.norm(dim=-1, keepdim=True).mean(dim=2, keepdim=True)
-            sub_mean = sub_k.mean(dim=2, keepdim=True)
-            merged_k = sub_mean * (sub_norm / (sub_mean.norm(dim=-1, keepdim=True) + 1e-6))
+            merged_k = centroid_k[:, :, i : i + span, :].mean(dim=2, keepdim=True)
             merged_v = centroid_v[:, :, i : i + span, :].mean(dim=2, keepdim=True)
             sum_k_list.append(merged_k.to(key.dtype))
             sum_v_list.append(merged_v.to(value.dtype))
@@ -573,9 +568,9 @@ def _compress_nope_kv_loglinear(
 
 def patch_spark_attention_for_loglinear_kv(
     base_model: nn.Module,
-    exact_threshold: int = 2048,
+    exact_threshold: int = 32768,
     sink_tokens: int = 32,
-    local_window: int = 1024,
+    local_window: int = 2048,
     base_block: int = 32,
     hip_top_blocks: int = 8,
     recent_window: Optional[int] = None,
@@ -902,17 +897,27 @@ class ZipfianTieredMoEEngram(nn.Module):
         c_skip = (skip - hot_b).clamp(min=0, max=cold_b - 1) + 2 * cold_b
 
         if self.offload_tier1b_cpu and self.tier1b_cold_weight is not None:
-            stacked = torch.stack([c_bi, c_tri, c_skip], dim=0)
-            uniq_gpu, inv = torch.unique(stacked, return_inverse=True)
-            uniq_cpu = uniq_gpu.cpu()
-            fetched_cpu = self.tier1b_cold_weight[uniq_cpu]
-            fetched_gpu = fetched_cpu.to(device=device, dtype=param_dtype, non_blocking=True)
-            if self.training:
-                fetched_gpu = fetched_gpu.detach().requires_grad_(True)
-                self._pending_tier1b_rows = uniq_cpu
-                self._pending_tier1b_leaf = fetched_gpu
-            gathered = fetched_gpu[inv]
-            c_e_bi, c_e_tri, c_e_skip = gathered[0], gathered[1], gathered[2]
+            if not self.training and device.type == 'cuda':
+                eval_gpu = getattr(self, '_eval_tier1b_gpu', None)
+                if eval_gpu is None or eval_gpu.device != device or eval_gpu.dtype != param_dtype:
+                    eval_gpu = self.tier1b_cold_weight.to(device=device, dtype=param_dtype, non_blocking=True)
+                    self._eval_tier1b_gpu = eval_gpu
+                c_e_bi = eval_gpu[c_bi]
+                c_e_tri = eval_gpu[c_tri]
+                c_e_skip = eval_gpu[c_skip]
+            else:
+                self._eval_tier1b_gpu = None
+                stacked = torch.stack([c_bi, c_tri, c_skip], dim=0)
+                uniq_gpu, inv = torch.unique(stacked, return_inverse=True)
+                uniq_cpu = uniq_gpu.cpu()
+                fetched_cpu = self.tier1b_cold_weight[uniq_cpu]
+                fetched_gpu = fetched_cpu.to(device=device, dtype=param_dtype, non_blocking=True)
+                if self.training:
+                    fetched_gpu = fetched_gpu.detach().requires_grad_(True)
+                    self._pending_tier1b_rows = uniq_cpu
+                    self._pending_tier1b_leaf = fetched_gpu
+                gathered = fetched_gpu[inv]
+                c_e_bi, c_e_tri, c_e_skip = gathered[0], gathered[1], gathered[2]
         else:
             c_e_bi = self.tier1b_cold(c_bi)
             c_e_tri = self.tier1b_cold(c_tri)
@@ -1077,6 +1082,8 @@ class ZipfianTieredMoEEngram(nn.Module):
 
         projected = self.project(combined)
         gate = torch.sigmoid(self.gain).to(dtype)
+        if not self.training and input_ids.shape[1] == 1:
+            gate = gate * float(getattr(self, 'decode_engram_scale', 0.25))
         return projected.to(dtype) * gate
 
 
@@ -1742,8 +1749,9 @@ class SparkXLoopV03(nn.Module):
                     win = gen_list[-384:]
                     rep_p, freq_p, pres_p, n_gram = repetition_penalty, 0.22, 0.12, no_repeat_ngram_size
                 else:
-                    win = gen_list[-128:]
-                    rep_p, freq_p, pres_p, n_gram = 1.01, 0.0, 0.0, max(28, no_repeat_ngram_size)
+                    win = gen_list[-192:]
+                    rep_p = max(1.04, min(1.07, float(repetition_penalty)))
+                    freq_p, pres_p, n_gram = 0.03, 0.0, 0
                 counts: dict[int, int] = {}
                 for tid in win:
                     counts[tid] = counts.get(tid, 0) + 1
@@ -1779,6 +1787,9 @@ class SparkXLoopV03(nn.Module):
             return torch.multinomial(probs, num_samples=1).unsqueeze(0)
 
         in_think = True
+        in_style = False
+        style_closed = False
+        style_start_idx = 0
         gen_list: list[int] = []
         t0 = time.time()
         try:
@@ -1816,21 +1827,56 @@ class SparkXLoopV03(nn.Module):
                 prev_tok = out[:, -2:]
                 if tokenizer is not None and len(gen_list) % 8 == 0:
                     tail_txt = tokenizer.decode(gen_list[-32:], skip_special_tokens=False)
+                    tail_low = tail_txt.lower()
                     if in_think and '</think>' in tail_txt:
                         in_think = False
-                    elif not in_think and '</html>' in tail_txt.lower():
-                        full_tail = tokenizer.decode(gen_list[-64:], skip_special_tokens=False).lower()
-                        after_html = full_tail.split('</html>', 1)[-1]
-                        if '```' in after_html or len(after_html.strip()) >= 3:
-                            if stream_print:
-                                dt = max(1e-3, time.time() - t0)
-                                print(f"  [72L Gen Complete] Emitted closing </html> at {len(gen_list)} tokens ({len(gen_list)/dt:.1f} tok/s).", flush=True)
-                            break
+                    elif not in_think:
+                        if not in_style and not style_closed and '<style' in tail_low and '</style>' not in tail_low:
+                            in_style = True
+                            style_start_idx = len(gen_list)
+                        elif in_style and '</style>' in tail_low:
+                            in_style = False
+                            style_closed = True
+                        elif '</html>' in tail_low:
+                            full_tail = tokenizer.decode(gen_list[-64:], skip_special_tokens=False).lower()
+                            after_html = full_tail.split('</html>', 1)[-1]
+                            if '```' in after_html or len(after_html.strip()) >= 3:
+                                if stream_print:
+                                    dt = max(1e-3, time.time() - t0)
+                                    print(f"  [72L Gen Complete] Emitted closing </html> at {len(gen_list)} tokens ({len(gen_list)/dt:.1f} tok/s).", flush=True)
+                                break
 
                 next_id = _sample_step(logits, gen_list, in_think)
                 tok_int = int(next_id.item())
                 gen_list.append(tok_int)
                 out = torch.cat((out, next_id), dim=-1)
+
+                # Guard against runaway decorative CSS loops inside <style>: transition cleanly after closing brace '}'
+                if in_style and not style_closed and tokenizer is not None:
+                    style_len = len(gen_list) - style_start_idx
+                    if style_len >= 180:
+                        tok_str = tokenizer.decode([tok_int], skip_special_tokens=False)
+                        if '}' in tok_str or style_len >= 230:
+                            prefix_close = '\n' if '}' in tok_str else ' }\n'
+                            style_bridge = (
+                                prefix_close
+                                + '</style>\n</head>\n<body>\n'
+                                + '<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>\n'
+                                + '<script>\n'
+                            )
+                            s_ids = tokenizer.encode(style_bridge, add_special_tokens=False)
+                            if s_ids:
+                                in_style = False
+                                style_closed = True
+                                for b_id in s_ids:
+                                    b_tensor = torch.tensor([[int(b_id)]], dtype=torch.long, device=out.device)
+                                    logits = self.forward_logits(next_id, past_key_values=cache, prev_ids=prev_tok)
+                                    prev_tok = out[:, -2:]
+                                    gen_list.append(int(b_id))
+                                    out = torch.cat((out, b_tensor), dim=-1)
+                                    next_id = b_tensor
+                                if stream_print:
+                                    print(f"  [72L Style Guard] Closed <style> at {style_len} CSS tokens -> transitioned directly to Three.js <script>.", flush=True)
 
                 if stream_print and tokenizer is not None and len(gen_list) % 128 == 0:
                     dt = max(1e-3, time.time() - t0)
