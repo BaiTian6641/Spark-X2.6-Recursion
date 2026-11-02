@@ -1116,7 +1116,12 @@ def export_final_v03_to_hub(
     return out_dir
 
 
-def _build_stage_optimizer(model: SparkXLoopV03, cfg: Dict[str, Any], lr_scale: float = 1.0):
+def _build_stage_optimizer(
+    model: SparkXLoopV03,
+    cfg: Dict[str, Any],
+    lr_scale: float = 1.0,
+    backbone_lr_mult: float = 1.0,
+):
     try:
         import bitsandbytes as bnb
         opt_cls = bnb.optim.AdamW8bit
@@ -1138,7 +1143,11 @@ def _build_stage_optimizer(model: SparkXLoopV03, cfg: Dict[str, Any], lr_scale: 
 
     groups = []
     if bb_params:
-        groups.append({'params': bb_params, 'lr': cfg['LR_BACKBONE'] * lr_scale, 'weight_decay': cfg['WEIGHT_DECAY']})
+        groups.append({
+            'params': bb_params,
+            'lr': cfg['LR_BACKBONE'] * lr_scale * backbone_lr_mult,
+            'weight_decay': cfg['WEIGHT_DECAY'],
+        })
     if mhc_params:
         groups.append({'params': mhc_params, 'lr': cfg['LR_MHC'] * lr_scale, 'weight_decay': 0.0})
     if eng_params:
@@ -1149,6 +1158,20 @@ def _build_stage_optimizer(model: SparkXLoopV03, cfg: Dict[str, Any], lr_scale: 
     return opt_cls(groups, betas=(0.9, 0.95), eps=1e-8)
 
 
+def _build_stage_cosine_scheduler(optimizer: Any, total_steps: int, warmup_ratio: float = 0.08, min_lr_ratio: float = 0.15):
+    warmup_steps = max(2, int(round(total_steps * warmup_ratio)))
+
+    def _lr_lambda(current_step: int) -> float:
+        if current_step < warmup_steps:
+            return float(current_step + 1) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        progress = min(1.0, max(0.0, progress))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+
+
 def run_v03_four_stage_training(
     model: SparkXLoopV03,
     tokenizer: Any,
@@ -1156,7 +1179,7 @@ def run_v03_four_stage_training(
     cfg: Dict[str, Any],
     hf_token: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Execute the 4-stage progressive sequence length & depth training loop with 22.5h budget & emergency recovery."""
+    """Execute the 4-stage progressive sequence length & depth training loop with anti-overfitting & emergency recovery."""
     import importlib
     importlib.reload(_core_mod)
     # Hot-bind latest checkpoint-safe SparkXLoopV03 & ZipfianTieredMoEEngram methods onto already-instantiated modules in VRAM
@@ -1174,38 +1197,82 @@ def run_v03_four_stage_training(
     model.zero_grad(set_to_none=True)
 
     device = next(model.base.parameters()).device
+    vram_total_gb = (
+        torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
+        if torch.cuda.is_available() else 0.0
+    )
     start_wall = time.time()
     max_seconds = float(cfg.get('MAX_RUN_HOURS', 22.5)) * 3600.0
     grad_accum = int(cfg.get('GRAD_ACCUM', 8))
     save_every = int(cfg.get('SAVE_EVERY_STEPS', 250))
     log_every = int(cfg.get('LOG_EVERY_STEPS', 5))
+    max_unfrozen_epochs = float(cfg.get('MAX_UNFROZEN_EPOCHS_PER_STAGE', 2.4))
+    loss_floor = float(cfg.get('STAGE_CE_LOSS_FLOOR', 0.165))
     ckpt_root = Path(cfg.get('CHECKPOINT_DIR', '/content/checkpoints_v03_en4b_a1b'))
 
     global_step = 0
     history: List[Dict[str, Any]] = []
     budget_reached = False
 
+    # Discover all existing local checkpoints so interrupted mid-stage runs can graduate cleanly without re-running
+    existing_ckpts = sorted(ckpt_root.glob('step_*')) if ckpt_root.exists() else []
+
     try:
-        for stage_cfg in cfg['STAGES']:
+        for stage_idx, stage_cfg in enumerate(cfg['STAGES']):
             if budget_reached:
                 break
             stage_name = stage_cfg['name']
             seq_len = int(stage_cfg['seq_len'])
-            stage_steps = int(stage_cfg['steps'])
+            raw_stage_steps = int(stage_cfg['steps'])
             freeze_bb = bool(stage_cfg.get('freeze_backbone', False))
+            pool = stage_pools.get(seq_len) or next(iter(stage_pools.values()))
+
+            # Epoch-aware anti-overfitting step cap for unfrozen backbone stages
+            steps_per_epoch = max(1, len(pool) // grad_accum)
+            if not freeze_bb:
+                capped_steps = max(80, int(round(max_unfrozen_epochs * steps_per_epoch)))
+                stage_steps = min(raw_stage_steps, capped_steps)
+            else:
+                stage_steps = raw_stage_steps
 
             expected_end_step = global_step + stage_steps
-            stage_ckpt_dir = ckpt_root / f"step_{expected_end_step:05d}_{stage_name}"
-            if stage_ckpt_dir.exists() and (stage_ckpt_dir / 'loop_v03_state.pt').exists():
-                print(
-                    f"\n[Auto-Resume] Found completed stage checkpoint {stage_ckpt_dir.name}; "
-                    f"restoring loop state and advancing global_step -> {expected_end_step}.",
-                    flush=True,
-                )
-                state_obj = torch.load(str(stage_ckpt_dir / 'loop_v03_state.pt'), map_location='cpu')
-                _core_mod.load_loop_v03_state_dict(model, state_obj, strict=False)
-                global_step = expected_end_step
-                continue
+            raw_expected_end_step = global_step + raw_stage_steps
+            stage_ckpt_candidates = [
+                ckpt_root / f"step_{expected_end_step:05d}_{stage_name}",
+                ckpt_root / f"step_{raw_expected_end_step:05d}_{stage_name}",
+            ] + [
+                d for d in existing_ckpts
+                if d.is_dir() and d.name.endswith(f"_{stage_name}") and (d / 'loop_v03_state.pt').exists()
+            ]
+            # Also allow an EMERGENCY_RECOVERY checkpoint taken after >= 140 steps into Stage 2 to graduate Stage 2
+            if stage_idx == 1:
+                for d in reversed(existing_ckpts):
+                    if d.is_dir() and 'EMERGENCY_RECOVERY' in d.name and (d / 'loop_v03_state.pt').exists():
+                        try:
+                            st_num = int(d.name.split('_')[1])
+                            if st_num >= 340:
+                                stage_ckpt_candidates.insert(0, d)
+                                break
+                        except Exception:
+                            pass
+
+            matched_ckpt = next((d for d in stage_ckpt_candidates if d.exists() and (d / 'loop_v03_state.pt').exists()), None)
+            if matched_ckpt is not None:
+                try:
+                    ckpt_step = int(matched_ckpt.name.split('_')[1])
+                except Exception:
+                    ckpt_step = expected_end_step
+                # Only auto-skip if the checkpoint represents >= 1.8 epochs (or full stage completion)
+                if ckpt_step >= global_step + min(stage_steps, max(50, int(1.8 * steps_per_epoch))):
+                    print(
+                        f"\n[Auto-Resume] Found converged checkpoint {matched_ckpt.name} for {stage_name}; "
+                        f"restoring loop state and advancing global_step -> {ckpt_step}.",
+                        flush=True,
+                    )
+                    state_obj = torch.load(str(matched_ckpt / 'loop_v03_state.pt'), map_location='cpu')
+                    _core_mod.load_loop_v03_state_dict(model, state_obj, strict=False)
+                    global_step = ckpt_step
+                    continue
 
             if stage_cfg.get('upcycle_8_to_32', False):
                 print(f"\n[{stage_name}] Executing Coarse-to-Fine Expert Upcycling (8 -> 32 experts, top_k=7)...", flush=True)
@@ -1222,6 +1289,10 @@ def run_v03_four_stage_training(
                 p3_end=int(stage_cfg.get('p3_end', 24)),
             )
 
+            # Automatically enable pinned-RAM checkpoint streaming at 16K on <=85GB GPUs to prevent 60L/72L OOM
+            if seq_len >= 16384 and 0.0 < vram_total_gb <= 85.0:
+                model.offload_checkpoint_to_cpu = True
+
             for p in model.base.parameters():
                 p.requires_grad = (not freeze_bb)
             for p in model.controllers.parameters():
@@ -1230,9 +1301,16 @@ def run_v03_four_stage_training(
                 for p in mod.parameters():
                     p.requires_grad = True
 
+            # Preserve pretrained & Stage-2 backbone fluency during Stage 3 (Upcycle32) & Stage 4 (72L Telescoping)
+            bb_lr_mult = 0.20 if (stage_idx >= 2 and not freeze_bb) else 1.0
+
             model.train()
-            optimizer = _build_stage_optimizer(model, cfg, lr_scale=float(stage_cfg.get('lr_scale', 1.0)))
-            pool = stage_pools.get(seq_len) or next(iter(stage_pools.values()))
+            optimizer = _build_stage_optimizer(
+                model, cfg,
+                lr_scale=float(stage_cfg.get('lr_scale', 1.0)),
+                backbone_lr_mult=bb_lr_mult,
+            )
+            scheduler = _build_stage_cosine_scheduler(optimizer, total_steps=stage_steps)
 
             trainable_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
             frozen_p = sum(p.numel() for p in model.parameters() if not p.requires_grad)
@@ -1243,19 +1321,26 @@ def run_v03_four_stage_training(
                 spans.append(f"pass3[{model.p3_start}..{model.p3_end})")
             spans.append(f"coda[{model.loop_end}..{model.n_layers})")
             plan_summary = ' -> '.join(spans)
+            est_epochs = (stage_steps * grad_accum) / float(max(1, len(pool)))
 
             print('\n' + '=' * 108)
             print(
                 f"Starting {stage_name} | Virtual Layers: {model.total_virtual_layers}L ({plan_summary})\n"
                 f"  SeqLen: {seq_len} | GradAccum: {grad_accum} ({seq_len * grad_accum:,} tok/step) | "
-                f"Steps: {stage_steps} | Pool Sequences: {len(pool)}\n"
-                f"  Backbone Frozen: {freeze_bb} | Trainable Params: {trainable_p / 1e9:.2f}B (Frozen: {frozen_p / 1e9:.2f}B) | "
-                f"Active Experts: {model.engram.active_experts} (Top-{model.engram.active_top_k})"
+                f"Steps: {stage_steps} (~{est_epochs:.2f} epochs over {len(pool)} seqs)\n"
+                f"  Backbone Frozen: {freeze_bb} (BB_LR_Mult={bb_lr_mult:.2f}) | "
+                f"Trainable Params: {trainable_p / 1e9:.2f}B (Frozen: {frozen_p / 1e9:.2f}B) | "
+                f"Active Experts: {model.engram.active_experts} (Top-{model.engram.active_top_k}) | "
+                f"CPU_Ckpt_Stream: {model.offload_checkpoint_to_cpu}"
             )
             print('=' * 108, flush=True)
 
             optimizer.zero_grad(set_to_none=True)
             pool_idx = 0
+            epoch_order = list(range(len(pool)))
+            rng = random.Random(int(cfg.get('SEED', 42)) + stage_idx * 1000)
+            rng.shuffle(epoch_order)
+            recent_ce: List[float] = []
             stage_t0 = time.time()
 
             for st_step in range(1, stage_steps + 1):
@@ -1266,7 +1351,9 @@ def run_v03_four_stage_training(
                 step_sup_tokens = 0
 
                 for _ in range(grad_accum):
-                    sample = pool[pool_idx % len(pool)]
+                    if pool_idx > 0 and (pool_idx % len(pool) == 0):
+                        rng.shuffle(epoch_order)
+                    sample = pool[epoch_order[pool_idx % len(pool)]]
                     pool_idx += 1
                     input_ids = sample['input_ids'].unsqueeze(0).to(device, non_blocking=True)
                     labels = sample['labels'].unsqueeze(0).to(device, non_blocking=True)
@@ -1284,9 +1371,14 @@ def run_v03_four_stage_training(
                     accum_z += (float(z_val.detach().item()) if isinstance(z_val, torch.Tensor) else float(z_val)) / float(grad_accum)
 
                 grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg['MAX_GRAD_NORM'])).item())
+                init_lr0 = float(optimizer.param_groups[0].get('initial_lr', optimizer.param_groups[0]['lr']))
+                lr_mult_now = float(scheduler.get_last_lr()[0]) / max(1e-12, init_lr0)
                 if math.isfinite(grad_norm):
                     optimizer.step()
-                    model.step_all_tier1b_sparse_adam(lr=float(cfg['LR_TIER1B_SPARSE']) * float(stage_cfg.get('lr_scale', 1.0)))
+                    model.step_all_tier1b_sparse_adam(
+                        lr=float(cfg['LR_TIER1B_SPARSE']) * float(stage_cfg.get('lr_scale', 1.0)) * lr_mult_now
+                    )
+                scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
                 global_step += 1
@@ -1298,9 +1390,12 @@ def run_v03_four_stage_training(
 
                 vram_alloc = torch.cuda.memory_allocated(device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
                 vram_peak = torch.cuda.max_memory_allocated(device) / (1024 ** 3) if torch.cuda.is_available() else 0.0
-                ctrl_sample = next(iter(model.controllers.values()))
-                gain_param = getattr(ctrl_sample, 'extra_gain', getattr(ctrl_sample, 'attn_extra_gain', None))
-                mhc_gain = float(torch.tanh(gain_param.detach().float()).abs().mean().item()) if gain_param is not None else 0.0
+                active_gains = []
+                for l_idx in range(model.loop_start, model.loop_end):
+                    c_mod = model.controllers[str(l_idx)]
+                    g_p = c_mod.p3_extra_gain if model.enable_p3 else c_mod.extra_gain
+                    active_gains.append(float(torch.tanh(g_p.detach().float()).abs().item()))
+                mhc_gain = sum(active_gains) / float(max(1, len(active_gains)))
 
                 metrics = {
                     'stage': stage_name,
@@ -1317,6 +1412,9 @@ def run_v03_four_stage_training(
                     'elapsed_hours': round(elapsed_h, 3),
                 }
                 history.append(metrics)
+                recent_ce.append(accum_ce)
+                if len(recent_ce) > 10:
+                    recent_ce.pop(0)
 
                 if st_step <= 3 or st_step % log_every == 0 or st_step == stage_steps:
                     print(
@@ -1334,6 +1432,17 @@ def run_v03_four_stage_training(
                         model, tokenizer, cfg, stage_name, global_step, metrics,
                         hf_token=hf_token, push_backbone=False,
                     )
+
+                # Anti-overfitting early stage graduation if 10-step rolling CE drops below floor after warmup
+                if (not freeze_bb) and st_step >= max(45, steps_per_epoch) and len(recent_ce) == 10:
+                    avg_ce = sum(recent_ce) / 10.0
+                    if avg_ce < loss_floor:
+                        print(
+                            f"[Anti-Overfit Guard] 10-step mean ce_loss={avg_ce:.4f} < {loss_floor:.4f} at step {st_step}/{stage_steps}; "
+                            f"graduating {stage_name} early to preserve generalization.",
+                            flush=True,
+                        )
+                        break
 
                 if (time.time() - start_wall) >= max_seconds:
                     print(f"[Wall-Clock Guard] Reached {cfg['MAX_RUN_HOURS']}h limit at step {global_step}. Stopping cleanly.", flush=True)
