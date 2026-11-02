@@ -870,6 +870,14 @@ def tokenize_and_mask_record_16k(
     try:
         prompt_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
         full_ids = tokenizer.apply_chat_template(full_messages, tokenize=True, add_generation_prompt=False)
+        if hasattr(prompt_ids, 'input_ids'):
+            prompt_ids = prompt_ids.input_ids
+        elif isinstance(prompt_ids, dict) and 'input_ids' in prompt_ids:
+            prompt_ids = prompt_ids['input_ids']
+        if hasattr(full_ids, 'input_ids'):
+            full_ids = full_ids.input_ids
+        elif isinstance(full_ids, dict) and 'input_ids' in full_ids:
+            full_ids = full_ids['input_ids']
     except Exception:
         prompt_str = f"<|im_start|>system\n{sys_text}<|im_end|>\n<|im_start|>user\n{rec['user']}<|im_end|>\n<|im_start|>assistant\n"
         full_str = prompt_str + assistant_body + "<|im_end|>\n"
@@ -2327,9 +2335,14 @@ class SparkXAgenticWorkspace:
             },
         ]
         try:
-            prompt_ids = self.tokenizer.apply_chat_template(
+            _enc = self.tokenizer.apply_chat_template(
                 ood_messages, tokenize=True, add_generation_prompt=True, return_tensors='pt'
-            ).to(device)
+            )
+            if hasattr(_enc, 'input_ids'):
+                _enc = _enc.input_ids
+            elif isinstance(_enc, dict) and 'input_ids' in _enc:
+                _enc = _enc['input_ids']
+            prompt_ids = _enc.to(device)
         except Exception:
             raw_p = (
                 f"<|im_start|>system\n{ood_messages[0]['content']}<|im_end|>\n"
@@ -2458,9 +2471,14 @@ class SparkXAgenticWorkspace:
             print(f"[UNCLAMPED OOD WEBGL EVALUATION TURN {turn}/{max_turns}] Token Cap: {turn_token_cap} | Mode: {audit_summary['best_mode']}")
             print('=' * 104, flush=True)
             try:
-                prompt_ids = self.tokenizer.apply_chat_template(
+                _enc = self.tokenizer.apply_chat_template(
                     messages, tokenize=True, add_generation_prompt=True, return_tensors='pt'
-                ).to(device)
+                )
+                if hasattr(_enc, 'input_ids'):
+                    _enc = _enc.input_ids
+                elif isinstance(_enc, dict) and 'input_ids' in _enc:
+                    _enc = _enc['input_ids']
+                prompt_ids = _enc.to(device)
             except Exception:
                 raw_prompt = (
                     f"<|im_start|>system\n{messages[0]['content']}<|im_end|>\n"

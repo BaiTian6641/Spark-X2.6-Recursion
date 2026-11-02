@@ -47,6 +47,24 @@ def _patch_transformers_v5_tied_weights() -> None:
         PreTrainedModel.get_expanded_tied_weights_keys = _safe_get_expanded_tied_weights_keys
         PreTrainedModel._sparkx_tied_patched = True
 
+    try:
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+        _orig_act = getattr(PreTrainedTokenizerBase, 'apply_chat_template', None)
+        if callable(_orig_act) and not getattr(_orig_act, '_sparkx_v5_patched', False):
+            def _patched_apply_chat_template(self, *args, **kwargs):
+                want_dict = bool(kwargs.get('return_dict', False))
+                res = _orig_act(self, *args, **kwargs)
+                if not want_dict:
+                    if hasattr(res, 'input_ids'):
+                        return res.input_ids
+                    if isinstance(res, dict) and 'input_ids' in res:
+                        return res['input_ids']
+                return res
+            _patched_apply_chat_template._sparkx_v5_patched = True
+            PreTrainedTokenizerBase.apply_chat_template = _patched_apply_chat_template
+    except Exception:
+        pass
+
 
 def load_sparkx_loop_v03(
     repo_or_dir: str = 'TassP0lar/Spark-X2.6-4B-En4B-A1B',

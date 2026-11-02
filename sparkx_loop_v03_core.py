@@ -344,7 +344,35 @@ def patch_spark_for_unsloth_triton(base_model: nn.Module) -> dict[str, bool]:
                 _wrapped._sparkx_v5_patched = True
                 return _wrapped
             setattr(attn_mod, _mask_fn_name, _make_mask_wrapper(_orig_mask_fn))
+
+    # 4. Patch PreTrainedTokenizerBase.apply_chat_template for Transformers 5.x (where return_dict=True became default)
+    try:
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+        _orig_act = getattr(PreTrainedTokenizerBase, 'apply_chat_template', None)
+        if callable(_orig_act) and not getattr(_orig_act, '_sparkx_v5_patched', False):
+            def _patched_apply_chat_template(self, *args, **kwargs):
+                want_dict = bool(kwargs.get('return_dict', False))
+                res = _orig_act(self, *args, **kwargs)
+                if not want_dict:
+                    if hasattr(res, 'input_ids'):
+                        return res.input_ids
+                    if isinstance(res, dict) and 'input_ids' in res:
+                        return res['input_ids']
+                return res
+            _patched_apply_chat_template._sparkx_v5_patched = True
+            PreTrainedTokenizerBase.apply_chat_template = _patched_apply_chat_template
+    except Exception:
+        pass
     return status
+
+
+def _unwrap_input_ids(x: Any) -> Any:
+    """Unwrap Transformers 5.x BatchEncoding or dict into a raw input_ids Tensor/list."""
+    if hasattr(x, 'input_ids'):
+        return x.input_ids
+    if isinstance(x, dict) and 'input_ids' in x:
+        return x['input_ids']
+    return x
 
 
 def _dispatch_spark_sdpa(
@@ -1658,6 +1686,7 @@ class SparkXLoopV03(nn.Module):
     def forward_hidden(self, input_ids: torch.LongTensor, attention_mask=None,
                        past_key_values=None, cache_position=None,
                        prev_ids: Optional[torch.LongTensor] = None) -> torch.Tensor:
+        input_ids = _unwrap_input_ids(input_ids)
         if input_ids.ndim != 2:
             raise ValueError('Expected input_ids shape [batch, sequence]')
         for mod in self.all_engram_modules():
@@ -1786,6 +1815,7 @@ class SparkXLoopV03(nn.Module):
     def forward_logits(self, input_ids: torch.LongTensor, attention_mask=None,
                        past_key_values=None, cache_position=None,
                        prev_ids: Optional[torch.LongTensor] = None):
+        input_ids = _unwrap_input_ids(input_ids)
         h = self.forward_hidden(
             input_ids, attention_mask=attention_mask,
             past_key_values=past_key_values, cache_position=cache_position,
@@ -1796,6 +1826,7 @@ class SparkXLoopV03(nn.Module):
         return self.base.lm_head(h)
 
     def forward(self, input_ids, labels=None, attention_mask=None, return_logits: bool = False):
+        input_ids = _unwrap_input_ids(input_ids)
         if labels is None:
             logits = self.forward_logits(input_ids, attention_mask)
             return {'logits': logits}
@@ -1831,6 +1862,7 @@ class SparkXLoopV03(nn.Module):
     ):
         """Pure, un-distorted 72-visit BF16 KV-cached looped generation."""
         from transformers.cache_utils import DynamicCache
+        input_ids = _unwrap_input_ids(input_ids)
         prev_train = self.training
         self.eval()
         try:
