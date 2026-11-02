@@ -1685,7 +1685,7 @@ class SparkXLoopV03(nn.Module):
     def generate_cached(
         self,
         input_ids: torch.LongTensor,
-        max_new_tokens: int = 256,
+        max_new_tokens: int = 4096,
         eos_token_id: Optional[int] = None,
         temperature: float = 0.6,
         top_p: float = 0.92,
@@ -1694,8 +1694,11 @@ class SparkXLoopV03(nn.Module):
         no_repeat_ngram_size: int = 10,
         do_sample: bool = True,
         tokenizer=None,
+        think_budget_tokens: Optional[int] = 384,
+        stream_print: bool = True,
+        **kwargs,
     ):
-        """Fast 72-visit BF16 KV-cached looped generation with phase-aware <think> vs code penalties."""
+        """Fast 72-visit BF16 KV-cached looped generation with phase-aware <think> budget & HTML completion detection."""
         from transformers.cache_utils import DynamicCache
         prev_train = self.training
         self.eval()
@@ -1704,10 +1707,21 @@ class SparkXLoopV03(nn.Module):
         except TypeError:
             cache = DynamicCache()
         out = input_ids
-        prompt_len = int(input_ids.shape[1])
 
+        stop_ids = set()
+        if eos_token_id is not None:
+            stop_ids.add(int(eos_token_id))
         think_Ids_mask = set()
         if tokenizer is not None:
+            if getattr(tokenizer, 'eos_token_id', None) is not None:
+                stop_ids.add(int(tokenizer.eos_token_id))
+            for stop_str in ('<|im_end|>', '<|endoftext|>', '<|eot_id|>'):
+                try:
+                    s_ids = tokenizer.encode(stop_str, add_special_tokens=False)
+                    if len(s_ids) == 1:
+                        stop_ids.add(int(s_ids[0]))
+                except Exception:
+                    pass
             for t_str in ('<think>', '</think>', '<think>\n', '\n</think>'):
                 try:
                     t_ids = tokenizer.encode(t_str, add_special_tokens=False)
@@ -1765,6 +1779,7 @@ class SparkXLoopV03(nn.Module):
 
         in_think = True
         gen_list: list[int] = []
+        t0 = time.time()
         try:
             logits = self.forward_logits(out, past_key_values=cache)
             next_id = _sample_step(logits, gen_list, in_think)
@@ -1772,20 +1787,60 @@ class SparkXLoopV03(nn.Module):
             gen_list.append(tok_int)
             prev_tok = out[:, -2:]
             out = torch.cat((out, next_id), dim=-1)
-            if eos_token_id is not None and tok_int == eos_token_id:
+            if tok_int in stop_ids:
                 return out
-            for _ in range(max_new_tokens - 1):
+            for step_i in range(1, max_new_tokens):
+                # Enforce think_budget_tokens transition if still inside <think> at budget limit
+                if (
+                    in_think
+                    and think_budget_tokens is not None
+                    and int(think_budget_tokens) > 0
+                    and len(gen_list) == int(think_budget_tokens)
+                    and tokenizer is not None
+                ):
+                    bridge_ids = tokenizer.encode('\n</think>\n```html\n<!DOCTYPE html>\n', add_special_tokens=False)
+                    if bridge_ids:
+                        in_think = False
+                        for b_id in bridge_ids:
+                            b_tensor = torch.tensor([[int(b_id)]], dtype=torch.long, device=out.device)
+                            logits = self.forward_logits(next_id, past_key_values=cache, prev_ids=prev_tok)
+                            prev_tok = out[:, -2:]
+                            gen_list.append(int(b_id))
+                            out = torch.cat((out, b_tensor), dim=-1)
+                            next_id = b_tensor
+                        if stream_print:
+                            print(f"  [72L Think Budget] Reached {think_budget_tokens} tokens -> closed </think> and entered HTML/WebGL synthesis.", flush=True)
+
                 logits = self.forward_logits(next_id, past_key_values=cache, prev_ids=prev_tok)
                 prev_tok = out[:, -2:]
-                if in_think and tokenizer is not None and len(gen_list) % 8 == 0:
-                    tail_txt = tokenizer.decode(gen_list[-24:], skip_special_tokens=False)
-                    if '</think>' in tail_txt:
+                if tokenizer is not None and len(gen_list) % 8 == 0:
+                    tail_txt = tokenizer.decode(gen_list[-32:], skip_special_tokens=False)
+                    if in_think and '</think>' in tail_txt:
                         in_think = False
+                    elif not in_think and '</html>' in tail_txt.lower():
+                        full_tail = tokenizer.decode(gen_list[-64:], skip_special_tokens=False).lower()
+                        after_html = full_tail.split('</html>', 1)[-1]
+                        if '```' in after_html or len(after_html.strip()) >= 3:
+                            if stream_print:
+                                dt = max(1e-3, time.time() - t0)
+                                print(f"  [72L Gen Complete] Emitted closing </html> at {len(gen_list)} tokens ({len(gen_list)/dt:.1f} tok/s).", flush=True)
+                            break
+
                 next_id = _sample_step(logits, gen_list, in_think)
                 tok_int = int(next_id.item())
                 gen_list.append(tok_int)
                 out = torch.cat((out, next_id), dim=-1)
-                if eos_token_id is not None and tok_int == eos_token_id:
+
+                if stream_print and tokenizer is not None and len(gen_list) % 128 == 0:
+                    dt = max(1e-3, time.time() - t0)
+                    snippet = tokenizer.decode(gen_list[-20:], skip_special_tokens=True).replace('\n', ' ')
+                    phase = 'think' if in_think else 'code'
+                    print(f"  [72L Gen | {len(gen_list):4d} tok | {len(gen_list)/dt:5.1f} tok/s | phase={phase}] ...{snippet[-64:]}", flush=True)
+
+                if tok_int in stop_ids:
+                    if stream_print:
+                        dt = max(1e-3, time.time() - t0)
+                        print(f"  [72L Gen Complete] Hit stop token at {len(gen_list)} tokens ({len(gen_list)/dt:.1f} tok/s).", flush=True)
                     break
         finally:
             self.train(prev_train)

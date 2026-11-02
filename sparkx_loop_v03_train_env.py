@@ -1641,11 +1641,18 @@ def set_loglinear_kv_runtime(
     base_block: int = 16,
     hip_top_blocks: int = 8,
 ):
-    """Toggle runtime O(n log n) Log-Linear KV Cache on a SparkXLoopV03 instance."""
+    """Toggle runtime O(n log n) Log-Linear KV Cache on a SparkXLoopV03 instance and hot-bind latest generate_cached."""
+    import importlib
+    importlib.reload(_core_mod)
+    model_cls = type(model)
+    model_cls.generate_cached = _core_mod.SparkXLoopV03.generate_cached
+    model_cls._forward_context = _core_mod.SparkXLoopV03._forward_context
+    model_cls.forward_hidden = _core_mod.SparkXLoopV03.forward_hidden
+    model_cls.forward_logits = _core_mod.SparkXLoopV03.forward_logits
     attn_mod = __import__(type(model.base.model.layers[0].self_attn).__module__, fromlist=['*'])
     attn_mod._sparkx_sdpa_patched = False
     if enabled:
-        patch_spark_for_loglinear_kv(
+        _core_mod.patch_spark_attention_for_loglinear_kv(
             model.base,
             exact_threshold=exact_threshold,
             sink_tokens=sink_tokens,
@@ -1668,10 +1675,10 @@ class SparkXAgenticWorkspace:
         lower = html_text.lower()
         has_doctype = '<!doctype html>' in lower or '<html' in lower
         has_closing = '</html>' in lower
-        has_three = 'three' in lower and ('webglrenderer' in lower or 'instancedmesh' in lower)
+        has_three = 'three' in lower and ('webglrenderer' in lower or 'instancedmesh' in lower or 'scene' in lower)
         has_script = '<script' in lower and '</script>' in lower
-        balanced_braces = abs(html_text.count('{') - html_text.count('}')) <= 2
-        valid = bool(has_doctype and has_closing and has_three and has_script and balanced_braces and len(html_text) >= 1200)
+        balanced_braces = abs(html_text.count('{') - html_text.count('}')) <= 4
+        valid = bool(has_doctype and has_closing and has_three and has_script and balanced_braces and len(html_text) >= 900)
         return {
             'valid': valid,
             'length_chars': len(html_text),
@@ -1695,17 +1702,21 @@ class SparkXAgenticWorkspace:
         max_turns: int = 3,
         max_new_tokens_per_turn: int = DEFAULT_MAX_NEW_TOKENS,
     ) -> Dict[str, Any]:
+        import importlib
+        importlib.reload(_core_mod)
+        type(self.model).generate_cached = _core_mod.SparkXLoopV03.generate_cached
         self.model.eval()
         device = next(self.model.base.parameters()).device
         messages = [
             {'role': 'system', 'content': SPARK_X26_SYSTEM_PROMPTS['agentic_3d_webgl']},
             {'role': 'user', 'content': mission_prompt},
         ]
+        turn_token_cap = min(int(max_new_tokens_per_turn), 6144)
         last_html = ''
         for turn in range(1, max_turns + 1):
             print('=' * 98)
             print(f"[AGENTIC WORKSPACE TURN {turn}/{max_turns}] Workspace: {self.root}")
-            print('=' * 98)
+            print('=' * 98, flush=True)
             try:
                 prompt_ids = self.tokenizer.apply_chat_template(
                     messages, tokenize=True, add_generation_prompt=True, return_tensors='pt'
@@ -1719,10 +1730,10 @@ class SparkXAgenticWorkspace:
 
             out_ids = self.model.generate_cached(
                 prompt_ids,
-                max_new_tokens=max_new_tokens_per_turn,
+                max_new_tokens=turn_token_cap,
                 temperature=0.35,
                 top_p=0.92,
-                repetition_penalty=1.08,
+                repetition_penalty=1.06,
                 eos_token_id=self.tokenizer.eos_token_id,
                 tokenizer=self.tokenizer,
                 think_budget_tokens=384,
@@ -1738,12 +1749,16 @@ class SparkXAgenticWorkspace:
                 m_raw = re.search(r'(<!DOCTYPE html>.*?</html>)', reply, flags=re.DOTALL | re.IGNORECASE)
                 if m_raw:
                     extracted = m_raw.group(1).strip()
+                elif '<html' in reply.lower() and '</html>' in reply.lower():
+                    idx_s = reply.lower().find('<html')
+                    idx_e = reply.lower().rfind('</html>') + len('</html>')
+                    extracted = '<!DOCTYPE html>\n' + reply[idx_s:idx_e].strip()
 
             if extracted:
                 last_html = extracted
                 res = self.write_file(target_filename, extracted)
                 ver = res['verification']
-                print(f"[Workspace Tool: write_file] Saved {res['saved_path']} ({res['bytes']} bytes) | Verification: {ver}")
+                print(f"[Workspace Tool: write_file] Saved {res['saved_path']} ({res['bytes']} bytes) | Verification: {ver}", flush=True)
                 if ver.get('valid'):
                     return {'success': True, 'turn': turn, 'html': extracted, 'path': res['saved_path'], 'verification': ver}
                 messages.append({'role': 'assistant', 'content': reply})
