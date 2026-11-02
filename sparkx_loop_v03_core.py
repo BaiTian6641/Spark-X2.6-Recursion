@@ -327,6 +327,85 @@ def patch_spark_for_unsloth_triton(base_model: nn.Module) -> dict[str, bool]:
     return status
 
 
+def _dispatch_spark_sdpa(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float,
+    orig_repeat_kv: Any = None,
+) -> torch.Tensor:
+    """Memory-exact SDPA dispatcher:
+    - Full causal attention (`sw is None`, `attention_mask is None`): dispatches `attn_mask=None, is_causal=True`
+      so PyTorch uses FlashAttention-2 / cuDNN fused causal kernels ($O(T)$ SRAM, zero $T \times T$ buffer).
+    - Sliding-window causal attention (`sw is not None`, `seq_q > 1024`, `attention_mask is None`): evaluates
+      queries in 1024-token tiles against the exact `[q_start - sw + 1, q_end)` KV window ($O(T \cdot W)$ memory,
+      eliminating the 14.42 GiB `[1, 32, 16384, 16384]` backward allocation).
+    """
+    sw = getattr(module, '_sparkx_sliding_window', None) or getattr(module, 'sliding_window', None)
+    seq_q, seq_k = query.shape[-2], key.shape[-2]
+    use_gqa = _SDPA_SUPPORTS_GQA and (module.num_key_value_groups > 1)
+    if not use_gqa and orig_repeat_kv is not None and module.num_key_value_groups > 1:
+        key = orig_repeat_kv(key, module.num_key_value_groups)
+        value = orig_repeat_kv(value, module.num_key_value_groups)
+    sdpa_kwargs = {'scale': scaling}
+    if use_gqa:
+        sdpa_kwargs['enable_gqa'] = True
+    drop_p = dropout if module.training else 0.0
+
+    # 1. Pure causal full-attention (FlashAttention-2 fast path: 0 GiB mask, O(T) backward!)
+    if sw is None and seq_q > 1 and seq_q == seq_k and attention_mask is None:
+        return F.scaled_dot_product_attention(
+            query, key, value,
+            attn_mask=None,
+            dropout_p=drop_p,
+            is_causal=True,
+            **sdpa_kwargs,
+        )
+
+    # 2. Pure sliding-window causal attention at long sequence lengths (>1024 tokens)
+    if sw is not None and seq_q > 1024 and seq_q == seq_k and attention_mask is None:
+        w = int(sw)
+        chunk_q = 1024
+        outs = []
+        device = query.device
+        for q_start in range(0, seq_q, chunk_q):
+            q_end = min(seq_q, q_start + chunk_q)
+            k_start = max(0, q_start - w + 1)
+            q_chunk = query[:, :, q_start:q_end, :]
+            k_chunk = key[:, :, k_start:q_end, :]
+            v_chunk = value[:, :, k_start:q_end, :]
+            q_pos = torch.arange(q_start, q_end, device=device).unsqueeze(1)
+            k_pos = torch.arange(k_start, q_end, device=device).unsqueeze(0)
+            local_mask = (k_pos <= q_pos) & ((q_pos - k_pos) < w)
+            outs.append(
+                F.scaled_dot_product_attention(
+                    q_chunk, k_chunk, v_chunk,
+                    attn_mask=local_mask.unsqueeze(0).unsqueeze(0),
+                    dropout_p=drop_p,
+                    is_causal=False,
+                    **sdpa_kwargs,
+                )
+            )
+        return torch.cat(outs, dim=2)
+
+    # 3. Standard path (short sequences <=1024, KV-cached decoding, or explicit padding mask)
+    attn_mask = None
+    if attention_mask is not None:
+        attn_mask = attention_mask[:, :, :, :seq_k]
+        if attn_mask.dtype != torch.bool and attn_mask.dtype != query.dtype:
+            attn_mask = attn_mask.to(query.dtype)
+    return F.scaled_dot_product_attention(
+        query, key, value,
+        attn_mask=attn_mask,
+        dropout_p=drop_p,
+        is_causal=(attn_mask is None and seq_q > 1 and seq_q == seq_k and sw is None),
+        **sdpa_kwargs,
+    )
+
+
 def patch_spark_attention_for_long_context(base_model: nn.Module) -> int:
     """Replace Spark2_5Attention's O(T^2) eager_attention_forward with fused BF16 PyTorch SDPA / GQA."""
     if not hasattr(base_model, 'model') or not hasattr(base_model.model, 'layers'):
@@ -347,8 +426,6 @@ def patch_spark_attention_for_long_context(base_model: nn.Module) -> int:
     attn_mod = importlib.import_module(type(layers[0].self_attn).__module__)
     if not hasattr(attn_mod, 'eager_attention_forward'):
         return 0
-    if getattr(attn_mod, '_sparkx_sdpa_patched', False) and not getattr(attn_mod, '_sparkx_loglinear_patched', False):
-        return len(layers)
 
     orig_repeat_kv = getattr(attn_mod, 'repeat_kv', None)
 
@@ -378,24 +455,12 @@ def patch_spark_attention_for_long_context(base_model: nn.Module) -> int:
             key = key[:, :, -int(sw):, :]
             value = value[:, :, -int(sw):, :]
 
-        attn_mask = None
-        if attention_mask is not None:
-            attn_mask = attention_mask[:, :, :, : key.shape[-2]]
-            if attn_mask.dtype != torch.bool and attn_mask.dtype != query.dtype:
-                attn_mask = attn_mask.to(query.dtype)
-        use_gqa = _SDPA_SUPPORTS_GQA and (module.num_key_value_groups > 1)
-        if not use_gqa and orig_repeat_kv is not None and module.num_key_value_groups > 1:
-            key = orig_repeat_kv(key, module.num_key_value_groups)
-            value = orig_repeat_kv(value, module.num_key_value_groups)
-        sdpa_kwargs = {'scale': scaling}
-        if use_gqa:
-            sdpa_kwargs['enable_gqa'] = True
-        out = F.scaled_dot_product_attention(
-            query, key, value,
-            attn_mask=attn_mask,
-            dropout_p=dropout if module.training else 0.0,
-            is_causal=False,
-            **sdpa_kwargs,
+        out = _dispatch_spark_sdpa(
+            module, query, key, value,
+            attention_mask=attention_mask,
+            scaling=scaling,
+            dropout=dropout,
+            orig_repeat_kv=orig_repeat_kv,
         )
         return out, None
 
@@ -594,24 +659,12 @@ def patch_spark_attention_for_loglinear_kv(
             )
             return out, None
 
-        attn_mask = None
-        if attention_mask is not None:
-            attn_mask = attention_mask[:, :, :, : key.shape[-2]]
-            if attn_mask.dtype != torch.bool and attn_mask.dtype != query.dtype:
-                attn_mask = attn_mask.to(query.dtype)
-        use_gqa = _SDPA_SUPPORTS_GQA and (module.num_key_value_groups > 1)
-        if not use_gqa and orig_repeat_kv is not None and module.num_key_value_groups > 1:
-            key = orig_repeat_kv(key, module.num_key_value_groups)
-            value = orig_repeat_kv(value, module.num_key_value_groups)
-        sdpa_kwargs = {'scale': scaling}
-        if use_gqa:
-            sdpa_kwargs['enable_gqa'] = True
-        out = F.scaled_dot_product_attention(
-            query, key, value,
-            attn_mask=attn_mask,
-            dropout_p=dropout if module.training else 0.0,
-            is_causal=False,
-            **sdpa_kwargs,
+        out = _dispatch_spark_sdpa(
+            module, query, key, value,
+            attention_mask=attention_mask,
+            scaling=scaling,
+            dropout=dropout,
+            orig_repeat_kv=orig_repeat_kv,
         )
         return out, None
 
@@ -1437,7 +1490,9 @@ class SparkXLoopV03(nn.Module):
         position_ids = cache_position.unsqueeze(0)
         if hasattr(model, 'make_loop_context'):
             return model.make_loop_context(embeds, attention_mask), cache_position
-        if past_key_values is not None and embeds.shape[1] == 1 and attention_mask is None:
+        if (past_key_values is not None and embeds.shape[1] == 1 and attention_mask is None) or (
+            past_key_values is None and attention_mask is None and embeds.shape[1] > 1024
+        ):
             masks = {'full_attention': None, 'sliding_attention': None}
         else:
             from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -1466,13 +1521,16 @@ class SparkXLoopV03(nn.Module):
             if past_key_values is not None else None
         )
         def step(x, _layer=layer, _rp=rp, _mk=mk, _vc=v_cache, _cp=cache_position):
-            return _layer(x, position_embeddings=_rp, attention_mask=_mk,
-                          past_key_values=_vc, cache_position=_cp)
+            out = _layer(x.float(), position_embeddings=_rp, attention_mask=_mk,
+                         past_key_values=_vc, cache_position=_cp)
+            return out.to(x.dtype)
         if v_cache is None and self.training and self.enable_checkpoint and (
             h.requires_grad or any(p.requires_grad for p in layer.parameters())
         ):
-            return checkpoint(step, h, use_reentrant=False)
-        return step(h)
+            ckpt_in = h.to(kv_dtype) if h.shape[1] >= 8192 else h
+            return checkpoint(step, ckpt_in, use_reentrant=False).float()
+        return layer(h, position_embeddings=rp, attention_mask=mk,
+                     past_key_values=v_cache, cache_position=cache_position)
 
     def forward_hidden(self, input_ids: torch.LongTensor, attention_mask=None,
                        past_key_values=None, cache_position=None,

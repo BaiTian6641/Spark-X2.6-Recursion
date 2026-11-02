@@ -1179,36 +1179,54 @@ def _build_stage_cosine_scheduler(optimizer: Any, total_steps: int, warmup_ratio
 
 
 def _reset_autograd_hooks_and_vram(model: Optional[nn.Module] = None) -> int:
-    """Pop any dangling C++ autograd saved_tensors_default_hooks left by an interrupted checkpoint block
-    and release IPython traceback references holding 16K GPU activation tensors.
+    """Release IPython traceback frames holding GPU tensors/optimizers first, run GC so any
+    abandoned checkpoint generator exits its hook context cleanly, then pop any remaining hooks.
     """
     import sys
-    popped = 0
-    if hasattr(torch._C, '_autograd') and hasattr(torch._C._autograd, '_pop_saved_tensors_default_hooks'):
-        for _ in range(1024):
-            try:
-                if hasattr(torch._C._autograd, '_top_saved_tensors_default_hooks'):
-                    top_h = torch._C._autograd._top_saved_tensors_default_hooks(True)
-                    if top_h is None or top_h == (None, None):
-                        break
-                torch._C._autograd._pop_saved_tensors_default_hooks()
-                popped += 1
-            except BaseException:
-                break
+    import traceback
     for attr in ('last_traceback', 'last_value', 'last_exc'):
-        if hasattr(sys, attr):
+        obj = getattr(sys, attr, None)
+        if obj is not None:
+            try:
+                if attr == 'last_traceback':
+                    traceback.clear_frames(obj)
+                elif hasattr(obj, '__traceback__') and obj.__traceback__ is not None:
+                    traceback.clear_frames(obj.__traceback__)
+            except BaseException:
+                pass
             try:
                 delattr(sys, attr)
             except BaseException:
                 pass
     try:
         ip = get_ipython()  # type: ignore[name-defined]
-        if ip is not None and hasattr(ip, 'InteractiveTB'):
-            ip.InteractiveTB.tb_offset = 0
+        if ip is not None:
+            if hasattr(ip, 'InteractiveTB') and hasattr(ip.InteractiveTB, 'tb_offset'):
+                ip.InteractiveTB.tb_offset = 0
+            for tb_attr in ('_last_traceback', 'last_execution_result'):
+                if hasattr(ip, tb_attr):
+                    try:
+                        setattr(ip, tb_attr, None)
+                    except BaseException:
+                        pass
     except BaseException:
         pass
     if model is not None:
         model.zero_grad(set_to_none=True)
+    # Collect abandoned checkpoint generators FIRST while their saved_tensors hook is still on the stack
+    gc.collect()
+    popped = 0
+    if hasattr(torch._C, '_autograd') and hasattr(torch._C._autograd, '_pop_saved_tensors_default_hooks'):
+        for _ in range(1024):
+            try:
+                if hasattr(torch._C._autograd, '_top_saved_tensors_default_hooks'):
+                    top_h = torch._C._autograd._top_saved_tensors_default_hooks(False)
+                    if top_h is None or top_h == (None, None):
+                        break
+                torch._C._autograd._pop_saved_tensors_default_hooks()
+                popped += 1
+            except BaseException:
+                break
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -1229,8 +1247,10 @@ def run_v03_four_stage_training(
     if popped_hooks > 0:
         print(f"[Autograd Hook Guard] Cleared {popped_hooks} dangling C++ checkpoint saved_tensors hook(s) and freed trapped VRAM.", flush=True)
 
-    # Hot-bind latest checkpoint-safe SparkXLoopV03 & ZipfianTieredMoEEngram methods onto already-instantiated modules in VRAM
+    # Hot-bind latest FlashAttention-2 / Windowed Sliding SDPA & checkpoint-safe methods onto already-instantiated modules in VRAM
+    _core_mod.patch_spark_attention_for_long_context(model.base)
     model_cls = type(model)
+    model_cls._forward_context = _core_mod.SparkXLoopV03._forward_context
     model_cls.forward_hidden = _core_mod.SparkXLoopV03.forward_hidden
     model_cls.forward = _core_mod.SparkXLoopV03.forward
     model_cls._apply_layer = _core_mod.SparkXLoopV03._apply_layer
@@ -1250,6 +1270,7 @@ def run_v03_four_stage_training(
         if torch.cuda.is_available() else 0.0
     )
     if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
         vram_now_gb = torch.cuda.memory_allocated(device) / (1024 ** 3)
         print(f"[VRAM Status] Ready before resume: {vram_now_gb:.1f} GB allocated / {vram_total_gb:.1f} GB total", flush=True)
     start_wall = time.time()
@@ -1544,6 +1565,7 @@ def run_v03_four_stage_training(
                 torch.cuda.empty_cache()
 
     except BaseException as exc:
+        optimizer = scheduler = out = loss = input_ids = labels = sample = None
         _reset_autograd_hooks_and_vram(model)
         is_kbd = isinstance(exc, KeyboardInterrupt)
         if global_step > max(0, best_ckpt_step):
