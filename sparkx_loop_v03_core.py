@@ -1693,20 +1693,20 @@ class SparkXLoopV03(nn.Module):
     def generate_cached(
         self,
         input_ids: torch.LongTensor,
-        max_new_tokens: int = 4096,
+        max_new_tokens: int = 32768,
         eos_token_id: Optional[int] = None,
-        temperature: float = 0.6,
-        top_p: float = 0.92,
+        temperature: float = 0.4,
+        top_p: float = 0.90,
         top_k: int = 40,
-        repetition_penalty: float = 1.04,
-        no_repeat_ngram_size: int = 10,
+        repetition_penalty: float = 1.03,
+        no_repeat_ngram_size: int = 0,
         do_sample: bool = True,
         tokenizer=None,
-        think_budget_tokens: Optional[int] = 384,
+        think_budget_tokens: Optional[int] = None,
         stream_print: bool = True,
         **kwargs,
     ):
-        """Fast 72-visit BF16 KV-cached looped generation with phase-aware <think> budget & HTML completion detection."""
+        """Pure, un-distorted 72-visit BF16 KV-cached looped generation."""
         from transformers.cache_utils import DynamicCache
         prev_train = self.training
         self.eval()
@@ -1719,7 +1719,7 @@ class SparkXLoopV03(nn.Module):
         stop_ids = set()
         if eos_token_id is not None:
             stop_ids.add(int(eos_token_id))
-        think_Ids_mask = set()
+        think_reentry_mask = set()
         if tokenizer is not None:
             if getattr(tokenizer, 'eos_token_id', None) is not None:
                 stop_ids.add(int(tokenizer.eos_token_id))
@@ -1730,44 +1730,26 @@ class SparkXLoopV03(nn.Module):
                         stop_ids.add(int(s_ids[0]))
                 except Exception:
                     pass
-            for t_str in ('<think>', '</think>', '<think>\n', '\n</think>'):
+            for t_str in ('<think>', '<think>\n'):
                 try:
                     t_ids = tokenizer.encode(t_str, add_special_tokens=False)
                     if len(t_ids) == 1:
-                        think_Ids_mask.add(int(t_ids[0]))
+                        think_reentry_mask.add(int(t_ids[0]))
                 except Exception:
                     pass
 
-        def _sample_step(step_logits: torch.Tensor, gen_list: list[int], in_think: bool) -> torch.Tensor:
+        def _sample_step(step_logits: torch.Tensor, gen_list: list[int], think_closed: bool) -> torch.Tensor:
             logits_1d = step_logits[0, -1, :].float().clone()
-            if not in_think and think_Ids_mask:
-                for tid in think_Ids_mask:
+            if think_closed and think_reentry_mask:
+                for tid in think_reentry_mask:
                     if 0 <= tid < logits_1d.shape[0]:
                         logits_1d[tid] = -1e9
-            if gen_list:
-                if in_think:
-                    win = gen_list[-384:]
-                    rep_p, freq_p, pres_p, n_gram = repetition_penalty, 0.22, 0.12, no_repeat_ngram_size
-                else:
-                    win = gen_list[-192:]
-                    rep_p = max(1.04, min(1.07, float(repetition_penalty)))
-                    freq_p, pres_p, n_gram = 0.03, 0.0, 0
-                counts: dict[int, int] = {}
-                for tid in win:
-                    counts[tid] = counts.get(tid, 0) + 1
-                u_ids = torch.tensor(list(counts.keys()), dtype=torch.long, device=logits_1d.device)
-                u_cnt = torch.tensor(list(counts.values()), dtype=torch.float32, device=logits_1d.device)
-                if rep_p > 1.0:
-                    vals = logits_1d[u_ids]
-                    logits_1d[u_ids] = torch.where(vals > 0, vals / rep_p, vals * rep_p)
-                if freq_p > 0.0 or pres_p > 0.0:
-                    logits_1d[u_ids] -= (freq_p * u_cnt + pres_p)
-                if n_gram > 1 and len(gen_list) >= n_gram - 1:
-                    prefix = tuple(gen_list[-(n_gram - 1):])
-                    scan = gen_list[-2048:]
-                    for idx_g in range(len(scan) - n_gram + 1):
-                        if tuple(scan[idx_g : idx_g + n_gram - 1]) == prefix:
-                            logits_1d[scan[idx_g + n_gram - 1]] = -1e9
+            if gen_list and repetition_penalty > 1.0:
+                win = gen_list[-256:]
+                u_ids = torch.tensor(list(set(win)), dtype=torch.long, device=logits_1d.device)
+                vals = logits_1d[u_ids]
+                rep_p = float(repetition_penalty)
+                logits_1d[u_ids] = torch.where(vals > 0, vals / rep_p, vals * rep_p)
             if not do_sample or temperature <= 1e-5:
                 return logits_1d.argmax(dim=-1, keepdim=True).unsqueeze(0)
             scaled = logits_1d / float(temperature)
@@ -1786,15 +1768,13 @@ class SparkXLoopV03(nn.Module):
                 return s_idx.gather(-1, choice).unsqueeze(0)
             return torch.multinomial(probs, num_samples=1).unsqueeze(0)
 
-        in_think = True
-        in_style = False
-        style_closed = False
-        style_start_idx = 0
+        in_think = False
+        think_closed = False
         gen_list: list[int] = []
         t0 = time.time()
         try:
             logits = self.forward_logits(out, past_key_values=cache)
-            next_id = _sample_step(logits, gen_list, in_think)
+            next_id = _sample_step(logits, gen_list, think_closed)
             tok_int = int(next_id.item())
             gen_list.append(tok_int)
             prev_tok = out[:, -2:]
@@ -1802,87 +1782,34 @@ class SparkXLoopV03(nn.Module):
             if tok_int in stop_ids:
                 return out
             for step_i in range(1, max_new_tokens):
-                # Enforce think_budget_tokens transition if still inside <think> at budget limit
-                if (
-                    in_think
-                    and think_budget_tokens is not None
-                    and int(think_budget_tokens) > 0
-                    and len(gen_list) == int(think_budget_tokens)
-                    and tokenizer is not None
-                ):
-                    bridge_ids = tokenizer.encode('\n</think>\n```html\n<!DOCTYPE html>\n', add_special_tokens=False)
-                    if bridge_ids:
-                        in_think = False
-                        for b_id in bridge_ids:
-                            b_tensor = torch.tensor([[int(b_id)]], dtype=torch.long, device=out.device)
-                            logits = self.forward_logits(next_id, past_key_values=cache, prev_ids=prev_tok)
-                            prev_tok = out[:, -2:]
-                            gen_list.append(int(b_id))
-                            out = torch.cat((out, b_tensor), dim=-1)
-                            next_id = b_tensor
-                        if stream_print:
-                            print(f"  [72L Think Budget] Reached {think_budget_tokens} tokens -> closed </think> and entered HTML/WebGL synthesis.", flush=True)
-
                 logits = self.forward_logits(next_id, past_key_values=cache, prev_ids=prev_tok)
                 prev_tok = out[:, -2:]
-                if tokenizer is not None and len(gen_list) % 8 == 0:
-                    tail_txt = tokenizer.decode(gen_list[-32:], skip_special_tokens=False)
-                    tail_low = tail_txt.lower()
-                    if in_think and '</think>' in tail_txt:
+                if tokenizer is not None and (len(gen_list) <= 16 or len(gen_list) % 8 == 0):
+                    tail_txt = tokenizer.decode(gen_list[-48:], skip_special_tokens=False)
+                    if not think_closed and '<think>' in tail_txt and '</think>' not in tail_txt:
+                        in_think = True
+                    if '</think>' in tail_txt:
+                        if in_think and stream_print:
+                            dt = max(1e-3, time.time() - t0)
+                            print(f"  [72L Natural </think>] Model closed </think> naturally at {len(gen_list)} tokens ({len(gen_list)/dt:.1f} tok/s).", flush=True)
                         in_think = False
-                    elif not in_think:
-                        if not in_style and not style_closed and '<style' in tail_low and '</style>' not in tail_low:
-                            in_style = True
-                            style_start_idx = len(gen_list)
-                        elif in_style and '</style>' in tail_low:
-                            in_style = False
-                            style_closed = True
-                        elif '</html>' in tail_low:
-                            full_tail = tokenizer.decode(gen_list[-64:], skip_special_tokens=False).lower()
-                            after_html = full_tail.split('</html>', 1)[-1]
-                            if '```' in after_html or len(after_html.strip()) >= 3:
-                                if stream_print:
-                                    dt = max(1e-3, time.time() - t0)
-                                    print(f"  [72L Gen Complete] Emitted closing </html> at {len(gen_list)} tokens ({len(gen_list)/dt:.1f} tok/s).", flush=True)
-                                break
+                        think_closed = True
 
-                next_id = _sample_step(logits, gen_list, in_think)
+                next_id = _sample_step(logits, gen_list, think_closed)
                 tok_int = int(next_id.item())
                 gen_list.append(tok_int)
                 out = torch.cat((out, next_id), dim=-1)
 
-                # Guard against runaway decorative CSS loops inside <style>: transition cleanly to <body> after '}'
-                if in_style and not style_closed and tokenizer is not None:
-                    style_len = len(gen_list) - style_start_idx
-                    if style_len >= 180:
-                        tok_str = tokenizer.decode([tok_int], skip_special_tokens=False)
-                        if '}' in tok_str or style_len >= 230:
-                            prefix_close = '\n' if '}' in tok_str else ' }\n'
-                            style_bridge = prefix_close + '</style>\n</head>\n<body>\n'
-                            s_ids = tokenizer.encode(style_bridge, add_special_tokens=False)
-                            if s_ids:
-                                in_style = False
-                                style_closed = True
-                                for b_id in s_ids:
-                                    b_tensor = torch.tensor([[int(b_id)]], dtype=torch.long, device=out.device)
-                                    logits = self.forward_logits(next_id, past_key_values=cache, prev_ids=prev_tok)
-                                    prev_tok = out[:, -2:]
-                                    gen_list.append(int(b_id))
-                                    out = torch.cat((out, b_tensor), dim=-1)
-                                    next_id = b_tensor
-                                if stream_print:
-                                    print(f"  [72L Style Guard] Closed <style> at {style_len} CSS tokens -> transitioned to <body>.", flush=True)
-
                 if stream_print and tokenizer is not None and len(gen_list) % 128 == 0:
                     dt = max(1e-3, time.time() - t0)
-                    snippet = tokenizer.decode(gen_list[-20:], skip_special_tokens=True).replace('\n', ' ')
-                    phase = 'think' if in_think else 'code'
-                    print(f"  [72L Gen | {len(gen_list):4d} tok | {len(gen_list)/dt:5.1f} tok/s | phase={phase}] ...{snippet[-64:]}", flush=True)
+                    snippet = tokenizer.decode(gen_list[-24:], skip_special_tokens=False).replace('\n', ' ')
+                    phase = 'think' if in_think else 'answer'
+                    print(f"  [Gen | {len(gen_list):5d} tok | {len(gen_list)/dt:5.1f} tok/s | phase={phase}] ...{snippet[-72:]}", flush=True)
 
                 if tok_int in stop_ids:
                     if stream_print:
                         dt = max(1e-3, time.time() - t0)
-                        print(f"  [72L Gen Complete] Hit stop token at {len(gen_list)} tokens ({len(gen_list)/dt:.1f} tok/s).", flush=True)
+                        print(f"  [Gen Complete] Hit stop token at {len(gen_list)} tokens ({len(gen_list)/dt:.1f} tok/s).", flush=True)
                     break
         finally:
             self.train(prev_train)

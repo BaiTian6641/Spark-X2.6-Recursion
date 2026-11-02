@@ -2128,6 +2128,118 @@ class SparkXAgenticWorkspace:
         ver = self.verify_html_webgl(content) if filename.endswith('.html') else {'valid': True, 'bytes': len(content)}
         return {'saved_path': str(path), 'bytes': len(content.encode('utf-8')), 'verification': ver, 'content': content}
 
+    def run_collapse_and_ablation_audit(self) -> Dict[str, Any]:
+        """
+        Evaluate the trained model on an unseen out-of-distribution algorithmic prompt across 3 modes:
+          1. 72L Full (3-Pass Loop + mHC + Engram)
+          2. 72L Recurrent Only (3-Pass Loop + mHC, Engram disabled)
+          3. 36L Base Backbone Only (1-Pass, mHC & Engram disabled)
+        With ZERO artificial <think> or <style> token cutoffs.
+        """
+        device = next(self.model.base.parameters()).device
+        ood_messages = [
+            {
+                'role': 'system',
+                'content': 'You are a precise software engineering assistant. Reason concisely inside <think>...</think>, close </think>, and provide the exact requested Python code.',
+            },
+            {
+                'role': 'user',
+                'content': (
+                    'Write a self-contained Python function `dijkstra_grid(grid)` that finds the minimum-cost path '
+                    'from top-left `(0, 0)` to bottom-right `(R-1, C-1)` on a 2D integer cost grid (moving up/down/left/right) '
+                    'using `heapq`. Then compute and print the exact integer result for '
+                    '`grid = [[1, 3, 1], [1, 5, 1], [4, 2, 1]]` (which should equal `7`).'
+                ),
+            },
+        ]
+        try:
+            prompt_ids = self.tokenizer.apply_chat_template(
+                ood_messages, tokenize=True, add_generation_prompt=True, return_tensors='pt'
+            ).to(device)
+        except Exception:
+            raw_p = (
+                f"<|im_start|>system\n{ood_messages[0]['content']}<|im_end|>\n"
+                f"<|im_start|>user\n{ood_messages[1]['content']}<|im_end|>\n<|im_start|>assistant\n"
+            )
+            prompt_ids = self.tokenizer(raw_p, return_tensors='pt').input_ids.to(device)
+
+        modes = [
+            ('72L_Full_Loop_mHC_Engram', dict(start=4, end=28, passes=2, use_mhc=True, use_engram=True, enable_p3=True, p3_start=12, p3_end=24)),
+            ('72L_Recurrent_mHC_NoEngram', dict(start=4, end=28, passes=2, use_mhc=True, use_engram=False, enable_p3=True, p3_start=12, p3_end=24)),
+            ('36L_Base_Backbone_Only', dict(start=4, end=28, passes=1, use_mhc=False, use_engram=False, enable_p3=False, p3_start=12, p3_end=24)),
+        ]
+
+        print('=' * 104)
+        print('[HONEST MODEL HEALTH & COLLAPSE AUDIT] Unseen OOD Prompt (`dijkstra_grid`, max_new_tokens=2048, NO forced cutoffs)')
+        print('=' * 104, flush=True)
+
+        audit_results: Dict[str, Any] = {}
+        best_mode_name = '72L_Full_Loop_mHC_Engram'
+        best_score = -999
+
+        for mode_name, loop_kwargs in modes:
+            print(f"\n--- Testing Mode: {mode_name} {loop_kwargs} ---", flush=True)
+            self.model.set_loop(**loop_kwargs)
+            out_ids = self.model.generate_cached(
+                prompt_ids,
+                max_new_tokens=2048,
+                temperature=0.3,
+                top_p=0.90,
+                repetition_penalty=1.03,
+                eos_token_id=self.tokenizer.eos_token_id,
+                tokenizer=self.tokenizer,
+                think_budget_tokens=None,
+                stream_print=True,
+            )
+            gen_ids = out_ids[0, prompt_ids.shape[1]:]
+            full_text = self.tokenizer.decode(gen_ids, skip_special_tokens=False)
+            clean_text = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+            low = clean_text.lower()
+
+            closed_think = '</think>' in full_text
+            hit_eos = int(gen_ids.shape[0]) < 2048
+            has_func = 'def dijkstra_grid' in clean_text
+            has_heapq = 'heapq' in clean_text
+            after_think = clean_text.split('</think>', 1)[-1] if '</think>' in clean_text else clean_text
+            has_ans_7 = bool(re.search(r'\b7\b', after_think))
+            leaked_html = any(w in low for w in ('<!doctype html>', 'three.scene', 'sakura', 'webglrenderer', 'torii'))
+
+            score = (
+                (2 if closed_think else 0)
+                + (2 if hit_eos else 0)
+                + (3 if has_func else 0)
+                + (2 if has_heapq else 0)
+                + (2 if has_ans_7 else 0)
+                - (6 if leaked_html else 0)
+            )
+            metrics = {
+                'tokens_generated': int(gen_ids.shape[0]),
+                'closed_think_naturally': closed_think,
+                'hit_eos_naturally': hit_eos,
+                'followed_def_dijkstra_grid': has_func,
+                'used_heapq': has_heapq,
+                'computed_answer_7': has_ans_7,
+                'leaked_memorized_html': leaked_html,
+                'health_score_out_of_11': score,
+            }
+            audit_results[mode_name] = {'metrics': metrics, 'loop_kwargs': loop_kwargs, 'output_preview': after_think.strip()[:600]}
+            print(f"[{mode_name} Metrics]: {json.dumps(metrics)}", flush=True)
+            print(f"[{mode_name} Output After </think> (First 500 chars)]:\n{after_think.strip()[:500]}\n", flush=True)
+
+            if score > best_score:
+                best_score = score
+                best_mode_name = mode_name
+
+        print('=' * 104)
+        print(f"[AUDIT VERDICT] Best Instruction-Following Mode: {best_mode_name} (score={best_score}/11)")
+        for m_name, m_data in audit_results.items():
+            print(f"  - {m_name:28s}: score={m_data['metrics']['health_score_out_of_11']:2d}/11 | {m_data['metrics']}")
+        print('=' * 104, flush=True)
+
+        # Restore best mode for downstream generation
+        self.model.set_loop(**audit_results[best_mode_name]['loop_kwargs'])
+        return {'best_mode': best_mode_name, 'best_score': best_score, 'modes': audit_results}
+
     def run_agentic_mission(
         self,
         mission_prompt: str,
@@ -2139,40 +2251,38 @@ class SparkXAgenticWorkspace:
         warnings.filterwarnings('ignore', message='.*Consider using IPython.display.IFrame.*')
         _hotbind_v03_runtime_methods(self.model)
         set_loglinear_kv_runtime(self.model, enabled=True, exact_threshold=32768)
-
-        # If a generated HTML artifact already exists in the workspace, inspect & auto-repair it first!
-        existing_path = self.root / target_filename
-        if existing_path.exists() and existing_path.stat().st_size >= 2000:
-            print('=' * 98)
-            print(f"[AGENTIC WORKSPACE INSPECTOR] Auditing existing {existing_path} ({existing_path.stat().st_size} bytes)...")
-            print('=' * 98, flush=True)
-            raw_existing = existing_path.read_text(encoding='utf-8', errors='ignore')
-            res_existing = self.write_file(target_filename, raw_existing)
-            ver_existing = res_existing['verification']
-            print(f"[Workspace Auto-Repair] Saved {res_existing['saved_path']} ({res_existing['bytes']} bytes) | Verification: {ver_existing}", flush=True)
-            if ver_existing.get('valid'):
-                rendered = self.render_inline_colab(res_existing['content'])
-                return {
-                    'success': True,
-                    'turn': 1,
-                    'html': '' if rendered else res_existing['content'],
-                    'rendered_html': res_existing['content'],
-                    'path': res_existing['saved_path'],
-                    'verification': ver_existing,
-                }
-
         self.model.eval()
+
+        # Step 1: Run Honest 3-Mode OOD Collapse & Instruction-Following Audit
+        audit_summary = self.run_collapse_and_ablation_audit()
+
+        # Step 2: Use an UNSEEN out-of-distribution 3D WebGL prompt if the caller passed the training-set Sakura prompt
+        if 'sakura' in mission_prompt.lower() or 'cherry blossom' in mission_prompt.lower():
+            eval_webgl_prompt = (
+                'Build a complete, self-contained, single-file HTML5 + Three.js 3D Interactive Cyberpunk Neon '
+                'Synthwave City & Hovercar Flight Simulator (`<!DOCTYPE html>` ... `</html>`).\n'
+                'Strict Prompt-Following Requirements:\n'
+                '1. Set the document `<title>Neon Horizon 2099</title>` and load Three.js (`https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js`).\n'
+                '2. Render a procedural neon magenta/cyan wireframe synthwave grid floor, a glowing retro wireframe sun on the horizon, and at least 50 procedural skyscrapers with glowing emissive windows.\n'
+                '3. Animate flying hovercar traffic light-trails streaking along city highway lanes and a player hovercar that tilts and steers smoothly with mouse movement.\n'
+                '4. Include interactive HUD buttons with exact IDs `id="mode-neon"`, `id="mode-rain"`, and `id="mode-overdrive"` to switch lighting/weather/speed modes, plus a live speed readout.'
+            )
+            print('\n[OOD Prompt Upgrade] Replaced in-distribution Sakura prompt with UNSEEN "Neon Horizon 2099" Cyberpunk Hovercar Simulator prompt to test true prompt following.')
+        else:
+            eval_webgl_prompt = mission_prompt
+
         device = next(self.model.base.parameters()).device
         messages = [
             {'role': 'system', 'content': SPARK_X26_SYSTEM_PROMPTS['agentic_3d_webgl']},
-            {'role': 'user', 'content': mission_prompt},
+            {'role': 'user', 'content': eval_webgl_prompt},
         ]
-        turn_token_cap = min(int(max_new_tokens_per_turn), 6144)
+        # High token cap (32,768 tokens by default, no 6,144 clamp, no forced <think> or <style> cutoffs)
+        turn_token_cap = max(32768, min(int(max_new_tokens_per_turn), 65536))
         last_html = ''
         for turn in range(1, max_turns + 1):
-            print('=' * 98)
-            print(f"[AGENTIC WORKSPACE TURN {turn}/{max_turns}] Workspace: {self.root}")
-            print('=' * 98, flush=True)
+            print('=' * 104)
+            print(f"[UNCLAMPED OOD WEBGL EVALUATION TURN {turn}/{max_turns}] Token Cap: {turn_token_cap} | Mode: {audit_summary['best_mode']}")
+            print('=' * 104, flush=True)
             try:
                 prompt_ids = self.tokenizer.apply_chat_template(
                     messages, tokenize=True, add_generation_prompt=True, return_tensors='pt'
@@ -2187,15 +2297,28 @@ class SparkXAgenticWorkspace:
             out_ids = self.model.generate_cached(
                 prompt_ids,
                 max_new_tokens=turn_token_cap,
-                temperature=0.32,
+                temperature=0.35,
                 top_p=0.90,
-                repetition_penalty=1.05,
+                repetition_penalty=1.03,
                 eos_token_id=self.tokenizer.eos_token_id,
                 tokenizer=self.tokenizer,
-                think_budget_tokens=320,
+                think_budget_tokens=None,
+                stream_print=True,
             )
             gen_ids = out_ids[0, prompt_ids.shape[1]:]
             reply = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+            low_reply = reply.lower()
+
+            # Check strict prompt adherence vs training-set memorization
+            adherence = {
+                'total_generated_tokens': int(gen_ids.shape[0]),
+                'closed_think_naturally': '</think>' in reply,
+                'has_title_neon_horizon_2099': 'neon horizon 2099' in low_reply,
+                'has_mode_buttons': all(k in low_reply for k in ('mode-neon', 'mode-rain', 'mode-overdrive')),
+                'has_hovercar_or_skyscraper': ('hover' in low_reply or 'skyscraper' in low_reply or 'building' in low_reply),
+                'memorized_sakura_leak': ('sakura' in low_reply or 'cherry blossom' in low_reply or 'torii' in low_reply),
+            }
+            print(f"[Prompt Adherence Audit]: {json.dumps(adherence)}", flush=True)
 
             extracted = ''
             m_fence = re.search(r'```html\s*(<!DOCTYPE html>.*?</html>)\s*```', reply, flags=re.DOTALL | re.IGNORECASE)
@@ -2214,6 +2337,7 @@ class SparkXAgenticWorkspace:
                 res = self.write_file(target_filename, extracted)
                 last_html = res['content']
                 ver = res['verification']
+                ver['prompt_adherence'] = adherence
                 print(f"[Workspace Tool: write_file] Saved {res['saved_path']} ({res['bytes']} bytes) | Verification: {ver}", flush=True)
                 if ver.get('valid'):
                     rendered = self.render_inline_colab(last_html)
@@ -2224,6 +2348,7 @@ class SparkXAgenticWorkspace:
                         'rendered_html': last_html,
                         'path': res['saved_path'],
                         'verification': ver,
+                        'audit_summary': audit_summary,
                     }
                 messages.append({'role': 'assistant', 'content': reply})
                 messages.append({
@@ -2231,10 +2356,17 @@ class SparkXAgenticWorkspace:
                     'content': f"<tool_response>\nVerification failed: {json.dumps(ver)}. Output the complete corrected HTML document.\n</tool_response>",
                 })
             else:
+                print(f"[Raw Reply Preview (No </html> found, {len(reply)} chars)]:\n{reply[:1000]}\n...\n{reply[-600:]}", flush=True)
                 messages.append({'role': 'assistant', 'content': reply})
                 messages.append({
                     'role': 'user',
                     'content': '<tool_response>\nNo complete `<!DOCTYPE html> ... </html>` document found. Emit the complete HTML inside ```html ... ```.\n</tool_response>',
                 })
 
-        return {'success': bool(last_html), 'turn': max_turns, 'html': last_html, 'path': str(self.root / target_filename)}
+        return {
+            'success': bool(last_html),
+            'turn': max_turns,
+            'html': last_html,
+            'path': str(self.root / target_filename),
+            'audit_summary': audit_summary,
+        }
