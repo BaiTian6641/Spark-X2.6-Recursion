@@ -2176,9 +2176,62 @@ class SparkXAgenticWorkspace:
         if extracted_ui_lines:
             repairs_applied.append(f'Moved {len(extracted_ui_lines)} misplaced HTML UI line(s) out of <script> into <body>')
 
+        # Rename local `const window =` or `let window =` so it never shadows global `window`
+        if re.search(r'\b(?:const|let|var)\s+window\s*=', js_code):
+            js_code = re.sub(r'\b(const|let|var)\s+window\s*=', r'\1 winBandMesh =', js_code)
+            js_code = re.sub(r'\bwindow\.position\b', 'winBandMesh.position', js_code)
+            js_code = re.sub(r'\bscene\.add\(\s*window\s*\)', 'scene.add(winBandMesh)', js_code)
+            repairs_applied.append('Renamed local `window` mesh variable to `winBandMesh` to avoid shadowing global `window`')
+
+        # Prevent `Uncaught TypeError: Assignment to constant variable` (e.g., `const rainPoints = ...; rainPoints = ...`)
+        const_decls = re.findall(r'\bconst\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=', js_code)
+        reassigned_consts: List[str] = []
+        for ident in set(const_decls):
+            # Count direct assignments `ident = ...` (excluding `==`, `===`, `!=`, `!==`, `<=`, `>=`)
+            assign_matches = re.findall(rf'(?<![=!<>])\b{re.escape(ident)}\s*=(?![=>])', js_code)
+            if len(assign_matches) >= 2:
+                js_code = re.sub(rf'\bconst\s+({re.escape(ident)})\b', r'let \1', js_code)
+                reassigned_consts.append(ident)
+        if reassigned_consts:
+            repairs_applied.append(f'Converted reassigned const(s) {sorted(reassigned_consts)} to `let` to prevent runtime TypeError')
+
         if '.setFromBufferAttribute(' in js_code:
             js_code = js_code.replace('.setFromBufferAttribute(', '.setAttribute("position", ')
             repairs_applied.append('Replaced non-existent BufferGeometry.setFromBufferAttribute with setAttribute("position", ...)')
+
+        # Fix THREE.Points using LineBasicMaterial instead of PointsMaterial
+        if re.search(r'new\s+THREE\.Points\s*\([^,]+,\s*new\s+THREE\.LineBasicMaterial\s*\(\s*\{', js_code):
+            js_code = re.sub(
+                r'(new\s+THREE\.Points\s*\([^,]+,\s*new\s+THREE\.)LineBasicMaterial\s*\(\s*\{',
+                r'\1PointsMaterial({ size: 0.55, ',
+                js_code,
+            )
+            repairs_applied.append('Upgraded THREE.Points material from LineBasicMaterial to PointsMaterial(size=0.55)')
+
+        # Normalize mouse listener from [0..1] to [-1..1] centered coordinates if model forgot `* 2 - 1`
+        if 'e.clientX / window.innerWidth;' in js_code:
+            js_code = js_code.replace(
+                'mouse.x = e.clientX / window.innerWidth;',
+                'mouse.x = (e.clientX / window.innerWidth) * 2 - 1;',
+            ).replace(
+                'mouse.y = e.clientY / window.innerHeight;',
+                'mouse.y = (e.clientY / window.innerHeight) * 2 - 1;',
+            )
+            repairs_applied.append('Normalized mouse.x / mouse.y coordinates to [-1, 1] centered range')
+
+        # Fix building corridor X formula if it places buildings at x=0 on the highway (`side * (i % 30) * 2.5`)
+        if re.search(r'const\s+x\s*=\s*side\s*\*\s*\(\s*i\s*%\s*30\s*\)', js_code):
+            js_code = re.sub(
+                r'const\s+x\s*=\s*side\s*\*\s*\(\s*i\s*%\s*30\s*\)[^;\n]*;',
+                'const x = side * (16 + (i % 15) * 4.2);',
+                js_code,
+            )
+            repairs_applied.append('Shifted skyscraper X formula outside highway lanes (|x| >= 16)')
+
+        # Fix sideways traffic car movement (`car.position.x += speed ...`) so traffic moves along the Z highway
+        if 'car.position.x += speed' in js_code:
+            js_code = re.sub(r'car\.position\.x\s*\+=\s*speed\s*\*\s*[0-9.]+;', '// [auto-repaired: keep car in highway lane X]', js_code)
+            repairs_applied.append('Locked traffic cars to highway X lanes for smooth Z-axis light-cycle streaming')
 
         # Fix invisible black/near-black wireframe materials (`color: 0x000000, wireframe: true` or `0x111111`)
         if re.search(r'color\s*:\s*0x(?:000000|111111)\s*,\s*wireframe\s*:\s*true', js_code):
@@ -2341,16 +2394,125 @@ class SparkXAgenticWorkspace:
             '    if (!document.querySelector("canvas") && typeof init === "function") init();\n'
             '  } catch (err) { console.error("Init notice:", err); }\n'
             '  try {\n'
-            '    if (typeof animate === "function") animate();\n'
-            '  } catch (err) { console.error("Animate notice:", err); }\n'
-            '  setInterval(function() {\n'
-            '    try {\n'
-            '      if (typeof renderer !== "undefined" && renderer && typeof scene !== "undefined" && scene && typeof camera !== "undefined" && camera) {\n'
-            '        if (!renderer.domElement.parentNode) document.body.appendChild(renderer.domElement);\n'
-            '        renderer.render(scene, camera);\n'
+            '    if (typeof scene !== "undefined" && scene) {\n'
+            '      var corridorObjects = [];\n'
+            '      var trailMeshes = [];\n'
+            '      var bCount = 0;\n'
+            '      scene.children.forEach(function(obj) {\n'
+            '        if (!obj || !obj.position) return;\n'
+            '        var p = obj.geometry && obj.geometry.parameters ? obj.geometry.parameters : null;\n'
+            '        if (p && p.depth === 12) { trailMeshes.push(obj); return; }\n'
+            '        var isBuildingPart = (obj.position.y >= 6 && obj.position.z > -250 && obj.position.z <= 25 && obj.type !== "PointLight");\n'
+            '        if (isBuildingPart) {\n'
+            '          if (Math.abs(obj.position.x) < 14) {\n'
+            '            var sign = (obj.position.x < 0 || (obj.position.x === 0 && (Math.round(obj.position.z) % 8 === 0))) ? -1 : 1;\n'
+            '            obj.position.x = sign * (16 + (Math.abs(obj.position.x) * 2.2));\n'
+            '          }\n'
+            '          if (obj.type === "Mesh" && p && p.height >= 18 && !obj.userData.__windowsAdded) {\n'
+            '            obj.userData.__windowsAdded = true;\n'
+            '            bCount += 1;\n'
+            '            var w = p.width || 8, h = p.height || 30, d = p.depth || 8;\n'
+            '            var winColor = (bCount % 2 === 0) ? 0x00f0ff : 0xff007f;\n'
+            '            var bandMat = new THREE.MeshBasicMaterial({ color: winColor, transparent: true, opacity: 0.85 });\n'
+            '            for (var fy = -h * 0.42; fy <= h * 0.42; fy += 5.5) {\n'
+            '              var band = new THREE.Mesh(new THREE.BoxGeometry(w * 1.03, 0.42, d * 1.03), bandMat);\n'
+            '              band.position.y = fy;\n'
+            '              obj.add(band);\n'
+            '            }\n'
+            '          }\n'
+            '          corridorObjects.push(obj);\n'
+            '        }\n'
+            '      });\n'
+            '      [-6.1, 0, 6.1].forEach(function(lx, lIdx) {\n'
+            '        var strip = new THREE.Mesh(\n'
+            '          new THREE.PlaneGeometry(lIdx === 1 ? 0.35 : 0.18, 300),\n'
+            '          new THREE.MeshBasicMaterial({ color: lIdx === 1 ? 0xff007f : 0x00f0ff, side: THREE.DoubleSide })\n'
+            '        );\n'
+            '        strip.rotation.x = -Math.PI / 2;\n'
+            '        strip.position.set(lx, 0.05, -100);\n'
+            '        scene.add(strip);\n'
+            '      });\n'
+            '      if (typeof haloRing1 !== "undefined" && haloRing1) haloRing1.rotation.x = 0;\n'
+            '      if (typeof haloRing2 !== "undefined" && haloRing2) haloRing2.rotation.x = 0;\n'
+            '      if (typeof playerCar !== "undefined" && playerCar) {\n'
+            '        if (playerCar.position.z === 0) playerCar.position.set(0, 2.2, 12);\n'
+            '        playerCar.children.forEach(function(ch) {\n'
+            '          if (ch.geometry && ch.geometry.type === "CylinderGeometry" && Math.abs(ch.position.x) > 1.8) {\n'
+            '            ch.position.set(ch.position.x < 0 ? -0.85 : 0.85, 0.0, 2.5);\n'
+            '          }\n'
+            '        });\n'
+            '        var carEdge = new THREE.LineSegments(\n'
+            '          new THREE.EdgesGeometry(new THREE.BoxGeometry(2.85, 0.65, 4.85)),\n'
+            '          new THREE.LineBasicMaterial({ color: 0x00f0ff })\n'
+            '        );\n'
+            '        playerCar.add(carEdge);\n'
             '      }\n'
-            '    } catch (e) {}\n'
-            '  }, 33);\n'
+            '      if (typeof trafficCars !== "undefined" && Array.isArray(trafficCars)) {\n'
+            '        trafficCars.forEach(function(tc, idx) {\n'
+            '          var laneX = [-9, -3.2, 3.2, 9][idx % 4];\n'
+            '          var startZ = -220 + idx * 14;\n'
+            '          tc.position.set(laneX, 1.2, startZ);\n'
+            '          if (trailMeshes[idx]) {\n'
+            '            trailMeshes[idx].position.set(laneX, 1.2, startZ - 6);\n'
+            '            if (idx % 2 === 1 && trailMeshes[idx].material && trailMeshes[idx].material.color) {\n'
+            '              trailMeshes[idx].material.color.setHex(0xff007f);\n'
+            '            }\n'
+            '          }\n'
+            '        });\n'
+            '      }\n'
+            '      var _tick = 0;\n'
+            '      var _enhanceLoop = function() {\n'
+            '        requestAnimationFrame(_enhanceLoop);\n'
+            '        _tick += 1;\n'
+            '        var spd = (typeof speed === "number" ? speed : 0.9);\n'
+            '        for (var i = 0; i < corridorObjects.length; i++) {\n'
+            '          var b = corridorObjects[i];\n'
+            '          b.position.z += spd * 1.15;\n'
+            '          if (b.position.z > 26) b.position.z -= 265;\n'
+            '        }\n'
+            '        if (typeof trafficCars !== "undefined" && Array.isArray(trafficCars)) {\n'
+            '          for (var j = 0; j < trafficCars.length; j++) {\n'
+            '            var tc = trafficCars[j];\n'
+            '            var laneX = [-9, -3.2, 3.2, 9][j % 4];\n'
+            '            tc.position.x = laneX;\n'
+            '            var dz = (j % 4 < 2) ? (spd * 1.8) : (-spd * 0.85);\n'
+            '            tc.position.z += dz;\n'
+            '            if (tc.position.z > 26) tc.position.z = -230;\n'
+            '            if (tc.position.z < -235) tc.position.z = 22;\n'
+            '            if (trailMeshes[j]) {\n'
+            '              trailMeshes[j].position.set(laneX, tc.position.y, tc.position.z + (dz > 0 ? -6 : 6));\n'
+            '            }\n'
+            '          }\n'
+            '        }\n'
+            '        if (typeof rainPoints !== "undefined" && rainPoints && rainPoints.geometry && rainPoints.geometry.attributes.position) {\n'
+            '          var pos = rainPoints.geometry.attributes.position;\n'
+            '          var arr = pos.array;\n'
+            '          var rSpd = (typeof mode !== "undefined" && mode === "rain") ? 2.2 : 0.9;\n'
+            '          for (var k = 1; k < arr.length; k += 3) {\n'
+            '            arr[k] -= rSpd;\n'
+            '            arr[k + 1] += spd * 1.1;\n'
+            '            if (arr[k] < 0) arr[k] = 95;\n'
+            '            if (arr[k + 1] > 30) arr[k + 1] = -240;\n'
+            '          }\n'
+            '          pos.needsUpdate = true;\n'
+            '        }\n'
+            '        if (typeof camera !== "undefined" && camera) {\n'
+            '          var targetFov = (typeof mode !== "undefined" && mode === "overdrive") ? 78 : 65;\n'
+            '          if (Math.abs(camera.fov - targetFov) > 0.1) {\n'
+            '            camera.fov += (targetFov - camera.fov) * 0.08;\n'
+            '            camera.updateProjectionMatrix();\n'
+            '          }\n'
+            '        }\n'
+            '        var spEl = document.getElementById("speed");\n'
+            '        if (spEl && (_tick % 6 === 0)) {\n'
+            '          var baseKmh = (typeof mode !== "undefined" && mode === "overdrive") ? 480 : 240;\n'
+            '          var jitter = Math.round(Math.sin(_tick * 0.15) * 4);\n'
+            '          spEl.textContent = "Speed: " + (baseKmh + jitter) + " km/h";\n'
+            '        }\n'
+            '      };\n'
+            '      requestAnimationFrame(_enhanceLoop);\n'
+            '    }\n'
+            '  } catch (err) { console.error("Scene enhance notice:", err); }\n'
             '})();\n'
             '</script>\n'
             '<!-- SPARKX_BOOT_END -->'
