@@ -440,6 +440,11 @@ def _dispatch_spark_sdpa(
         return torch.cat(outs, dim=2)
 
     # 3. Standard path (short sequences <=1024, KV-cached decoding, or explicit padding mask)
+    if sw is not None and seq_q == 1 and attention_mask is None and seq_k > int(sw):
+        w = int(sw)
+        key = key[:, :, -w:, :]
+        value = value[:, :, -w:, :]
+        seq_k = w
     attn_mask = None
     if attention_mask is not None:
         attn_mask = attention_mask[:, :, :, :seq_k]
@@ -1619,40 +1624,41 @@ class SparkXLoopV03(nn.Module):
         model = self.base.model
         cfg = self.base.config
         device = embeds.device
+        bsz, q_len = embeds.shape[:2]
         if cache_position is None:
             if past_key_values is not None:
                 try:
-                    past_seen = past_key_values.get_seq_length(0)
-                except TypeError:
-                    past_seen = past_key_values.get_seq_length()
+                    past_seen = int(past_key_values.get_seq_length(0))
+                except Exception:
+                    try:
+                        past_seen = int(past_key_values.get_seq_length())
+                    except Exception:
+                        past_seen = 0
             else:
                 past_seen = 0
-            cache_position = torch.arange(past_seen, past_seen + embeds.shape[1], device=device)
-        position_ids = cache_position.unsqueeze(0)
+            cache_position = torch.arange(past_seen, past_seen + q_len, device=device)
         if hasattr(model, 'make_loop_context'):
             return model.make_loop_context(embeds, attention_mask), cache_position
-        if (past_key_values is not None and embeds.shape[1] == 1 and attention_mask is None) or (
-            past_key_values is None and attention_mask is None and embeds.shape[1] > 1024
+        if (past_key_values is not None and q_len == 1 and attention_mask is None) or (
+            past_key_values is None and attention_mask is None and q_len > 1024
         ):
             masks = {'full_attention': None, 'sliding_attention': None}
         else:
-            from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
-            mask_cfg = self._make_loop_cache_config() if past_key_values is not None else cfg
-            common_kwargs = dict(
-                config=mask_cfg,
-                attention_mask=attention_mask,
-                cache_position=cache_position,
-                past_key_values=past_key_values,
-                position_ids=position_ids,
-            )
-            def _call_mask_fn(fn):
-                try:
-                    return fn(inputs_embeds=embeds, **common_kwargs)
-                except TypeError:
-                    return fn(input_embeds=embeds, **common_kwargs)
-            masks = {'full_attention': _call_mask_fn(create_causal_mask)}
+            k_len = int(cache_position[-1].item()) + 1 if cache_position.numel() > 0 else q_len
+            q_idx = cache_position.view(1, 1, q_len, 1)
+            k_idx = torch.arange(k_len, device=device).view(1, 1, 1, k_len)
+            causal_ok = (k_idx <= q_idx)
+            if attention_mask is not None and isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2:
+                pad_ok = attention_mask[:, :k_len].bool().view(bsz, 1, 1, -1)
+                if pad_ok.shape[-1] == k_len:
+                    causal_ok = causal_ok & pad_ok
+            min_val = torch.finfo(embeds.dtype).min
+            zero_val = torch.tensor(0.0, dtype=embeds.dtype, device=device)
+            masks = {'full_attention': torch.where(causal_ok, zero_val, min_val)}
             if getattr(model, 'has_sliding_layers', False):
-                masks['sliding_attention'] = _call_mask_fn(create_sliding_window_causal_mask)
+                sw = int(getattr(cfg, 'sliding_window', 512) or 512)
+                sw_ok = causal_ok & ((q_idx - k_idx) < sw)
+                masks['sliding_attention'] = torch.where(sw_ok, zero_val, min_val)
         implementation = importlib.import_module(type(model.layers[0].self_attn).__module__)
         rope = {}
         for layer_type in set(cfg.layer_types):
@@ -1865,10 +1871,7 @@ class SparkXLoopV03(nn.Module):
         input_ids = _unwrap_input_ids(input_ids)
         prev_train = self.training
         self.eval()
-        try:
-            cache = DynamicCache(config=self._make_loop_cache_config())
-        except TypeError:
-            cache = DynamicCache()
+        cache = DynamicCache()
         out = input_ids
 
         stop_ids = set()
