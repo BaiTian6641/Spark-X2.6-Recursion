@@ -2302,7 +2302,7 @@ class SparkXAgenticWorkspace:
         ver = self.verify_html_webgl(content) if filename.endswith('.html') else {'valid': True, 'bytes': len(content)}
         return {'saved_path': str(path), 'bytes': len(content.encode('utf-8')), 'verification': ver, 'content': content}
 
-    def run_collapse_and_ablation_audit(self) -> Dict[str, Any]:
+    def run_collapse_and_ablation_audit(self, max_new_tokens: int = 4096) -> Dict[str, Any]:
         """
         Evaluate the trained model on an unseen out-of-distribution algorithmic prompt across 3 modes:
           1. 72L Full (3-Pass Loop + mHC + Engram)
@@ -2344,7 +2344,7 @@ class SparkXAgenticWorkspace:
         ]
 
         print('=' * 104)
-        print('[HONEST MODEL HEALTH & COLLAPSE AUDIT] Unseen OOD Prompt (`dijkstra_grid`, max_new_tokens=2048, NO forced cutoffs)')
+        print(f'[HONEST MODEL HEALTH & COLLAPSE AUDIT] Unseen OOD Prompt (`dijkstra_grid`, max_new_tokens={max_new_tokens}, NO forced cutoffs)')
         print('=' * 104, flush=True)
 
         audit_results: Dict[str, Any] = {}
@@ -2356,7 +2356,7 @@ class SparkXAgenticWorkspace:
             self.model.set_loop(**loop_kwargs)
             out_ids = self.model.generate_cached(
                 prompt_ids,
-                max_new_tokens=2048,
+                max_new_tokens=max_new_tokens,
                 temperature=0.3,
                 top_p=0.90,
                 repetition_penalty=1.03,
@@ -2371,7 +2371,7 @@ class SparkXAgenticWorkspace:
             low = clean_text.lower()
 
             closed_think = '</think>' in full_text
-            hit_eos = int(gen_ids.shape[0]) < 2048
+            hit_eos = int(gen_ids.shape[0]) < max_new_tokens
             has_func = 'def dijkstra_grid' in clean_text
             has_heapq = 'heapq' in clean_text
             after_think = clean_text.split('</think>', 1)[-1] if '</think>' in clean_text else clean_text
