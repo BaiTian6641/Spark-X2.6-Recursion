@@ -337,7 +337,7 @@ def _dispatch_spark_sdpa(
     dropout: float,
     orig_repeat_kv: Any = None,
 ) -> torch.Tensor:
-    """Memory-exact SDPA dispatcher:
+    r"""Memory-exact SDPA dispatcher:
     - Full causal attention (`sw is None`, `attention_mask is None`): dispatches `attn_mask=None, is_causal=True`
       so PyTorch uses FlashAttention-2 / cuDNN fused causal kernels ($O(T)$ SRAM, zero $T \times T$ buffer).
     - Sliding-window causal attention (`sw is not None`, `seq_q > 1024`, `attention_mask is None`): evaluates
