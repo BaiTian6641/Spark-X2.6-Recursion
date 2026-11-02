@@ -293,8 +293,39 @@ def patch_spark_for_unsloth_triton(base_model: nn.Module) -> dict[str, bool]:
         mlp_cls._sparkx_triton_swiglu_patched = True
     status['patched_mlp_swiglu'] = True
 
-    # 2. Patch apply_rotary_pos_emb in modeling_spark so rotated q/k are immediately cast back to BF16/FP16
+    # 1b. Patch Spark2_5RMSNorm with Fused Triton/Liger RMSNorm (replaces 5 ops x 144 calls/tok with 1 fused kernel)
+    if hasattr(layers[0], 'input_layernorm'):
+        norm_cls = type(layers[0].input_layernorm)
+        if not getattr(norm_cls, '_sparkx_triton_rmsnorm_patched', False):
+            def _triton_rmsnorm_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+                return triton_rmsnorm(hidden_states, self.weight, getattr(self, 'variance_epsilon', 1e-6))
+            norm_cls.forward = _triton_rmsnorm_forward
+            norm_cls._sparkx_triton_rmsnorm_patched = True
+        status['patched_rmsnorm'] = True
+
+    # 2. Patch apply_rotary_pos_emb & compute_rope_cos_sin in modeling_spark (eliminates CPU->GPU copy every token)
     attn_mod = importlib.import_module(type(layers[0].self_attn).__module__)
+    if not getattr(attn_mod, '_sparkx_fast_rope_cos_sin_patched', False):
+        _rope_inv_freq_cache: dict[tuple, torch.Tensor] = {}
+        def _fast_compute_rope_cos_sin(positions, head_dim, rope_theta, partial_rotary_factor=1.0, device='cpu'):
+            dev_key = str(device)
+            cache_key = (int(head_dim), float(rope_theta), float(partial_rotary_factor), dev_key)
+            inv_freq = _rope_inv_freq_cache.get(cache_key)
+            if inv_freq is None:
+                rope_head_dim = int(head_dim * partial_rotary_factor)
+                inv_freq = 1.0 / (
+                    rope_theta ** (
+                        torch.arange(0, rope_head_dim, 2, dtype=torch.float32, device=device) / rope_head_dim
+                    )
+                )
+                _rope_inv_freq_cache[cache_key] = inv_freq
+            t = positions.to(device=device, dtype=torch.float32)
+            freqs = torch.outer(t, inv_freq)
+            freqs = torch.cat((freqs, freqs), dim=-1)
+            return freqs.cos(), freqs.sin()
+        attn_mod.compute_rope_cos_sin = _fast_compute_rope_cos_sin
+        attn_mod._sparkx_fast_rope_cos_sin_patched = True
+
     orig_apply_rope = getattr(attn_mod, '_sparkx_orig_apply_rope', None)
     if orig_apply_rope is None:
         cur_fn = getattr(attn_mod, 'apply_rotary_pos_emb', None)
@@ -1075,11 +1106,18 @@ class ZipfianTieredMoEEngram(nn.Module):
         if ngram_indices is None:
             ngram_indices = self.compute_ngram_indices(input_ids, self.total_buckets, prev_ids=prev_ids)
 
-        # 1. Tier 1A + 1B Lexical N-gram Lookup (with 20% training dropout to prevent verbatim 3-gram memorization)
-        e_lexical = self._lookup_tier1_lexical(ngram_indices, input_ids.device, param_dtype)
-        if self.training:
-            e_lexical = F.dropout(e_lexical, p=0.20, training=True)
-        lex_hidden = self.lexical_up(e_lexical)
+        # 1. Tier 1A + 1B Lexical N-gram Lookup (cached across recurrent passes during eval!)
+        cache_key = (ngram_indices[0].data_ptr(), ngram_indices[0].shape, param_dtype) if not self.training else None
+        cached_lex = getattr(self, '_eval_lex_cache', None) if not self.training else None
+        if cached_lex is not None and cached_lex[0] == cache_key:
+            e_lexical, lex_hidden = cached_lex[1], cached_lex[2]
+        else:
+            e_lexical = self._lookup_tier1_lexical(ngram_indices, input_ids.device, param_dtype)
+            if self.training:
+                e_lexical = F.dropout(e_lexical, p=0.20, training=True)
+            lex_hidden = self.lexical_up(e_lexical)
+            if not self.training:
+                self._eval_lex_cache = (cache_key, e_lexical, lex_hidden)
 
         if hidden_states is not None:
             h_norm = triton_rmsnorm(hidden_states.to(param_dtype), self.norm_weight, self.norm_eps)
@@ -1323,6 +1361,40 @@ class TwoStreamMHC(nn.Module):
             mat = self.mixing_matrix(dyn_mix, base_logits=base_m).permute(2, 3, 0, 1).unsqueeze(-1)
             return rw, ww, mat
 
+    def _compute_routing_scalars(self, s0: torch.Tensor, s1: torch.Tensor, pass_idx: int = 0, is_ffn: bool = False):
+        p_idx = min(max(0, int(pass_idx)), self.max_passes - 1)
+        sub_idx = 1 if is_ffn else 0
+        base_r = self.ffn_read_logits if is_ffn else self.read_logits
+        base_w = self.ffn_write_logits if is_ffn else self.write_logits
+        base_m = self.ffn_mix_logits if is_ffn else self.mix_logits
+        proj = self.ffn_dynamic_proj if is_ffn else self.dynamic_proj
+        nw = getattr(self, 'ffn_norm_weight' if is_ffn else 'norm_weight', None)
+        p_bias = self.pass_routing_bias[p_idx, sub_idx].float()
+
+        if not self.dynamic or proj is None:
+            r_log = base_r.float() + p_bias[:2]
+            w_log = base_w.float() + p_bias[2:4]
+            m_log = (base_m.float().reshape(4) + p_bias[4:8]).clamp(min=-30.0, max=30.0)
+            r1 = torch.sigmoid(r_log[1] - r_log[0])
+            w1 = torch.sigmoid(w_log[1] - w_log[0])
+            diag_adv = 0.5 * ((m_log[0] + m_log[3]) - (m_log[1] + m_log[2]))
+            p_swap = 1.0 - torch.sigmoid(diag_adv)
+            return r1, 1.0 - w1, w1, p_swap
+
+        with torch.autocast(device_type=s0.device.type, enabled=False):
+            flat = torch.cat((s0, s1), dim=-1)
+            rms = torch.rsqrt(flat.pow(2).mean(dim=-1, keepdim=True) + self.norm_eps)
+            normed = (flat * rms * nw) if nw is not None else (flat * rms)
+            dyn = proj(normed) + p_bias.view(1, 1, -1)
+            r_log = base_r.float() + dyn[..., 0:2]
+            w_log = base_w.float() + dyn[..., 2:4]
+            m_log = (base_m.float().reshape(1, 1, 4) + dyn[..., 4:8]).clamp(min=-30.0, max=30.0)
+            r1 = torch.sigmoid(r_log[..., 1:2] - r_log[..., 0:1])
+            w1 = torch.sigmoid(w_log[..., 1:2] - w_log[..., 0:1])
+            diag_adv = 0.5 * ((m_log[..., 0:1] + m_log[..., 3:4]) - (m_log[..., 1:2] + m_log[..., 2:3]))
+            p_swap = 1.0 - torch.sigmoid(diag_adv)
+            return r1, 1.0 - w1, w1, p_swap
+
     def _apply_pass_adapter(self, x: torch.Tensor, pass_idx: int) -> torch.Tensor:
         if self.pass_down is None or self.pass_up is None:
             return torch.zeros_like(x, dtype=torch.float32)
@@ -1344,14 +1416,14 @@ class TwoStreamMHC(nn.Module):
         cache_position=None,
     ) -> torch.Tensor:
         orig_dtype = streams.dtype
-        streams_f32 = streams.float()
-        identity = torch.eye(2, dtype=torch.float32, device=streams.device)[:, :, None, None, None]
+        s0, s1 = streams[0].float(), streams[1].float()
 
         if self.sublayer_mhc and hasattr(layer, 'input_layernorm') and hasattr(layer, 'post_attention_layernorm'):
             target_dtype = layer.mlp.gate_proj.weight.dtype
-            # 1. Attention sublayer mHC
-            rw_a, ww_a, mat_a = self._compute_routing(streams_f32, pass_idx=pass_idx, is_ffn=False)
-            mixed_a = (rw_a * streams_f32).sum(dim=0)
+            # 1. Attention sublayer mHC (exact 3D closed-form 2x2 Sinkhorn)
+            r1_a, w0_a, w1_a, p_swap_a = self._compute_routing_scalars(s0, s1, pass_idx=pass_idx, is_ffn=False)
+            diff_a = s1 - s0
+            mixed_a = s0 + r1_a * diff_a
             normed_a = layer.input_layernorm(mixed_a.to(orig_dtype)).to(target_dtype)
             attn_out, _ = layer.self_attn(
                 hidden_states=normed_a,
@@ -1362,22 +1434,28 @@ class TwoStreamMHC(nn.Module):
             )
             gain_a_param = self.p3_extra_gain if pass_idx >= 2 else self.extra_gain
             gain_a = torch.tanh(gain_a_param.float()) if extra else 1.0
-            eff_mat_a = identity + gain_a * (mat_a - identity)
-            streams_mid = (eff_mat_a * streams_f32.unsqueeze(0)).sum(dim=1) + gain_a * ww_a * attn_out.float().unsqueeze(0)
+            alpha_a = gain_a * p_swap_a
+            attn_delta = gain_a * attn_out.float()
+            m0 = s0 + alpha_a * diff_a + w0_a * attn_delta
+            m1 = s1 - alpha_a * diff_a + w1_a * attn_delta
 
             # 2. FFN sublayer mHC + Pass-conditioned deliberation adapter
-            rw_f, ww_f, mat_f = self._compute_routing(streams_mid, pass_idx=pass_idx, is_ffn=True)
-            mixed_f = (rw_f * streams_mid).sum(dim=0)
+            r1_f, w0_f, w1_f, p_swap_f = self._compute_routing_scalars(m0, m1, pass_idx=pass_idx, is_ffn=True)
+            diff_f = m1 - m0
+            mixed_f = m0 + r1_f * diff_f
             normed_f = layer.post_attention_layernorm(mixed_f.to(orig_dtype)).to(target_dtype)
             mlp_out = layer.mlp(normed_f).float() + self._apply_pass_adapter(mixed_f, pass_idx)
             gain_f_param = self.p3_ffn_extra_gain if pass_idx >= 2 else self.ffn_extra_gain
             gain_f = torch.tanh(gain_f_param.float()) if extra else 1.0
-            eff_mat_f = identity + gain_f * (mat_f - identity)
-            out = (eff_mat_f * streams_mid.unsqueeze(0)).sum(dim=1) + gain_f * ww_f * mlp_out.unsqueeze(0)
-            return out.to(orig_dtype)
+            alpha_f = gain_f * p_swap_f
+            mlp_delta = gain_f * mlp_out
+            out0 = m0 + alpha_f * diff_f + w0_f * mlp_delta
+            out1 = m1 - alpha_f * diff_f + w1_f * mlp_delta
+            return torch.stack((out0.to(orig_dtype), out1.to(orig_dtype)), dim=0)
 
-        rw, ww, mat = self._compute_routing(streams_f32, pass_idx=pass_idx, is_ffn=False)
-        mixed_input = (rw * streams_f32).sum(dim=0).to(orig_dtype)
+        r1, w0, w1, p_swap = self._compute_routing_scalars(s0, s1, pass_idx=pass_idx, is_ffn=False)
+        diff = s1 - s0
+        mixed_input = (s0 + r1 * diff).to(orig_dtype)
         updated = layer(
             mixed_input,
             position_embeddings=position_embeddings,
@@ -1388,10 +1466,11 @@ class TwoStreamMHC(nn.Module):
         delta = updated.float() - mixed_input.float() + self._apply_pass_adapter(mixed_input, pass_idx)
         gain_param = self.p3_extra_gain if pass_idx >= 2 else self.extra_gain
         gain = torch.tanh(gain_param.float()) if extra else 1.0
-        eff_mat = identity + gain * (mat - identity)
-        routed = (eff_mat * streams_f32.unsqueeze(0)).sum(dim=1)
-        out = routed + gain * ww * delta.unsqueeze(0)
-        return out.to(orig_dtype)
+        alpha = gain * p_swap
+        scaled_delta = gain * delta
+        out0 = s0 + alpha * diff + w0 * scaled_delta
+        out1 = s1 - alpha * diff + w1 * scaled_delta
+        return torch.stack((out0.to(orig_dtype), out1.to(orig_dtype)), dim=0)
 
 
 def fused_masked_cross_entropy(
@@ -1942,9 +2021,9 @@ class SparkXLoopV03(nn.Module):
             for step_i in range(1, max_new_tokens):
                 logits = self.forward_logits(next_id, past_key_values=cache, prev_ids=prev_tok)
                 prev_tok = out[:, -2:]
-                if tokenizer is not None and (len(gen_list) <= 16 or len(gen_list) % 8 == 0):
+                if not think_closed and tokenizer is not None and (len(gen_list) <= 16 or len(gen_list) % 8 == 0):
                     tail_txt = tokenizer.decode(gen_list[-48:], skip_special_tokens=False)
-                    if not think_closed and '<think>' in tail_txt and '</think>' not in tail_txt:
+                    if '<think>' in tail_txt and '</think>' not in tail_txt:
                         in_think = True
                     if '</think>' in tail_txt:
                         if in_think and stream_print:

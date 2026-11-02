@@ -1816,20 +1816,26 @@ SPARK_X26_SYSTEM_PROMPTS: Dict[str, str] = {
 
 
 def _hotbind_v03_runtime_methods(model: SparkXLoopV03) -> None:
-    """Hot-bind reloaded SparkXLoopV03 and ZipfianTieredMoEEngram methods onto an already-instantiated GPU model."""
+    """Hot-bind reloaded SparkXLoopV03, TwoStreamMHC, and ZipfianTieredMoEEngram methods onto an already-instantiated GPU model."""
     import importlib
     importlib.reload(_core_mod)
+    _core_mod.patch_spark_for_unsloth_triton(model.base)
     model_cls = type(model)
     model_cls.generate_cached = _core_mod.SparkXLoopV03.generate_cached
     model_cls._forward_context = _core_mod.SparkXLoopV03._forward_context
     model_cls.forward_hidden = _core_mod.SparkXLoopV03.forward_hidden
     model_cls.forward_logits = _core_mod.SparkXLoopV03.forward_logits
+    for ctrl in model.controllers.values():
+        ctrl_cls = type(ctrl)
+        ctrl_cls._compute_routing_scalars = _core_mod.TwoStreamMHC._compute_routing_scalars
+        ctrl_cls.forward = _core_mod.TwoStreamMHC.forward
     for eng_mod in model.all_engram_modules():
         eng_cls = type(eng_mod)
         eng_cls._lookup_tier1_lexical = _core_mod.ZipfianTieredMoEEngram._lookup_tier1_lexical
         eng_cls.forward = _core_mod.ZipfianTieredMoEEngram.forward
         eng_mod.decode_engram_scale = 0.25
         eng_mod._eval_tier1b_gpu = None
+        eng_mod._eval_lex_cache = None
 
 
 def set_loglinear_kv_runtime(
