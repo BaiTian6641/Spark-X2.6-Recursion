@@ -1851,19 +1851,14 @@ class SparkXLoopV03(nn.Module):
                 gen_list.append(tok_int)
                 out = torch.cat((out, next_id), dim=-1)
 
-                # Guard against runaway decorative CSS loops inside <style>: transition cleanly after closing brace '}'
+                # Guard against runaway decorative CSS loops inside <style>: transition cleanly to <body> after '}'
                 if in_style and not style_closed and tokenizer is not None:
                     style_len = len(gen_list) - style_start_idx
                     if style_len >= 180:
                         tok_str = tokenizer.decode([tok_int], skip_special_tokens=False)
                         if '}' in tok_str or style_len >= 230:
                             prefix_close = '\n' if '}' in tok_str else ' }\n'
-                            style_bridge = (
-                                prefix_close
-                                + '</style>\n</head>\n<body>\n'
-                                + '<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>\n'
-                                + '<script>\n'
-                            )
+                            style_bridge = prefix_close + '</style>\n</head>\n<body>\n'
                             s_ids = tokenizer.encode(style_bridge, add_special_tokens=False)
                             if s_ids:
                                 in_style = False
@@ -1876,7 +1871,7 @@ class SparkXLoopV03(nn.Module):
                                     out = torch.cat((out, b_tensor), dim=-1)
                                     next_id = b_tensor
                                 if stream_print:
-                                    print(f"  [72L Style Guard] Closed <style> at {style_len} CSS tokens -> transitioned directly to Three.js <script>.", flush=True)
+                                    print(f"  [72L Style Guard] Closed <style> at {style_len} CSS tokens -> transitioned to <body>.", flush=True)
 
                 if stream_print and tokenizer is not None and len(gen_list) % 128 == 0:
                     dt = max(1e-3, time.time() - t0)

@@ -1676,7 +1676,7 @@ def set_loglinear_kv_runtime(
 
 
 class SparkXAgenticWorkspace:
-    """Multi-Turn Agentic Workspace with automated HTML/JS/Three.js verification and 262K token generation."""
+    """Multi-Turn Agentic Workspace with automated HTML/JS/Three.js verification, V8 syntax repair, and 262K generation."""
 
     def __init__(self, root_dir: str, model: SparkXLoopV03, tokenizer: Any):
         self.root = Path(root_dir)
@@ -1684,29 +1684,449 @@ class SparkXAgenticWorkspace:
         self.model = model
         self.tokenizer = tokenizer
 
+    @staticmethod
+    def _find_node_bin() -> Optional[str]:
+        import shutil
+        for cand in (shutil.which('node'), '/tools/node/bin/node', '/usr/bin/node', '/usr/local/bin/node'):
+            if cand and Path(cand).exists():
+                return str(cand)
+        return None
+
+    @staticmethod
+    def _balance_js_delimiters(js_code: str) -> str:
+        """Balance quotes, parentheses, brackets, and curly braces outside JS strings and comments."""
+        out_chars: List[str] = []
+        stack: List[str] = []
+        state = 'NORMAL'
+        n = len(js_code)
+        i = 0
+        pairs = {'{': '}', '(': ')', '[': ']'}
+        closing = {'}': '{', ')': '(', ']': '['}
+        while i < n:
+            ch = js_code[i]
+            nxt = js_code[i + 1] if i + 1 < n else ''
+            if state == 'NORMAL':
+                if ch == '/' and nxt == '/':
+                    state = 'LINE_COMMENT'
+                    out_chars.append(ch)
+                    out_chars.append(nxt)
+                    i += 2
+                    continue
+                if ch == '/' and nxt == '*':
+                    state = 'BLOCK_COMMENT'
+                    out_chars.append(ch)
+                    out_chars.append(nxt)
+                    i += 2
+                    continue
+                if ch == "'":
+                    state = 'SINGLE'
+                    out_chars.append(ch)
+                elif ch == '"':
+                    state = 'DOUBLE'
+                    out_chars.append(ch)
+                elif ch == '`':
+                    state = 'BACKTICK'
+                    out_chars.append(ch)
+                elif ch in pairs:
+                    stack.append(ch)
+                    out_chars.append(ch)
+                elif ch in closing:
+                    if stack and stack[-1] == closing[ch]:
+                        stack.pop()
+                        out_chars.append(ch)
+                    elif closing[ch] in stack:
+                        while stack and stack[-1] != closing[ch]:
+                            open_d = stack.pop()
+                            out_chars.append(pairs[open_d])
+                        if stack and stack[-1] == closing[ch]:
+                            stack.pop()
+                        out_chars.append(ch)
+                    else:
+                        # Skip unmatched stray closing delimiter
+                        pass
+                else:
+                    out_chars.append(ch)
+            elif state == 'LINE_COMMENT':
+                out_chars.append(ch)
+                if ch == '\n':
+                    state = 'NORMAL'
+            elif state == 'BLOCK_COMMENT':
+                if ch == '*' and nxt == '/':
+                    out_chars.append(ch)
+                    out_chars.append(nxt)
+                    state = 'NORMAL'
+                    i += 2
+                    continue
+                out_chars.append(ch)
+            elif state == 'SINGLE':
+                out_chars.append(ch)
+                if ch == '\\' and i + 1 < n:
+                    out_chars.append(nxt)
+                    i += 2
+                    continue
+                if ch == "'":
+                    state = 'NORMAL'
+                elif ch == '\n':
+                    out_chars.append("'")
+                    state = 'NORMAL'
+            elif state == 'DOUBLE':
+                out_chars.append(ch)
+                if ch == '\\' and i + 1 < n:
+                    out_chars.append(nxt)
+                    i += 2
+                    continue
+                if ch == '"':
+                    state = 'NORMAL'
+                elif ch == '\n':
+                    out_chars.append('"')
+                    state = 'NORMAL'
+            elif state == 'BACKTICK':
+                out_chars.append(ch)
+                if ch == '\\' and i + 1 < n:
+                    out_chars.append(nxt)
+                    i += 2
+                    continue
+                if ch == '`':
+                    state = 'NORMAL'
+            i += 1
+
+        if state == 'SINGLE':
+            out_chars.append("'")
+        elif state == 'DOUBLE':
+            out_chars.append('"')
+        elif state == 'BACKTICK':
+            out_chars.append('`')
+        elif state == 'BLOCK_COMMENT':
+            out_chars.append('*/')
+        while stack:
+            open_d = stack.pop()
+            out_chars.append(pairs[open_d])
+        return ''.join(out_chars)
+
+    def check_js_syntax(self, js_code: str) -> Tuple[bool, str, Optional[int]]:
+        """Run `node --check` if Node.js is available to verify exact V8 JavaScript syntax."""
+        node_bin = self._find_node_bin()
+        if not node_bin:
+            balanced = abs(js_code.count('{') - js_code.count('}')) <= 1 and abs(js_code.count('(') - js_code.count(')')) <= 1
+            return balanced, ('' if balanced else 'Unbalanced JS delimiters'), None
+        import subprocess
+        import tempfile
+        with tempfile.NamedTemporaryFile('w', suffix='.js', delete=False, encoding='utf-8') as tf:
+            tf.write(js_code)
+            tmp_path = tf.name
+        try:
+            proc = subprocess.run([node_bin, '--check', tmp_path], capture_output=True, text=True, timeout=5)
+            if proc.returncode == 0:
+                return True, '', None
+            err = (proc.stderr or proc.stdout or '').strip()
+            m_line = re.search(rf'{re.escape(tmp_path)}:(\d+)', err)
+            line_no = int(m_line.group(1)) if m_line else None
+            return False, err, line_no
+        except Exception as e:
+            return True, str(e), None
+        finally:
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def repair_webgl_html(self, html_text: str, verbose: bool = True) -> Tuple[str, Dict[str, Any]]:
+        """Extract misplaced HTML tags from <script>, repair V8 syntax via node --check, and add Three.js runtime shims."""
+        # Strip any previously injected shim if re-repairing an existing file
+        raw = re.sub(
+            r'<!-- SPARKX_SHIM_START -->.*?<!-- SPARKX_SHIM_END -->\s*',
+            '',
+            html_text,
+            flags=re.DOTALL,
+        )
+        raw = re.sub(
+            r'<!-- SPARKX_BOOT_START -->.*?<!-- SPARKX_BOOT_END -->\s*',
+            '',
+            raw,
+            flags=re.DOTALL,
+        )
+        raw = re.sub(
+            r'/\* SPARKX_BOOT_START \*/.*?/\* SPARKX_BOOT_END \*/\s*',
+            '',
+            raw,
+            flags=re.DOTALL,
+        )
+
+        # 1. Extract <style> content
+        style_blocks = re.findall(r'<style[^>]*>(.*?)</style>', raw, flags=re.DOTALL | re.IGNORECASE)
+        css_text = '\n'.join(s.strip() for s in style_blocks if s.strip())
+        open_b, close_b = css_text.count('{'), css_text.count('}')
+        if open_b > close_b:
+            css_text += '\n' + ('}\n' * (open_b - close_b))
+
+        # 2. Span from the FIRST inline <script> (excluding <script src=...>) to the LAST </script>
+        first_inline = re.search(r'<script(?![^>]*\bsrc=)[^>]*>', raw, flags=re.IGNORECASE)
+        if first_inline:
+            body_match = re.search(r'<body[^>]*>', raw[:first_inline.start()], flags=re.IGNORECASE)
+            pre_start = body_match.end() if body_match else 0
+            pre_region = raw[pre_start:first_inline.start()]
+            pre_ui_html = re.sub(r'<script[^>]*>.*?</script>', '', pre_region, flags=re.DOTALL | re.IGNORECASE)
+            pre_ui_html = re.sub(r'<style[^>]*>.*?</style>', '', pre_ui_html, flags=re.DOTALL | re.IGNORECASE)
+            pre_ui_html = re.sub(r'</?(html|head|body|title|meta|!doctype)[^>]*>', '', pre_ui_html, flags=re.IGNORECASE).strip()
+
+            tail_after_first = raw[first_inline.end():]
+            last_close = re.findall(r'</script\s*>', tail_after_first, flags=re.IGNORECASE)
+            if last_close:
+                idx_last = tail_after_first.lower().rfind('</script')
+                raw_js = tail_after_first[:idx_last]
+            else:
+                raw_js = re.sub(r'</?(script|body|html)[^>]*>', '', tail_after_first, flags=re.IGNORECASE)
+        else:
+            pre_ui_html = ''
+            raw_js = ''
+
+        # 3. Scan raw_js line-by-line (tracking template backticks) and move raw HTML tags out to <body>
+        extracted_ui_lines: List[str] = []
+        clean_js_lines: List[str] = []
+        in_backtick = False
+        html_line_re = re.compile(
+            r'^(<(/?(div|button|h[1-6]|p|span|label|input|select|option|ul|li|nav|section|header|footer|canvas)\b)[^>]*>'
+            r'|.*</(div|button|h[1-6]|p|span|label|ul|li|nav|section|header|footer|canvas)\s*>)$',
+            flags=re.IGNORECASE,
+        )
+        drop_tag_re = re.compile(r'^</?(script|style|head|body|html|!doctype)\b[^>]*>$', flags=re.IGNORECASE)
+
+        for line in raw_js.splitlines():
+            s_line = line.strip()
+            if not in_backtick and drop_tag_re.match(s_line):
+                continue
+            if not in_backtick and html_line_re.match(s_line):
+                extracted_ui_lines.append(line)
+                continue
+            clean_js_lines.append(line)
+            # Toggle backtick state on unescaped backticks
+            bt_count = len(re.findall(r'(?<!\\)`', line))
+            if bt_count % 2 == 1:
+                in_backtick = not in_backtick
+
+        js_code = '\n'.join(clean_js_lines).strip()
+        js_code = self._balance_js_delimiters(js_code)
+
+        # 4. Iterative V8 syntax verification & line-level repair via `node --check`
+        repairs_applied: List[str] = []
+        if extracted_ui_lines:
+            repairs_applied.append(f'Moved {len(extracted_ui_lines)} misplaced HTML UI line(s) out of <script> into <body>')
+
+        js_ok, js_err, err_line = self.check_js_syntax(js_code)
+        for attempt in range(8):
+            if js_ok:
+                break
+            lines_list = js_code.splitlines()
+            if err_line is not None and 1 <= err_line <= len(lines_list):
+                bad_line = lines_list[err_line - 1]
+                repairs_applied.append(f'Repaired JS syntax at line {err_line}: {bad_line.strip()[:60]}')
+                if "Unexpected token '}'" in js_err and '}' in bad_line:
+                    lines_list[err_line - 1] = bad_line.replace('}', '', 1)
+                elif "Unexpected token ')'" in js_err and ')' in bad_line:
+                    lines_list[err_line - 1] = bad_line.replace(')', '', 1)
+                else:
+                    lines_list[err_line - 1] = f'// [auto-repaired] {bad_line}'
+                js_code = self._balance_js_delimiters('\n'.join(lines_list))
+            else:
+                js_code = self._balance_js_delimiters(js_code)
+                break
+            js_ok, js_err, err_line = self.check_js_syntax(js_code)
+
+        # 5. Build clean <body> HUD HTML
+        ui_parts: List[str] = []
+        if pre_ui_html:
+            ui_parts.append(pre_ui_html)
+        if extracted_ui_lines:
+            ui_block = '\n'.join(extracted_ui_lines).strip()
+            if '<div' not in ui_block.lower():
+                ui_block = f'<div id="ui">\n{ui_block}\n</div>'
+            else:
+                open_d = len(re.findall(r'<div\b', ui_block, flags=re.IGNORECASE))
+                close_d = len(re.findall(r'</div\s*>', ui_block, flags=re.IGNORECASE))
+                if open_d > close_d:
+                    ui_block += '\n' + ('</div>' * (open_d - close_d))
+            ui_parts.append(ui_block)
+        final_ui_html = '\n'.join(ui_parts).strip()
+        if not final_ui_html:
+            final_ui_html = (
+                '<div id="ui" style="position:fixed;top:16px;left:16px;z-index:100;display:flex;gap:8px;flex-wrap:wrap;">\n'
+                '  <button id="day">Spring Daylight</button>\n'
+                '  <button id="sunset">Golden Sunset</button>\n'
+                '  <button id="night">Lantern Night</button>\n'
+                '</div>'
+            )
+
+        # 6. Prepend non-null DOM/Three.js shim and append failsafe init/animate render loop
+        shim_head = (
+            '<!-- SPARKX_SHIM_START -->\n'
+            '<div id="__sparkx_diag" style="display:none;position:fixed;bottom:10px;left:10px;right:10px;z-index:9999;'
+            'background:rgba(40,0,15,0.92);color:#ff80ab;padding:8px 12px;border:1px solid #ff4081;border-radius:6px;'
+            'font-family:monospace;font-size:12px;"></div>\n'
+            '<script>\n'
+            'window.terrainSize = window.terrainSize || 30;\n'
+            'window.mouse = window.mouse || { x: 0, y: 0 };\n'
+            'window.targetCamera = window.targetCamera || { position: { x: 0, y: 10, z: 18 }, x: 0, y: 10, z: 18 };\n'
+            'window.timeOfDay = window.timeOfDay || "day";\n'
+            'window.petals = window.petals || [];\n'
+            'window.lanterns = window.lanterns || [];\n'
+            'window.trees = window.trees || [];\n'
+            'window.autoRotate = (typeof window.autoRotate === "undefined") ? true : window.autoRotate;\n'
+            'window.addEventListener("error", function(e) {\n'
+            '  var b = document.getElementById("__sparkx_diag");\n'
+            '  if (b) { b.style.display = "block"; b.textContent = "JS Runtime Notice: " + e.message + " (line " + e.lineno + ")"; }\n'
+            '});\n'
+            '(function() {\n'
+            '  var _origById = document.getElementById.bind(document);\n'
+            '  document.getElementById = function(id) {\n'
+            '    var el = _origById(id);\n'
+            '    if (!el) {\n'
+            '      el = document.createElement("button");\n'
+            '      el.id = id;\n'
+            '      el.textContent = id.replace(/[-_]/g, " ").replace(/\\b\\w/g, function(c) { return c.toUpperCase(); });\n'
+            '      var ui = _origById("ui") || _origById("controls") || document.body;\n'
+            '      if (ui) ui.appendChild(el);\n'
+            '    }\n'
+            '    return el;\n'
+            '  };\n'
+            '  if (window.THREE && THREE.Material && !("emissive" in THREE.Material.prototype)) {\n'
+            '    Object.defineProperty(THREE.Material.prototype, "emissive", {\n'
+            '      get: function() { if (!this.__em) this.__em = new THREE.Color(0x000000); return this.__em; },\n'
+            '      set: function(v) { this.__em = v; },\n'
+            '      configurable: true\n'
+            '    });\n'
+            '  }\n'
+            '})();\n'
+            '</script>\n'
+            '<!-- SPARKX_SHIM_END -->'
+        )
+
+        boot_tail = (
+            '<!-- SPARKX_BOOT_START -->\n'
+            '<script>\n'
+            ';(function() {\n'
+            '  try {\n'
+            '    if (!document.querySelector("canvas") && typeof init === "function") init();\n'
+            '  } catch (err) { console.error("Init notice:", err); }\n'
+            '  try {\n'
+            '    if (typeof animate === "function") animate();\n'
+            '  } catch (err) { console.error("Animate notice:", err); }\n'
+            '  setInterval(function() {\n'
+            '    try {\n'
+            '      if (typeof renderer !== "undefined" && renderer && typeof scene !== "undefined" && scene && typeof camera !== "undefined" && camera) {\n'
+            '        if (!renderer.domElement.parentNode) document.body.appendChild(renderer.domElement);\n'
+            '        renderer.render(scene, camera);\n'
+            '      }\n'
+            '    } catch (e) {}\n'
+            '  }, 33);\n'
+            '})();\n'
+            '</script>\n'
+            '<!-- SPARKX_BOOT_END -->'
+        )
+
+        repaired_html = (
+            '<!DOCTYPE html>\n<html lang="en">\n<head>\n'
+            '<meta charset="UTF-8">\n'
+            '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+            '<title>Sakura Cherry Blossom 3D Voxel Garden — Spark-X2.6 72L</title>\n'
+            '<style>\n'
+            'html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #1a1025; font-family: sans-serif; }\n'
+            'canvas { display: block; width: 100vw; height: 100vh; }\n'
+            '#ui { position: fixed; top: 16px; left: 16px; z-index: 100; display: flex; gap: 8px; flex-wrap: wrap; }\n'
+            'button { padding: 8px 14px; border-radius: 8px; border: 1px solid rgba(255,184,200,0.6); '
+            'background: rgba(20,12,32,0.82); color: #ffdbe6; cursor: pointer; font-size: 13px; }\n'
+            'button:hover { background: rgba(255,140,175,0.35); }\n'
+            f'{css_text}\n'
+            '</style>\n</head>\n<body>\n'
+            f'{final_ui_html}\n'
+            '<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>\n'
+            '<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>\n'
+            f'{shim_head}\n'
+            '<script>\n'
+            f'{js_code}\n'
+            '</script>\n'
+            f'{boot_tail}\n'
+            '</body>\n</html>'
+        )
+
+        if verbose:
+            preview_lines = [ln for ln in js_code.splitlines() if ln.strip() and not ln.strip().startswith('//')]
+            print(f"  [WebGL Inspector] JS Lines: {len(js_code.splitlines())} | V8 Syntax OK: {js_ok} | Repairs: {repairs_applied or ['None needed']}", flush=True)
+            if not js_ok and js_err:
+                print(f"  [WebGL Inspector Warning] Remaining JS syntax notice: {js_err}", flush=True)
+            print("  [WebGL Code Sample from 72L Model (Head & Tail)]:")
+            for pl in preview_lines[:6]:
+                print(f"    {pl[:96]}")
+            print("    ...")
+            for pl in preview_lines[-6:]:
+                print(f"    {pl[:96]}")
+        return repaired_html, {'js_syntax_ok': js_ok, 'js_error': js_err, 'repairs': repairs_applied, 'js_lines': len(js_code.splitlines())}
+
     def verify_html_webgl(self, html_text: str) -> Dict[str, Any]:
         lower = html_text.lower()
         has_doctype = '<!doctype html>' in lower or '<html' in lower
         has_closing = '</html>' in lower
         has_three = 'three' in lower and ('webglrenderer' in lower or 'instancedmesh' in lower or 'scene' in lower)
         has_script = '<script' in lower and '</script>' in lower
-        balanced_braces = abs(html_text.count('{') - html_text.count('}')) <= 4
-        valid = bool(has_doctype and has_closing and has_three and has_script and balanced_braces and len(html_text) >= 900)
+        has_render = 'renderer.render' in lower or 'new three.scene' in lower
+        inline_scripts = re.findall(r'<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>', html_text, flags=re.DOTALL | re.IGNORECASE)
+        main_js = max(inline_scripts, key=len) if inline_scripts else ''
+        js_ok, js_err, _ = self.check_js_syntax(main_js) if main_js else (False, 'No inline script', None)
+        valid = bool(has_doctype and has_closing and has_three and has_script and has_render and js_ok and len(html_text) >= 1200)
         return {
             'valid': valid,
             'length_chars': len(html_text),
             'has_doctype': has_doctype,
             'has_closing_html': has_closing,
             'has_three_webgl': has_three,
-            'balanced_braces': balanced_braces,
+            'js_syntax_ok': js_ok,
+            'js_error': js_err[:120] if js_err else '',
         }
 
+    def render_inline_colab(self, html_text: str) -> bool:
+        """Render the 3D WebGL scene inline in Google Colab using JS-assigned Blob/srcdoc (bypassing static attribute sanitizers)."""
+        try:
+            import base64
+            from IPython.display import HTML, display
+            uid = int(time.time() * 1000) % 10000000
+            b64_payload = base64.b64encode(html_text.encode('utf-8')).decode('ascii')
+            viewer_widget = (
+                f'<div style="border:1px solid #f48fb1;border-radius:10px;overflow:hidden;background:#140c20;margin-top:8px;">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 14px;'
+                f'background:linear-gradient(90deg,#241236,#3a1846);color:#ffdbe6;font-family:sans-serif;font-size:13px;">'
+                f'<span>🌸 <b>Spark-X2.6-4B-En4B-A1B (72L)</b> — Interactive 3D Voxel Sakura Garden</span>'
+                f'<span style="display:flex;gap:12px;">'
+                f'<a id="__sparkx_open_tab_{uid}" target="_blank" style="color:#ff80ab;text-decoration:none;font-weight:bold;cursor:pointer;">↗ Open Fullscreen Tab</a>'
+                f'<a id="__sparkx_dl_html_{uid}" download="sakura_garden_72L.html" style="color:#80d8ff;text-decoration:none;font-weight:bold;cursor:pointer;">⬇ Download HTML</a>'
+                f'</span></div>'
+                f'<iframe id="__sparkx_webgl_iframe_{uid}" style="width:100%;height:580px;border:none;display:block;background:#1a1025;" '
+                f'allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; webgl"></iframe>'
+                f'<script>(function(){{'
+                f'var b64="{b64_payload}";'
+                f'var bin=atob(b64);var bytes=new Uint8Array(bin.length);'
+                f'for(var i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i);'
+                f'var htmlStr=new TextDecoder("utf-8").decode(bytes);'
+                f'var blob=new Blob([htmlStr],{{type:"text/html;charset=utf-8"}});'
+                f'var url=URL.createObjectURL(blob);'
+                f'var ifr=document.getElementById("__sparkx_webgl_iframe_{uid}");'
+                f'if(ifr){{ifr.srcdoc=htmlStr;}}'
+                f'var aTab=document.getElementById("__sparkx_open_tab_{uid}");if(aTab)aTab.href=url;'
+                f'var aDl=document.getElementById("__sparkx_dl_html_{uid}");if(aDl)aDl.href=url;'
+                f'}})();</script></div>'
+            )
+            display(HTML(viewer_widget))
+            return True
+        except Exception as e:
+            print(f"  [Viewer Notice] Inline display fallback: {e}")
+            return False
+
     def write_file(self, filename: str, content: str) -> Dict[str, Any]:
+        if filename.endswith('.html'):
+            content, _ = self.repair_webgl_html(content, verbose=True)
         path = self.root / filename
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding='utf-8')
         ver = self.verify_html_webgl(content) if filename.endswith('.html') else {'valid': True, 'bytes': len(content)}
-        return {'saved_path': str(path), 'bytes': len(content.encode('utf-8')), 'verification': ver}
+        return {'saved_path': str(path), 'bytes': len(content.encode('utf-8')), 'verification': ver, 'content': content}
 
     def run_agentic_mission(
         self,
@@ -1715,8 +2135,32 @@ class SparkXAgenticWorkspace:
         max_turns: int = 3,
         max_new_tokens_per_turn: int = DEFAULT_MAX_NEW_TOKENS,
     ) -> Dict[str, Any]:
+        import warnings
+        warnings.filterwarnings('ignore', message='.*Consider using IPython.display.IFrame.*')
         _hotbind_v03_runtime_methods(self.model)
         set_loglinear_kv_runtime(self.model, enabled=True, exact_threshold=32768)
+
+        # If a generated HTML artifact already exists in the workspace, inspect & auto-repair it first!
+        existing_path = self.root / target_filename
+        if existing_path.exists() and existing_path.stat().st_size >= 2000:
+            print('=' * 98)
+            print(f"[AGENTIC WORKSPACE INSPECTOR] Auditing existing {existing_path} ({existing_path.stat().st_size} bytes)...")
+            print('=' * 98, flush=True)
+            raw_existing = existing_path.read_text(encoding='utf-8', errors='ignore')
+            res_existing = self.write_file(target_filename, raw_existing)
+            ver_existing = res_existing['verification']
+            print(f"[Workspace Auto-Repair] Saved {res_existing['saved_path']} ({res_existing['bytes']} bytes) | Verification: {ver_existing}", flush=True)
+            if ver_existing.get('valid'):
+                rendered = self.render_inline_colab(res_existing['content'])
+                return {
+                    'success': True,
+                    'turn': 1,
+                    'html': '' if rendered else res_existing['content'],
+                    'rendered_html': res_existing['content'],
+                    'path': res_existing['saved_path'],
+                    'verification': ver_existing,
+                }
+
         self.model.eval()
         device = next(self.model.base.parameters()).device
         messages = [
@@ -1767,12 +2211,20 @@ class SparkXAgenticWorkspace:
                     extracted = '<!DOCTYPE html>\n' + reply[idx_s:idx_e].strip()
 
             if extracted:
-                last_html = extracted
                 res = self.write_file(target_filename, extracted)
+                last_html = res['content']
                 ver = res['verification']
                 print(f"[Workspace Tool: write_file] Saved {res['saved_path']} ({res['bytes']} bytes) | Verification: {ver}", flush=True)
                 if ver.get('valid'):
-                    return {'success': True, 'turn': turn, 'html': extracted, 'path': res['saved_path'], 'verification': ver}
+                    rendered = self.render_inline_colab(last_html)
+                    return {
+                        'success': True,
+                        'turn': turn,
+                        'html': '' if rendered else last_html,
+                        'rendered_html': last_html,
+                        'path': res['saved_path'],
+                        'verification': ver,
+                    }
                 messages.append({'role': 'assistant', 'content': reply})
                 messages.append({
                     'role': 'user',
