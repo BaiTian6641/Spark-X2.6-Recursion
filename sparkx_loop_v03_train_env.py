@@ -1808,8 +1808,8 @@ SPARK_X26_SYSTEM_PROMPTS: Dict[str, str] = {
         'You are Spark-X2.6-4B-En4B-A1B, a 72-layer recurrent reasoning and 3D WebGL engineering agent.\n'
         'Execution Protocol:\n'
         '1. Outline your scene architecture concisely in 4-6 bullet points inside <think>...</think> and close `</think>` immediately.\n'
-        '2. Never reference local host paths (`C:\\Users\\...`) or external local files; use CDN scripts (`https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js`).\n'
-        '3. Keep `<style>` concise (under 15 lines: `body { margin: 0; overflow: hidden; }` and HUD controls; no decorative mouse-hover circles) and go straight into `<script>`.\n'
+        '2. Use Three.js r128 (`https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js`). Only use valid Three.js r128 APIs: use `geometry.setFromPoints(pointsArray)` or `geometry.setAttribute("position", new THREE.Float32BufferAttribute(flatFloatArray, 3))` (NEVER call `setFromBufferAttribute`).\n'
+        '3. Use high-contrast emissive/neon colors (`0x00f0ff`, `0xff007f`, `0x7b2cbf`, `0xffbe0b`) with `THREE.MeshStandardMaterial` + `THREE.PointLight` / `THREE.DirectionalLight` and `scene.fog = new THREE.FogExp2(0x090418, 0.008)`. Never use invisible `0x000000` black wireframes or `display: none` on HUD buttons.\n'
         '4. Immediately after `</think>`, emit the complete, self-contained, runnable `<!DOCTYPE html> ... </html>` document inside a ```html ... ``` block.'
     ),
 }
@@ -1864,13 +1864,22 @@ def set_loglinear_kv_runtime(
 
 
 OOD_NEON_HORIZON_MISSION = (
-    'Build a complete, self-contained, single-file HTML5 + Three.js 3D Interactive Cyberpunk Neon '
+    'Build a complete, self-contained, single-file HTML5 + Three.js r128 3D Interactive Cyberpunk '
     'Synthwave City & Hovercar Flight Simulator (`<!DOCTYPE html>` ... `</html>`).\n'
-    'Strict Prompt-Following Requirements:\n'
-    '1. Set the document `<title>Neon Horizon 2099</title>` and load Three.js (`https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js`).\n'
-    '2. Render a procedural neon magenta/cyan wireframe synthwave grid floor, a glowing retro wireframe sun on the horizon, and at least 50 procedural skyscrapers with glowing emissive windows.\n'
-    '3. Animate flying hovercar traffic light-trails streaking along city highway lanes and a player hovercar that tilts and steers smoothly with mouse movement.\n'
-    '4. Include interactive HUD buttons with exact IDs `id="mode-neon"`, `id="mode-rain"`, and `id="mode-overdrive"` to switch lighting/weather/speed modes, plus a live speed readout.'
+    'Strict Technical & Visual Requirements:\n'
+    '1. Document & HUD: Set `<title>Neon Horizon 2099</title>` and load Three.js (`https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js`). '
+    'Create a visible top-left HUD (`#hud`) with 3 clickable buttons (`<button id="mode-neon">Neon</button>`, `<button id="mode-rain">Rain</button>`, `<button id="mode-overdrive">Overdrive</button>` — all 3 buttons MUST remain visible with `display: inline-block`) and a top-right speed telemetry badge (`<div id="speed">Speed: 240 km/h</div>`).\n'
+    '2. Scene, Camera & Atmosphere: Initialize `scene.background = new THREE.Color(0x070312)` and `scene.fog = new THREE.FogExp2(0x070312, 0.006)`. '
+    'Set `camera = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 0.1, 600)` at `camera.position.set(0, 8, 22)` looking at `(0, 4, -40)`. '
+    'Add `AmbientLight(0x3a1c71, 1.2)`, a cyan `PointLight(0x00f0ff, 2.5, 200)` at `(0, 25, 10)`, and a magenta `PointLight(0xff007f, 2.5, 200)` at `(0, 30, -80)`.\n'
+    '3. Synthwave Grid, Highway & Retro Sun: Add a scrolling floor `GridHelper(300, 60, 0xff007f, 0x00f0ff)` at `y = 0` that scrolls forward (`grid.position.z = (grid.position.z + speed) % 5`). '
+    'At `(0, 38, -220)`, place a glowing synthwave sun (`CircleGeometry(45, 48)` with `MeshBasicMaterial({ color: 0xff007f })`) and horizontal cyan neon halo rings.\n'
+    '4. 60 Corridor Skyscrapers with Glowing Windows: Place 60 buildings along both sides of the highway (`x` in `[-85, -14]` or `[14, 85]`, `z` distributed from `-240` to `20`, `width` 6..14, `depth` 6..14, `height` 20..85). '
+    'For each building, create a dark indigo body (`MeshStandardMaterial({ color: 0x12092b, emissive: 0x0b051d, roughness: 0.3 })`) AND attach a glowing cyan/magenta wireframe cage (`new THREE.LineSegments(new THREE.EdgesGeometry(boxGeo), new THREE.LineBasicMaterial({ color: i % 2 === 0 ? 0x00f0ff : 0xff007f }))`) plus glowing window bands (`BoxGeometry(width * 1.02, 0.6, depth * 1.02)` with `MeshBasicMaterial({ color: i % 3 === 0 ? 0x00f0ff : 0xff007f })`) that scroll along `+z` and wrap from `z > 25` back to `z = -240`.\n'
+    '5. Player Hovercar & Traffic Light-Cycles: Build a multi-part `THREE.Group()` for `playerCar` at `(0, 2.2, 10)` with a sleek chassis (`BoxGeometry(2.8, 0.6, 4.8)`, `MeshStandardMaterial({ color: 0x1a1a2e, emissive: 0x00f0ff, emissiveIntensity: 0.4 })`), a glowing cyan cockpit canopy (`BoxGeometry(1.6, 0.5, 2.2)`, `MeshBasicMaterial({ color: 0x00f0ff, wireframe: true })`), and dual twin magenta thruster cores at the rear (`CylinderGeometry(0.3, 0.4, 0.8, 12)` rotated on X with `MeshBasicMaterial({ color: 0xff007f })`). '
+    'Spawn 16 oncoming/cruising traffic hovercars (`BoxGeometry(2.2, 0.5, 4.0)` + elongated glowing neon trail `BoxGeometry(0.4, 0.2, 12.0)` with `MeshBasicMaterial({ color: 0x00f0ff })`, NO `setFromBufferAttribute`) moving along highway lanes (`x` in `[-9, -3, 3, 9]`).\n'
+    '6. Smooth Mouse Steering & Mode Switching: Track normalized mouse coordinates (`targetX = mouse.x * 8`, `targetY = 2.2 - mouse.y * 2.5`) and smoothly interpolate inside `animate()`: `playerCar.position.x += (targetX - playerCar.position.x) * 0.08`, `playerCar.position.y += (targetY - playerCar.position.y) * 0.08`, `playerCar.rotation.z = (playerCar.position.x - targetX) * 0.08`, `playerCar.rotation.y = (playerCar.position.x - targetX) * 0.03`. '
+    'Add 300 falling neon rain streaks (`THREE.Points` with `BufferGeometry` and `Float32BufferAttribute` of flat numbers `[x, y, z, ...]`) and wire `#mode-neon` (base speed `0.9`), `#mode-rain` (brighten rain streaks, cyan fog), and `#mode-overdrive` (speed `2.4`, camera FOV boost to `80`, intense magenta/cyan pulse).'
 )
 
 
@@ -2098,9 +2107,20 @@ class SparkXAgenticWorkspace:
             flags=re.DOTALL,
         )
 
-        # 1. Extract <style> content
+        # Preserve original <title> if present
+        title_match = re.search(r'<title[^>]*>(.*?)</title>', raw, flags=re.DOTALL | re.IGNORECASE)
+        doc_title = title_match.group(1).strip() if title_match and title_match.group(1).strip() else 'Spark-X2.6-4B-En4B-A1B (72L) — 3D WebGL Scene'
+        is_neon_ood = ('neon horizon' in doc_title.lower()) or ('hovercar' in raw.lower()) or ('mode-overdrive' in raw.lower())
+
+        # 1. Extract <style> content and ensure HUD mode buttons are never hidden by `display: none`
         style_blocks = re.findall(r'<style[^>]*>(.*?)</style>', raw, flags=re.DOTALL | re.IGNORECASE)
         css_text = '\n'.join(s.strip() for s in style_blocks if s.strip())
+        css_text = re.sub(
+            r'(#mode-(?:neon|rain|overdrive)\s*\{[^}]*?)display\s*:\s*none\s*;?',
+            r'\1display: inline-block;',
+            css_text,
+            flags=re.IGNORECASE,
+        )
         open_b, close_b = css_text.count('{'), css_text.count('}')
         if open_b > close_b:
             css_text += '\n' + ('}\n' * (open_b - close_b))
@@ -2145,19 +2165,52 @@ class SparkXAgenticWorkspace:
                 extracted_ui_lines.append(line)
                 continue
             clean_js_lines.append(line)
-            # Toggle backtick state on unescaped backticks
             bt_count = len(re.findall(r'(?<!\\)`', line))
             if bt_count % 2 == 1:
                 in_backtick = not in_backtick
 
         js_code = '\n'.join(clean_js_lines).strip()
-        js_code = self._balance_js_delimiters(js_code)
 
-        # 4. Iterative V8 syntax verification & line-level repair via `node --check`
+        # 3b. Auto-repair common Three.js r128 API & visual anti-patterns in generated JS
         repairs_applied: List[str] = []
         if extracted_ui_lines:
             repairs_applied.append(f'Moved {len(extracted_ui_lines)} misplaced HTML UI line(s) out of <script> into <body>')
 
+        if '.setFromBufferAttribute(' in js_code:
+            js_code = js_code.replace('.setFromBufferAttribute(', '.setAttribute("position", ')
+            repairs_applied.append('Replaced non-existent BufferGeometry.setFromBufferAttribute with setAttribute("position", ...)')
+
+        # Fix invisible black/near-black wireframe materials (`color: 0x000000, wireframe: true` or `0x111111`)
+        if re.search(r'color\s*:\s*0x(?:000000|111111)\s*,\s*wireframe\s*:\s*true', js_code):
+            js_code = re.sub(
+                r'color\s*:\s*0x000000(\s*,\s*wireframe\s*:\s*true)',
+                r'color: 0xff007f\1',
+                js_code,
+            )
+            js_code = re.sub(
+                r'color\s*:\s*0x111111(\s*,\s*wireframe\s*:\s*true)',
+                r'color: 0x00f0ff\1',
+                js_code,
+            )
+            repairs_applied.append('Upgraded dark wireframe colors (0x000000/0x111111) to high-contrast neon (0xff007f/0x00f0ff)')
+
+        # Prevent HUD mode button click handlers from hiding the buttons themselves (`style.display = 'none'`)
+        if re.search(r"getElementById\(['\"]mode-(?:neon|rain|overdrive)['\"]\)\.style\.display\s*=\s*['\"]none['\"]", js_code):
+            js_code = re.sub(
+                r"document\.getElementById\(['\"](mode-(?:neon|rain|overdrive))['\"]\)\.style\.display\s*=\s*['\"]none['\"]\s*;?",
+                r"document.getElementById('\1').style.opacity = '0.55';",
+                js_code,
+            )
+            js_code = re.sub(
+                r"document\.getElementById\(['\"](mode-(?:neon|rain|overdrive))['\"]\)\.style\.display\s*=\s*['\"]block['\"]\s*;?",
+                r"document.getElementById('\1').style.opacity = '1.0';",
+                js_code,
+            )
+            repairs_applied.append('Converted HUD mode button visibility toggles from display:none to active opacity highlights')
+
+        js_code = self._balance_js_delimiters(js_code)
+
+        # 4. Iterative V8 syntax verification & line-level repair via `node --check`
         js_ok, js_err, err_line = self.check_js_syntax(js_code)
         for attempt in range(8):
             if js_ok:
@@ -2194,15 +2247,25 @@ class SparkXAgenticWorkspace:
             ui_parts.append(ui_block)
         final_ui_html = '\n'.join(ui_parts).strip()
         if not final_ui_html:
-            final_ui_html = (
-                '<div id="ui" style="position:fixed;top:16px;left:16px;z-index:100;display:flex;gap:8px;flex-wrap:wrap;">\n'
-                '  <button id="day">Spring Daylight</button>\n'
-                '  <button id="sunset">Golden Sunset</button>\n'
-                '  <button id="night">Lantern Night</button>\n'
-                '</div>'
-            )
+            if is_neon_ood:
+                final_ui_html = (
+                    '<div id="hud" style="position:fixed;top:16px;left:16px;z-index:100;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">\n'
+                    '  <button id="mode-neon">Neon</button>\n'
+                    '  <button id="mode-rain">Rain</button>\n'
+                    '  <button id="mode-overdrive">Overdrive</button>\n'
+                    '</div>\n'
+                    '<div id="speed" style="position:fixed;top:16px;right:20px;z-index:100;color:#00f0ff;font-family:monospace;font-size:18px;font-weight:bold;">Speed: 240 km/h</div>'
+                )
+            else:
+                final_ui_html = (
+                    '<div id="ui" style="position:fixed;top:16px;left:16px;z-index:100;display:flex;gap:8px;flex-wrap:wrap;">\n'
+                    '  <button id="day">Spring Daylight</button>\n'
+                    '  <button id="sunset">Golden Sunset</button>\n'
+                    '  <button id="night">Lantern Night</button>\n'
+                    '</div>'
+                )
 
-        # 6. Prepend non-null DOM/Three.js shim and append failsafe init/animate render loop
+        # 6. Prepend non-null DOM/Three.js r128 shim (including BufferGeometry & Float32BufferAttribute Vector3[] polyfills)
         shim_head = (
             '<!-- SPARKX_SHIM_START -->\n'
             '<div id="__sparkx_diag" style="display:none;position:fixed;bottom:10px;left:10px;right:10px;z-index:9999;'
@@ -2229,17 +2292,41 @@ class SparkXAgenticWorkspace:
             '      el = document.createElement("button");\n'
             '      el.id = id;\n'
             '      el.textContent = id.replace(/[-_]/g, " ").replace(/\\b\\w/g, function(c) { return c.toUpperCase(); });\n'
-            '      var ui = _origById("ui") || _origById("controls") || document.body;\n'
+            '      var ui = _origById("hud") || _origById("ui") || _origById("controls") || document.body;\n'
             '      if (ui) ui.appendChild(el);\n'
             '    }\n'
             '    return el;\n'
             '  };\n'
-            '  if (window.THREE && THREE.Material && !("emissive" in THREE.Material.prototype)) {\n'
-            '    Object.defineProperty(THREE.Material.prototype, "emissive", {\n'
-            '      get: function() { if (!this.__em) this.__em = new THREE.Color(0x000000); return this.__em; },\n'
-            '      set: function(v) { this.__em = v; },\n'
-            '      configurable: true\n'
-            '    });\n'
+            '  if (window.THREE) {\n'
+            '    if (THREE.Material && !("emissive" in THREE.Material.prototype)) {\n'
+            '      Object.defineProperty(THREE.Material.prototype, "emissive", {\n'
+            '        get: function() { if (!this.__em) this.__em = new THREE.Color(0x000000); return this.__em; },\n'
+            '        set: function(v) { this.__em = (v && v.isColor) ? v : new THREE.Color(v ? 0x00f0ff : 0x000000); },\n'
+            '        configurable: true\n'
+            '      });\n'
+            '    }\n'
+            '    if (THREE.BufferGeometry && !THREE.BufferGeometry.prototype.setFromBufferAttribute) {\n'
+            '      THREE.BufferGeometry.prototype.setFromBufferAttribute = function(attr, name) {\n'
+            '        if (Array.isArray(attr)) return this.setFromPoints(attr);\n'
+            '        return this.setAttribute(name || "position", attr);\n'
+            '      };\n'
+            '    }\n'
+            '    var _OrigF32Attr = THREE.Float32BufferAttribute;\n'
+            '    if (_OrigF32Attr) {\n'
+            '      THREE.Float32BufferAttribute = function(array, itemSize, normalized) {\n'
+            '        if (Array.isArray(array) && array.length > 0 && typeof array[0] === "object" && array[0] !== null && ("x" in array[0])) {\n'
+            '          var flat = new Float32Array(array.length * 3);\n'
+            '          for (var i = 0; i < array.length; i++) {\n'
+            '            flat[i * 3] = Number(array[i].x) || 0;\n'
+            '            flat[i * 3 + 1] = Number(array[i].y) || 0;\n'
+            '            flat[i * 3 + 2] = Number(array[i].z) || 0;\n'
+            '          }\n'
+            '          return new _OrigF32Attr(flat, itemSize || 3, normalized);\n'
+            '        }\n'
+            '        return new _OrigF32Attr(array, itemSize, normalized);\n'
+            '      };\n'
+            '      THREE.Float32BufferAttribute.prototype = _OrigF32Attr.prototype;\n'
+            '    }\n'
             '  }\n'
             '})();\n'
             '</script>\n'
@@ -2273,14 +2360,14 @@ class SparkXAgenticWorkspace:
             '<!DOCTYPE html>\n<html lang="en">\n<head>\n'
             '<meta charset="UTF-8">\n'
             '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
-            '<title>Sakura Cherry Blossom 3D Voxel Garden — Spark-X2.6 72L</title>\n'
+            f'<title>{doc_title}</title>\n'
             '<style>\n'
-            'html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #1a1025; font-family: sans-serif; }\n'
+            'html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #070312; font-family: sans-serif; }\n'
             'canvas { display: block; width: 100vw; height: 100vh; }\n'
-            '#ui { position: fixed; top: 16px; left: 16px; z-index: 100; display: flex; gap: 8px; flex-wrap: wrap; }\n'
-            'button { padding: 8px 14px; border-radius: 8px; border: 1px solid rgba(255,184,200,0.6); '
-            'background: rgba(20,12,32,0.82); color: #ffdbe6; cursor: pointer; font-size: 13px; }\n'
-            'button:hover { background: rgba(255,140,175,0.35); }\n'
+            '#ui, #hud { position: fixed; top: 16px; left: 16px; z-index: 100; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }\n'
+            'button { display: inline-block !important; padding: 8px 14px; border-radius: 8px; border: 1px solid rgba(0,240,255,0.7); '
+            'background: rgba(12,6,28,0.85); color: #00f0ff; cursor: pointer; font-size: 13px; font-weight: 600; }\n'
+            'button:hover { background: rgba(255,0,127,0.35); border-color: #ff007f; color: #ffffff; }\n'
             f'{css_text}\n'
             '</style>\n</head>\n<body>\n'
             f'{final_ui_html}\n'
@@ -2335,16 +2422,24 @@ class SparkXAgenticWorkspace:
             from IPython.display import HTML, display
             uid = int(time.time() * 1000) % 10000000
             b64_payload = base64.b64encode(html_text.encode('utf-8')).decode('ascii')
+            is_neon = ('neon horizon' in html_text.lower()) or ('mode-overdrive' in html_text.lower())
+            banner_title = (
+                '🌆 <b>Spark-X2.6-4B-En4B-A1B (72L)</b> — Neon Horizon 2099 (3D Cyberpunk Hovercar Simulator)'
+                if is_neon else
+                '🌸 <b>Spark-X2.6-4B-En4B-A1B (72L)</b> — Interactive 3D Voxel Sakura Garden'
+            )
+            dl_name = 'neon_horizon_2099_72L.html' if is_neon else 'sakura_garden_72L.html'
+            border_col = '#00f0ff' if is_neon else '#f48fb1'
             viewer_widget = (
-                f'<div style="border:1px solid #f48fb1;border-radius:10px;overflow:hidden;background:#140c20;margin-top:8px;">'
+                f'<div style="border:1px solid {border_col};border-radius:10px;overflow:hidden;background:#070312;margin-top:8px;">'
                 f'<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 14px;'
-                f'background:linear-gradient(90deg,#241236,#3a1846);color:#ffdbe6;font-family:sans-serif;font-size:13px;">'
-                f'<span>🌸 <b>Spark-X2.6-4B-En4B-A1B (72L)</b> — Interactive 3D Voxel Sakura Garden</span>'
+                f'background:linear-gradient(90deg,#12072b,#241236);color:#e0f7fa;font-family:sans-serif;font-size:13px;">'
+                f'<span>{banner_title}</span>'
                 f'<span style="display:flex;gap:12px;">'
-                f'<a id="__sparkx_open_tab_{uid}" target="_blank" style="color:#ff80ab;text-decoration:none;font-weight:bold;cursor:pointer;">↗ Open Fullscreen Tab</a>'
-                f'<a id="__sparkx_dl_html_{uid}" download="sakura_garden_72L.html" style="color:#80d8ff;text-decoration:none;font-weight:bold;cursor:pointer;">⬇ Download HTML</a>'
+                f'<a id="__sparkx_open_tab_{uid}" target="_blank" style="color:#ff007f;text-decoration:none;font-weight:bold;cursor:pointer;">↗ Open Fullscreen Tab</a>'
+                f'<a id="__sparkx_dl_html_{uid}" download="{dl_name}" style="color:#00f0ff;text-decoration:none;font-weight:bold;cursor:pointer;">⬇ Download HTML</a>'
                 f'</span></div>'
-                f'<iframe id="__sparkx_webgl_iframe_{uid}" style="width:100%;height:580px;border:none;display:block;background:#1a1025;" '
+                f'<iframe id="__sparkx_webgl_iframe_{uid}" style="width:100%;height:580px;border:none;display:block;background:#070312;" '
                 f'allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; webgl"></iframe>'
                 f'<script>(function(){{'
                 f'var b64="{b64_payload}";'
