@@ -878,6 +878,12 @@ class ZipfianTieredMoEEngram(nn.Module):
         self.project = nn.Linear(self.width, self.width, bias=False, dtype=param_dtype)
         nn.init.zeros_(self.project.weight)
         self.gain = nn.Parameter(torch.tensor(-2.0, dtype=torch.float32))
+        # Per-pass telescoping gate logits: sigmoid([-0.6190, -1.7346, -2.9444, -2.9444]) == [0.35, 0.15, 0.05, 0.05]
+        # so Pass 1 (initial lexical lookup) injects at 0.35x, Pass 2 (reasoning) at 0.15x, and Pass 3 (verification) at 0.05x
+        self.pass_gain_logits = nn.Parameter(
+            torch.tensor([-0.6190392, -1.7346011, -2.9444390, -2.9444390], dtype=torch.float32)
+        )
+        self.use_pass_gain_schedule: bool = False
         self.last_router_z_loss: torch.Tensor = torch.tensor(0.0)
         self._gate_override_tensor: Optional[torch.Tensor] = None
         self._gate_override_ref_val: Optional[float] = None
@@ -1229,12 +1235,17 @@ class ZipfianTieredMoEEngram(nn.Module):
             combined = F.silu(lex_hidden)
 
         projected = self.project(combined)
+        p_idx_gate = min(max(int(pass_idx), 0), self.max_passes - 1)
         if not self.training and self._gate_override_tensor is not None:
             gate = torch.tanh(self._gate_override_tensor.to(device=projected.device, dtype=torch.float32)).abs().to(dtype)
+            if getattr(self, 'use_pass_gain_schedule', False):
+                gate = gate * torch.sigmoid(self.pass_gain_logits[p_idx_gate]).to(dtype)
         else:
             gate = torch.sigmoid(self.gain).to(dtype)
-        if not self.training and input_ids.shape[1] == 1:
-            gate = gate * float(getattr(self, 'decode_engram_scale', 0.25))
+            if getattr(self, 'use_pass_gain_schedule', False):
+                gate = gate * torch.sigmoid(self.pass_gain_logits[p_idx_gate]).to(dtype)
+            elif not self.training and input_ids.shape[1] == 1:
+                gate = gate * float(getattr(self, 'decode_engram_scale', 0.25))
         return projected.to(dtype) * gate
 
 
@@ -2196,6 +2207,7 @@ def loop_v03_state_dict(model: SparkXLoopV03, include_tier1b: bool = True) -> di
     active_meta = {
         'engram_active_experts': model.engram.active_experts,
         'engram_active_top_k': model.engram.active_top_k,
+        'use_pass_gain_schedule': bool(getattr(model.engram, 'use_pass_gain_schedule', False)),
     }
     return {
         'version': 'v0.3-en4b-a1b',
@@ -2213,9 +2225,11 @@ def load_loop_v03_state_dict(model: SparkXLoopV03, state: dict, strict: bool = F
     meta = state.get('active_meta', {})
     act_e = int(meta.get('engram_active_experts', model.engram.active_experts))
     act_k = int(meta.get('engram_active_top_k', model.engram.active_top_k))
+    use_pg = bool(meta.get('use_pass_gain_schedule', False))
     for mod in model.all_engram_modules():
         mod.active_experts = min(act_e, mod.num_experts)
         mod.active_top_k = min(act_k, mod.active_experts)
+        mod.use_pass_gain_schedule = use_pg
     c_res = model.controllers.load_state_dict(state['controllers'], strict=strict)
     e_res = model.engram.load_state_dict(state['engram'], strict=strict)
     b_res = model.backbone_engrams.load_state_dict(state['backbone_engrams'], strict=strict)

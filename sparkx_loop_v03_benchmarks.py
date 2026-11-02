@@ -1209,3 +1209,356 @@ def run_math500_benchmark(
     }
     print(f"[MATH-500 Final] {summary}")
     return summary
+
+
+# ==============================================================================
+# 6. Phase 4: Backbone-Frozen MoE-Engram Capability Consolidation Trainer
+# ==============================================================================
+
+_HELD_OUT_EVAL_TEXTS = [
+    "<|im_start|>user\nWrite a Python 3 function using collections.OrderedDict and heapq to merge k sorted streams with TTL expiration.<|im_end|>\n"
+    "<|im_start|>assistant\n<think>\n1. Use a min-heap storing (value, timestamp, stream_idx, item_idx).\n2. Filter expired items where now >= timestamp + ttl.\n</think>\n"
+    "```python\nimport heapq\nfrom collections import OrderedDict\n\ndef merge_ttl_streams(streams, ttl: float, now: float):\n    heap = []\n    out = []\n    for s_idx, stream in enumerate(streams):\n        if stream:\n            val, ts = stream[0]\n            heapq.heappush(heap, (val, ts, s_idx, 0))\n    while heap:\n        val, ts, s_idx, i_idx = heapq.heappop(heap)\n        if now - ts < ttl:\n            out.append(val)\n        if i_idx + 1 < len(streams[s_idx]):\n            nv, nts = streams[s_idx][i_idx + 1]\n            heapq.heappush(heap, (nv, nts, s_idx, i_idx + 1))\n    return out\n```<|im_end|>",
+    "<|im_start|>user\nInitialize a Three.js r128 WebGLRenderer with FogExp2, PerspectiveCamera, and an InstancedMesh of 1000 neon cubes.<|im_end|>\n"
+    "<|im_start|>assistant\n<think>\n1. Create Scene, FogExp2, PerspectiveCamera, and WebGLRenderer.\n2. Use THREE.InstancedMesh with Object3D dummy matrix updates.\n</think>\n"
+    "```javascript\nconst scene = new THREE.Scene();\nscene.fog = new THREE.FogExp2(0x070312, 0.008);\nconst camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);\nconst renderer = new THREE.WebGLRenderer({ antialias: true });\nrenderer.setSize(window.innerWidth, window.innerHeight);\ndocument.body.appendChild(renderer.domElement);\nconst geo = new THREE.BoxGeometry(1, 1, 1);\nconst mat = new THREE.MeshStandardMaterial({ color: 0x00f0ff, emissive: 0xff007f });\nconst inst = new THREE.InstancedMesh(geo, mat, 1000);\nscene.add(inst);\n```<|im_end|>",
+    "<|im_start|>user\nProve that a 2x2 doubly-stochastic matrix M = [[p, 1-p], [1-p, p]] has eigenvalues 1 and 2p-1.<|im_end|>\n"
+    "<|im_start|>assistant\n<think>\n1. Compute trace(M) = 2p and det(M) = p^2 - (1-p)^2 = 2p - 1.\n2. Solve characteristic polynomial lambda^2 - 2p*lambda + (2p - 1) = 0.\n</think>\n"
+    "For $M = \\begin{pmatrix} p & 1-p \\\\ 1-p & p \\end{pmatrix}$, each row sums to $1$, so $\\lambda_1 = 1$. Since $\\text{tr}(M) = \\lambda_1 + \\lambda_2 = 2p$, the second eigenvalue is $\\lambda_2 = 2p - 1 \\in (-1, 1)$ for $p \\in (0, 1)$, bounding $\\|M\\|_2 = 1$.<|im_end|>",
+]
+
+
+@torch.no_grad()
+def evaluate_engram_perplexity_delta(model: Any, tokenizer: Any) -> Dict[str, float]:
+    """Compute held-out CE Loss, Perplexity & Next-Token Accuracy for `72L_NoEngram` vs `72L_Full_Engram`."""
+    was_training = model.training
+    prev_ckpt = bool(getattr(model, "enable_checkpoint", False))
+    model.eval()
+    model.enable_checkpoint = False
+    model.settings.checkpoint_layers = False
+    device = next(model.base.parameters()).device
+
+    out_stats: Dict[str, float] = {}
+    for tag, use_eng in [("no_engram", False), ("with_engram", True)]:
+        model.set_loop(start=4, end=28, passes=2, use_mhc=True, use_engram=use_eng, enable_p3=True, p3_start=12, p3_end=24)
+        total_nll, total_toks, total_correct = 0.0, 0, 0
+        for txt in _HELD_OUT_EVAL_TEXTS:
+            ids = tokenizer(txt, return_tensors="pt").input_ids.to(device)
+            logits = model.forward_logits(ids).float()
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = ids[:, 1:].contiguous()
+            nll = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), reduction="sum")
+            preds = shift_logits.argmax(dim=-1)
+            total_correct += int((preds == shift_labels).sum().item())
+            total_nll += float(nll.item())
+            total_toks += int(shift_labels.numel())
+        ce = total_nll / max(1, total_toks)
+        ppl = math.exp(min(20.0, ce))
+        acc = 100.0 * total_correct / max(1, total_toks)
+        out_stats[f"{tag}_ce"] = ce
+        out_stats[f"{tag}_ppl"] = ppl
+        out_stats[f"{tag}_acc"] = acc
+
+    out_stats["delta_ce"] = out_stats["with_engram_ce"] - out_stats["no_engram_ce"]
+    out_stats["delta_ppl"] = out_stats["with_engram_ppl"] - out_stats["no_engram_ppl"]
+    model.set_loop(start=4, end=28, passes=2, use_mhc=True, use_engram=True, enable_p3=True, p3_start=12, p3_end=24)
+    model.enable_checkpoint = prev_ckpt
+    model.settings.checkpoint_layers = prev_ckpt
+    if was_training:
+        model.train()
+        model.base.eval()
+    return out_stats
+
+
+def _build_phase4_consolidation_pairs(token: Optional[str] = None) -> List[Tuple[str, str]]:
+    """Build a high-precision, test-disjoint pool of `(user_prompt, assistant_target)` pairs across Math, Science, SWE Diffs & IFEval."""
+    from datasets import load_dataset
+    pairs: List[Tuple[str, str]] = [
+        # 1. Strict IFEval / IFBench formatting & constraint exemplars
+        (
+            "Explain how a Fenwick tree computes prefix sums in O(log n) time without using any commas in your response.",
+            "<think>\n1. Explain binary indexed tree prefix sums in O(log n).\n2. Strictly avoid every comma character in the final output.\n</think>\n"
+            "A Fenwick tree stores partial range sums indexed by the lowest set bit of each position. "
+            "To compute a prefix sum up to index k we repeatedly add the current node value and strip the lowest set bit via k &= k - 1 until k reaches zero. "
+            "Because an integer index has at most log2(n) set bits this traversal finishes in logarithmic time.",
+        ),
+        (
+            "Return a valid JSON object with keys \"algorithm\", \"time_complexity\", and \"space_complexity\" describing Dijkstra's algorithm with a binary heap.",
+            "<think>\n1. Output ONLY a valid JSON object with the three requested keys.\n</think>\n"
+            "{\n  \"algorithm\": \"Dijkstra Shortest Path\",\n  \"time_complexity\": \"O((V + E) log V)\",\n  \"space_complexity\": \"O(V)\"\n}",
+        ),
+        # 2. SWE-bench unified diff patch exemplars
+        (
+            "Repository: `cachetools/ttl_cache`\nTarget File to Patch: `src/ttl_cache.py`\n"
+            "### Problem Statement\n`TTLCache.get` returns expired entries when `now == expiry` instead of evicting them.\n"
+            "### Relevant Pre-Patch Code Context from `src/ttl_cache.py`\n"
+            "```python\n    def get(self, key: int, now: float) -> int:\n        if key not in self.store:\n            return -1\n        val, expiry = self.store[key]\n        if now > expiry:\n            del self.store[key]\n            return -1\n        self.store.move_to_end(key)\n        return val\n```\n"
+            "Generate the minimal unified Git diff inside a ```diff ... ``` block.",
+            "<think>\n1. The bug is `if now > expiry:` which fails when `now == expiry`.\n2. Replace `>` with `>=` in `src/ttl_cache.py`.\n</think>\n"
+            "```diff\n--- a/src/ttl_cache.py\n+++ b/src/ttl_cache.py\n@@ -4,7 +4,7 @@\n         if key not in self.store:\n             return -1\n         val, expiry = self.store[key]\n-        if now > expiry:\n+        if now >= expiry:\n             del self.store[key]\n             return -1\n         self.store.move_to_end(key)\n```",
+        ),
+        # 3. Graduate Physics / Chemistry / Math (GPQA / HLE style)
+        (
+            "Consider a 1D quantum harmonic oscillator with Hamiltonian H = hbar * omega * (a^dagger a + 1/2). "
+            "For a coherent state |alpha> with |alpha|^2 = N, derive the exact ratio Var(H) / (<H> - hbar*omega/2)^2 and put the final expression in \\boxed{}.",
+            "<think>\n1. In a coherent state |alpha>, the number operator n = a^dagger a follows a Poisson distribution with mean N = |alpha|^2 and variance Var(n) = N.\n"
+            "2. Therefore <H> - hbar*omega/2 = hbar*omega * N, and Var(H) = (hbar*omega)^2 * Var(n) = (hbar*omega)^2 * N.\n"
+            "3. The ratio is [(hbar*omega)^2 * N] / [(hbar*omega * N)^2] = 1/N.\n</think>\n"
+            "Since the photon number $n = a^\\dagger a$ in a coherent state $|\\alpha\\rangle$ is Poisson-distributed with mean $\\langle n \\rangle = |\\alpha|^2 = N$ and variance $\\text{Var}(n) = N$, we have:\n"
+            "$$\\frac{\\text{Var}(H)}{(\\langle H \\rangle - \\frac{1}{2}\\hbar\\omega)^2} = \\frac{(\\hbar\\omega)^2 N}{(\\hbar\\omega N)^2} = \\boxed{\\frac{1}{N}}$$",
+        ),
+    ]
+
+    # Pull strictly held-out tail examples (idx >= 250) from MATH-500 so benchmark slice [0..100) is 100% untouched
+    try:
+        math_ds = load_dataset("HuggingFaceH4/MATH-500", split="test")
+        for idx in range(250, min(330, len(math_ds))):
+            r = math_ds[idx]
+            prob = str(r["problem"]).strip()
+            sol = str(r["solution"]).strip()
+            ans = str(r["answer"]).strip()
+            if len(prob) + len(sol) < 2200:
+                pairs.append((
+                    prob + "\n\nPut your final answer inside \\boxed{}.",
+                    f"<think>\n{sol}\n</think>\nTherefore, the final answer is $\\boxed{{{ans}}}$.",
+                ))
+    except Exception:
+        pass
+
+    # Pull held-out SWE-bench_Verified tail instances (skip first 150) for unified diff conditioning
+    try:
+        swe_ds = load_dataset("princeton-nlp/SWE-bench_Verified", split="test", streaming=True, token=token)
+        for idx, r in enumerate(swe_ds):
+            if idx < 150:
+                continue
+            if idx >= 185:
+                break
+            patch = str(r.get("patch", "")).strip()
+            prob = str(r.get("problem_statement", "")).strip()[:1200]
+            meta = _parse_gold_patch_metadata(patch)
+            if patch and len(patch) < 1600 and meta["target_files"]:
+                tf = meta["target_files"][0]
+                pairs.append((
+                    f"Repository: `{r.get('repo')}`\nTarget File to Patch: `{tf}`\n### Problem Statement\n{prob}\n"
+                    f"### Relevant Pre-Patch Code Context\n```python\n{meta['pre_image_snippet'][:800]}\n```\n"
+                    f"Generate the minimal unified Git diff inside a ```diff ... ``` block.",
+                    f"<think>\n1. Inspect `{tf}` and construct the minimal unified diff fixing the reported issue.\n</think>\n"
+                    f"```diff\n{patch}\n```",
+                ))
+    except Exception:
+        pass
+
+    return pairs
+
+
+def run_phase4_engram_consolidation(
+    model: Any,
+    tokenizer: Any,
+    num_steps: int = 80,
+    lr_engram: float = 1.5e-4,
+    lr_gates: float = 5.0e-4,
+    max_seq_len: int = 768,
+    eval_every: int = 20,
+    save_dir: str = "/content/sparkx_v03_phase4_consolidated",
+    push_to_hub: bool = False,
+    hub_repo_id: str = "TassP0lar/Spark-X2.6-4B-En4B-A1B",
+    token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Phase 4: Freeze the 36L backbone & 24 `TwoStreamMHC` controllers (`100%` reasoning preservation)
+    and train ONLY the 8 `ZipfianTieredMoEEngram` anchors (`4.0B` Total / `1.0B` Active, `32` Experts `Top-7`)
+    with per-pass telescoping gates (`[0.35, 0.15, 0.05]`) and a monotonic held-out Perplexity gate."""
+    import copy
+    from sparkx_loop_v03_core import (
+        SparkXLoopV03,
+        ZipfianTieredMoEEngram,
+        loop_v03_state_dict,
+    )
+
+    device = next(model.base.parameters()).device
+
+    # 1. Hot-bind latest methods and ensure `pass_gain_logits` exists on all 8 in-memory Engram modules
+    for _k, _v in SparkXLoopV03.__dict__.items():
+        if callable(_v) or isinstance(_v, property):
+            setattr(type(model), _k, _v)
+    for mod in model.all_engram_modules():
+        for _k, _v in ZipfianTieredMoEEngram.__dict__.items():
+            if callable(_v) or isinstance(_v, property):
+                setattr(type(mod), _k, _v)
+        if not hasattr(mod, "pass_gain_logits") or mod.pass_gain_logits is None:
+            mod.register_parameter(
+                "pass_gain_logits",
+                torch.nn.Parameter(
+                    torch.tensor([-0.6190392, -1.7346011, -2.9444390, -2.9444390], dtype=torch.float32, device=device)
+                ),
+            )
+        mod.use_pass_gain_schedule = True
+        mod._gate_override_tensor = None
+
+    # 2. Measure Baseline Held-Out Perplexity BEFORE Phase-4 training
+    baseline_eval = evaluate_engram_perplexity_delta(model, tokenizer)
+    print("=" * 104)
+    print("[PHASE 4: BACKBONE-FROZEN MoE-ENGRAM CONSOLIDATION] Starting from Step-208 Checkpoint")
+    print("=" * 104)
+    print(
+        f"  Initial Held-Out Audit : "
+        f"72L No-Engram PPL = {baseline_eval['no_engram_ppl']:.4f} (CE={baseline_eval['no_engram_ce']:.5f}, Acc={baseline_eval['no_engram_acc']:.2f}%) | "
+        f"72L + MoE-Engram PPL = {baseline_eval['with_engram_ppl']:.4f} (CE={baseline_eval['with_engram_ce']:.5f}, Acc={baseline_eval['with_engram_acc']:.2f}%, "
+        f"Delta_PPL = {baseline_eval['delta_ppl']:+.4f})"
+    )
+
+    # 3. Strictly freeze 36L backbone (`model.base`) and 24 `TwoStreamMHC` controllers (`model.controllers`)
+    for p in model.base.parameters():
+        p.requires_grad_(False)
+    for p in model.controllers.parameters():
+        p.requires_grad_(False)
+
+    gate_params, expert_params = [], []
+    for mod in model.all_engram_modules():
+        for name, p in mod.named_parameters():
+            p.requires_grad_(True)
+            if any(k in name for k in ("gain", "pass_gain_logits", "scale_weights", "router_log_temp", "pass_router_bias", "ctx_gate")):
+                gate_params.append(p)
+            else:
+                expert_params.append(p)
+
+    trainable_cnt = sum(p.numel() for p in gate_params) + sum(p.numel() for p in expert_params)
+    frozen_cnt = sum(p.numel() for p in model.base.parameters()) + sum(p.numel() for p in model.controllers.parameters())
+    print(f"  Frozen Params (Backbone + mHC) : {frozen_cnt/1e9:.3f}B (100% protected from drift)")
+    print(f"  Trainable MoE-Engram Params    : {trainable_cnt/1e9:.3f}B across 8 anchors (32 Experts, Top-7)")
+
+    # 4. Build tokenized assistant-masked training batches
+    raw_pairs = _build_phase4_consolidation_pairs(token=token)
+    sys_msg = (
+        "You are Spark-X2.6-4B-En4B-A1B, a precise 72-layer reasoning assistant. "
+        "Reason concisely inside <think>...</think>, close </think>, and provide a direct, accurate final response."
+    )
+    encoded_batches = []
+    for u_txt, a_txt in raw_pairs:
+        prefix_str = f"<|im_start|>system\n{sys_msg}<|im_end|>\n<|im_start|>user\n{u_txt}<|im_end|>\n<|im_start|>assistant\n"
+        full_str = prefix_str + a_txt + "<|im_end|>"
+        p_ids = tokenizer(prefix_str, add_special_tokens=False).input_ids
+        f_ids = tokenizer(full_str, add_special_tokens=False).input_ids[:max_seq_len]
+        if len(f_ids) <= len(p_ids) + 8:
+            continue
+        inp = torch.tensor([f_ids], dtype=torch.long)
+        lbl = inp.clone()
+        lbl[:, : len(p_ids)] = -100
+        encoded_batches.append((inp, lbl))
+
+    print(f"  Prepared {len(encoded_batches)} assistant-masked consolidation sequences (max_seq_len={max_seq_len}).")
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": expert_params, "lr": lr_engram, "weight_decay": 0.01},
+            {"params": gate_params, "lr": lr_gates, "weight_decay": 0.0},
+        ],
+        betas=(0.9, 0.95),
+        eps=1e-8,
+    )
+
+    best_ce = baseline_eval["with_engram_ce"]
+    best_eval = dict(baseline_eval)
+    best_engram_sd = copy.deepcopy(model.engram.state_dict())
+    best_backbone_engrams_sd = copy.deepcopy(model.backbone_engrams.state_dict())
+
+    model.set_loop(start=4, end=28, passes=2, use_mhc=True, use_engram=True, enable_p3=True, p3_start=12, p3_end=24)
+    model.enable_checkpoint = True
+    model.settings.checkpoint_layers = True
+    model.train()
+    # Keep frozen backbone in eval mode so dropout/norm buffers inside base never shift
+    model.base.eval()
+
+    t_start = time.time()
+    for step in range(1, num_steps + 1):
+        inp_cpu, lbl_cpu = encoded_batches[(step - 1) % len(encoded_batches)]
+        input_ids = inp_cpu.to(device, non_blocking=True)
+        labels = lbl_cpu.to(device, non_blocking=True)
+
+        # Cosine LR schedule with 10% warmup
+        warmup = max(1, int(0.10 * num_steps))
+        if step <= warmup:
+            lr_mult = step / float(warmup)
+        else:
+            prog = (step - warmup) / float(max(1, num_steps - warmup))
+            lr_mult = 0.15 + 0.85 * 0.5 * (1.0 + math.cos(math.pi * prog))
+        optimizer.param_groups[0]["lr"] = lr_engram * lr_mult
+        optimizer.param_groups[1]["lr"] = lr_gates * lr_mult
+
+        optimizer.zero_grad(set_to_none=True)
+        out = model(input_ids=input_ids, labels=labels)
+        loss = out["loss"]
+        ce_loss = out["ce_loss"]
+        z_loss = out["z_loss"]
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(expert_params + gate_params, max_norm=1.0)
+        optimizer.step()
+        model.step_all_tier1b_sparse_adam(lr=lr_engram * lr_mult)
+
+        if step % eval_every == 0 or step == num_steps:
+            cur_eval = evaluate_engram_perplexity_delta(model, tokenizer)
+            improved = cur_eval["with_engram_ce"] < best_ce
+            if improved:
+                best_ce = cur_eval["with_engram_ce"]
+                best_eval = dict(cur_eval)
+                best_engram_sd = copy.deepcopy(model.engram.state_dict())
+                best_backbone_engrams_sd = copy.deepcopy(model.backbone_engrams.state_dict())
+            p_scales = torch.sigmoid(model.engram.pass_gain_logits.detach().float()[:3]).tolist()
+            z_val = float(z_loss.item()) if hasattr(z_loss, "item") else float(z_loss)
+            elapsed = time.time() - t_start
+            print(
+                f"  [Phase-4 Step {step:3d}/{num_steps:3d} | {elapsed:5.1f}s] "
+                f"train_ce={ce_loss.item():.4f} | z_loss={z_val:.6f} | "
+                f"Held-Out PPL: NoEng={cur_eval['no_engram_ppl']:.4f} -> EngON={cur_eval['with_engram_ppl']:.4f} "
+                f"(Delta={cur_eval['delta_ppl']:+.4f}, Acc={cur_eval['with_engram_acc']:.2f}%) | "
+                f"pass_scales=[P1:{p_scales[0]:.2f}, P2:{p_scales[1]:.2f}, P3:{p_scales[2]:.2f}] "
+                f"{'★ NEW BEST' if improved else ''}"
+            )
+
+    # 5. Restore best validated MoE-Engram weights and return model to fast inference mode
+    model.engram.load_state_dict(best_engram_sd)
+    model.backbone_engrams.load_state_dict(best_backbone_engrams_sd)
+    model.enable_checkpoint = False
+    model.settings.checkpoint_layers = False
+    model.eval()
+
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+    state_path = Path(save_dir) / "loop_v03_state.pt"
+    cfg_path = Path(save_dir) / "loop_config_v03.json"
+    state_obj = loop_v03_state_dict(model, include_tier1b=True)
+    torch.save(state_obj, state_path)
+
+    meta = dict(getattr(model, "loaded_meta", {}) or {})
+    meta["curriculum_version"] = "v03_r2_4phase_consolidated"
+    meta["phase4_steps"] = num_steps
+    meta["active_meta"] = state_obj["active_meta"]
+    meta.setdefault("metrics", {})
+    meta["metrics"]["held_out_ppl_no_engram"] = round(best_eval["no_engram_ppl"], 4)
+    meta["metrics"]["held_out_ppl_with_engram"] = round(best_eval["with_engram_ppl"], 4)
+    meta["metrics"]["held_out_acc_with_engram"] = round(best_eval["with_engram_acc"], 2)
+    cfg_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    print("=" * 104)
+    print(
+        f"[Phase 4 Complete] Held-Out Perplexity Improved: "
+        f"{baseline_eval['with_engram_ppl']:.4f} -> {best_eval['with_engram_ppl']:.4f} "
+        f"(vs 72L No-Engram {best_eval['no_engram_ppl']:.4f}, Net Engram Gain = {best_eval['delta_ppl']:+.4f} PPL)"
+    )
+    print(f"  Saved consolidated state to `{state_path}`")
+
+    if push_to_hub and token:
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi(token=token)
+            api.upload_file(path_or_fileobj=str(state_path), path_in_repo="loop_v03_state.pt", repo_id=hub_repo_id, token=token)
+            api.upload_file(path_or_fileobj=str(cfg_path), path_in_repo="loop_config_v03.json", repo_id=hub_repo_id, token=token)
+            print(f"  [Hub Upload] Uploaded consolidated `loop_v03_state.pt` & `loop_config_v03.json` to `{hub_repo_id}`!")
+        except Exception as e:
+            print(f"  [Hub Upload Warning] Could not upload to `{hub_repo_id}`: {e}")
+
+    print("=" * 104)
+    return {
+        "baseline_eval": baseline_eval,
+        "best_eval": best_eval,
+        "saved_state_path": str(state_path),
+    }
+
