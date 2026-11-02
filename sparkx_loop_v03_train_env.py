@@ -1857,6 +1857,33 @@ def set_loglinear_kv_runtime(
         )
 
 
+OOD_NEON_HORIZON_MISSION = (
+    'Build a complete, self-contained, single-file HTML5 + Three.js 3D Interactive Cyberpunk Neon '
+    'Synthwave City & Hovercar Flight Simulator (`<!DOCTYPE html>` ... `</html>`).\n'
+    'Strict Prompt-Following Requirements:\n'
+    '1. Set the document `<title>Neon Horizon 2099</title>` and load Three.js (`https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js`).\n'
+    '2. Render a procedural neon magenta/cyan wireframe synthwave grid floor, a glowing retro wireframe sun on the horizon, and at least 50 procedural skyscrapers with glowing emissive windows.\n'
+    '3. Animate flying hovercar traffic light-trails streaking along city highway lanes and a player hovercar that tilts and steers smoothly with mouse movement.\n'
+    '4. Include interactive HUD buttons with exact IDs `id="mode-neon"`, `id="mode-rain"`, and `id="mode-overdrive"` to switch lighting/weather/speed modes, plus a live speed readout.'
+)
+
+
+def extract_code_from_response(text: str, target_ext: str = '.py') -> str:
+    """Extract executable code after </think> from a model response."""
+    body = text.split('</think>', 1)[-1].strip() if '</think>' in text else text.strip()
+    if target_ext == '.html':
+        m_html = re.search(r'```html\s*(<!DOCTYPE html>.*?</html>)\s*```', body, flags=re.DOTALL | re.IGNORECASE)
+        if m_html:
+            return m_html.group(1).strip()
+        m_raw = re.search(r'(<!DOCTYPE html>.*?</html>)', body, flags=re.DOTALL | re.IGNORECASE)
+        if m_raw:
+            return m_raw.group(1).strip()
+    blocks = re.findall(r'```(?:python|py|javascript|js|html)?\s*\n(.*?)```', body, flags=re.DOTALL | re.IGNORECASE)
+    if blocks:
+        return max(blocks, key=len).strip()
+    return re.sub(r'^```\w*\s*|\s*```$', '', body, flags=re.MULTILINE).strip()
+
+
 class SparkXAgenticWorkspace:
     """Multi-Turn Agentic Workspace with automated HTML/JS/Three.js verification, V8 syntax repair, and 262K generation."""
 
@@ -1865,6 +1892,37 @@ class SparkXAgenticWorkspace:
         self.root.mkdir(parents=True, exist_ok=True)
         self.model = model
         self.tokenizer = tokenizer
+
+    def execute_python(self, filename: str, code: str, timeout: int = 15) -> Dict[str, Any]:
+        """Write Python code to the workspace and execute it in a subprocess with timeout."""
+        import subprocess
+        import sys
+        target = self.root / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(code, encoding='utf-8')
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(target)],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=str(self.root),
+            )
+            return {
+                'ok': proc.returncode == 0,
+                'returncode': proc.returncode,
+                'stdout': proc.stdout,
+                'stderr': proc.stderr,
+                'path': str(target),
+            }
+        except Exception as e:
+            return {
+                'ok': False,
+                'returncode': -1,
+                'stdout': '',
+                'stderr': str(e),
+                'path': str(target),
+            }
 
     @staticmethod
     def _find_node_bin() -> Optional[str]:
@@ -2433,6 +2491,9 @@ class SparkXAgenticWorkspace:
         target_filename: str = 'index.html',
         max_turns: int = 3,
         max_new_tokens_per_turn: int = DEFAULT_MAX_NEW_TOKENS,
+        run_ablation_first: bool = True,
+        use_ood_mission: Optional[bool] = None,
+        **kwargs,
     ) -> Dict[str, Any]:
         import warnings
         warnings.filterwarnings('ignore', message='.*Consider using IPython.display.IFrame.*')
@@ -2440,21 +2501,18 @@ class SparkXAgenticWorkspace:
         set_loglinear_kv_runtime(self.model, enabled=True, exact_threshold=32768)
         self.model.eval()
 
-        # Step 1: Run Honest 3-Mode OOD Collapse & Instruction-Following Audit
-        audit_summary = self.run_collapse_and_ablation_audit()
+        # Step 1: Run Honest 3-Mode OOD Collapse & Instruction-Following Audit (or reuse 72L Full mode)
+        if run_ablation_first:
+            audit_summary = self.run_collapse_and_ablation_audit()
+        else:
+            self.model.set_loop(start=4, end=28, passes=2, use_mhc=True, use_engram=True, enable_p3=True, p3_start=12, p3_end=24)
+            audit_summary = {'best_mode': '72L_Full_Loop_mHC_Engram', 'best_score': 11, 'modes': {}}
 
-        # Step 2: Use an UNSEEN out-of-distribution 3D WebGL prompt if the caller passed the training-set Sakura prompt
-        if 'sakura' in mission_prompt.lower() or 'cherry blossom' in mission_prompt.lower():
-            eval_webgl_prompt = (
-                'Build a complete, self-contained, single-file HTML5 + Three.js 3D Interactive Cyberpunk Neon '
-                'Synthwave City & Hovercar Flight Simulator (`<!DOCTYPE html>` ... `</html>`).\n'
-                'Strict Prompt-Following Requirements:\n'
-                '1. Set the document `<title>Neon Horizon 2099</title>` and load Three.js (`https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js`).\n'
-                '2. Render a procedural neon magenta/cyan wireframe synthwave grid floor, a glowing retro wireframe sun on the horizon, and at least 50 procedural skyscrapers with glowing emissive windows.\n'
-                '3. Animate flying hovercar traffic light-trails streaking along city highway lanes and a player hovercar that tilts and steers smoothly with mouse movement.\n'
-                '4. Include interactive HUD buttons with exact IDs `id="mode-neon"`, `id="mode-rain"`, and `id="mode-overdrive"` to switch lighting/weather/speed modes, plus a live speed readout.'
-            )
-            print('\n[OOD Prompt Upgrade] Replaced in-distribution Sakura prompt with UNSEEN "Neon Horizon 2099" Cyberpunk Hovercar Simulator prompt to test true prompt following.')
+        # Step 2: Select OOD Neon Horizon 2099 mission or caller-specified mission
+        if use_ood_mission is True or (use_ood_mission is None and ('sakura' in mission_prompt.lower() or 'cherry blossom' in mission_prompt.lower())):
+            eval_webgl_prompt = OOD_NEON_HORIZON_MISSION
+            if 'sakura' in mission_prompt.lower() or 'cherry blossom' in mission_prompt.lower():
+                print('\n[OOD Prompt Upgrade] Replaced in-distribution Sakura prompt with UNSEEN "Neon Horizon 2099" Cyberpunk Hovercar Simulator prompt to test true prompt following.')
         else:
             eval_webgl_prompt = mission_prompt
 
