@@ -1240,6 +1240,9 @@ class ZipfianTieredMoEEngram(nn.Module):
 
             scores = torch.sigmoid(router_logits)
             sel_scores = scores + self.expert_bias[:e_act]
+            dom_bias = getattr(self, '_domain_zone_bias', None)
+            if dom_bias is not None and dom_bias.numel() >= e_act:
+                sel_scores = sel_scores + dom_bias[:e_act].to(device=sel_scores.device, dtype=sel_scores.dtype)
             _, topk_idx = torch.topk(sel_scores, k=k_act, dim=-1)
             topk_raw = torch.gather(scores, dim=-1, index=topk_idx)
 
@@ -1919,6 +1922,56 @@ class SparkXLoopV03(nn.Module):
             'updated_tensors': updated_tensors,
             'swap_latency_ms': round(elapsed_ms, 2),
         }
+
+    @torch.no_grad()
+    def set_domain_engram_focus(
+        self,
+        domain: str = 'general',
+        boost: float = 0.08,
+    ) -> dict[str, Any]:
+        """Partition the 32 routed experts per anchor into Domain Knowledge Engram Zones for SI-SRSI & specialized inference:
+          - 'stem_reason' : Experts [0..11]  + Bridge [30..31] (14 specialists/anchor = 112 across 8 anchors)
+          - 'web_ux_sec'  : Experts [12..21] + Bridge [30..31] (12 specialists/anchor =  96 across 8 anchors)
+          - 'anti_slop'   : Experts [22..29] + Bridge [30..31] (10 specialists/anchor =  80 across 8 anchors)
+          - 'general'     : Uniform zero bias across all 32 experts
+        """
+        dom = str(domain).lower().strip()
+        zones = {
+            'stem_reason': list(range(0, 12)) + [30, 31],
+            'web_ux_sec':  list(range(12, 22)) + [30, 31],
+            'anti_slop':   list(range(22, 30)) + [30, 31],
+        }
+        selected_indices = zones.get(dom, [])
+        for mod in self.all_engram_modules():
+            if not selected_indices or boost <= 0.0:
+                mod._domain_zone_bias = None
+            else:
+                vec = torch.zeros(mod.num_experts, dtype=torch.float32, device=mod.expert_bias.device)
+                for idx in selected_indices:
+                    if idx < mod.num_experts:
+                        vec[idx] = float(boost)
+                # Zero-mean center so average selection threshold stays invariant
+                vec = vec - vec.mean()
+                mod._domain_zone_bias = vec
+        return {
+            'domain_focus': dom if selected_indices else 'general',
+            'boost': round(float(boost) if selected_indices else 0.0, 4),
+            'zone_experts': selected_indices,
+        }
+
+    @torch.no_grad()
+    def auto_detect_and_focus_domain(self, prompt_text: str, boost: float = 0.08) -> dict[str, Any]:
+        """Automatically detect prompt domain (`anti_slop`, `web_ux_sec`, `stem_reason`, or `general`) and focus the Engram router."""
+        low = str(prompt_text).lower()
+        if any(k in low for k in ('html', 'css', 'react', 'ux', 'wcag', 'aria-', 'frontend', 'backend', 'endpoint', 'csrf', 'xss', 'csp', 'sql', 'api', 'tailwind', 'three.js', 'webgl')):
+            dom = 'web_ux_sec'
+        elif any(k in low for k in ('essay', 'report', 'prose', 'composition', 'editorial', 'article', 'memo', 'rewrite', 'human', 'anti-slop', 'tone', 'narrative')):
+            dom = 'anti_slop'
+        elif any(k in low for k in ('prove', 'derive', 'theorem', 'hamiltonian', 'quantum', 'eigenvalue', 'integral', 'equation', 'matrix', 'dijkstra', 'algorithm', 'complexity', 'boxed', 'olympiad', 'molecule', 'thermodynamic')):
+            dom = 'stem_reason'
+        else:
+            dom = 'general'
+        return self.set_domain_engram_focus(domain=dom, boost=boost)
 
     def total_router_z_loss(self) -> torch.Tensor:
         losses = []

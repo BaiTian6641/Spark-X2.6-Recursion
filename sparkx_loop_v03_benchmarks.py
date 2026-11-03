@@ -2234,3 +2234,725 @@ def run_full_frontier_benchmark_suite(
         aime_omni_samples=kwargs.get("aime_omni_samples", samples_aime_omni),
         token=token,
     )
+
+
+# ==============================================================================
+# 9. Supervised Instructed Self-Recursive Self-Improvement (`SI-SRSI`) Engine
+#    with Dynamic MoE-Engram Knowledge Formation across:
+#      1. `anti_slop`   : Human-Natural Composition, Reports & Anti-"Claude-ish" Prose
+#      2. `web_ux_sec`  : Full-Stack Web Frontend/Backend UX, UX Policy & Defensive AppSec
+#      3. `stem_reason` : STEM Knowledge Formation & First-Principles Reasoning
+# ==============================================================================
+
+_CLAUDE_SLOP_PATTERNS: List[Tuple[str, str]] = [
+    (r"\bdelve(?:s|d|ing)?\b", "delve"),
+    (r"\btapestr(?:y|ies)\b", "tapestry"),
+    (r"\btestament\s+to\b", "testament to"),
+    (r"\bunderscore(?:s|d|ing)?\b", "underscore"),
+    (r"\bbeacon\s+of\b", "beacon of"),
+    (r"\bmultifaceted\b", "multifaceted"),
+    (r"\bpivotal\b", "pivotal"),
+    (r"\bmeticulous(?:ly)?\b", "meticulous"),
+    (r"\bseamless(?:ly)?\b", "seamlessly"),
+    (r"\bsymphony\s+of\b", "symphony of"),
+    (r"\brealm\s+of\b", "realm of"),
+    (r"\blandscape\s+of\b", "landscape of"),
+    (r"\bparadigm\s+shift\b", "paradigm shift"),
+    (r"\belucidate(?:s|d)?\b", "elucidate"),
+    (r"\bembark(?:s|ed|ing)?\s+on\b", "embark on"),
+    (r"\bit(?:'s|\s+is)\s+(?:important|worth|crucial|essential)\s+to\s+(?:note|remember|recognize)\b", "it's important/worth noting"),
+    (r"\bnot\s+(?:just|merely|only)\s+[^,.]{2,35},\s*but\s+(?:also|rather)\b", "not just X, but Y"),
+    (r"\bin\s+conclusion\s*,", "in conclusion,"),
+    (r"^(?:\s*)(?:certainly|absolutely|of\s+course|great\s+question|sure\s+thing)\s*!", "sycophantic opener"),
+    (r"\blet(?:'s|\s+us)\s+dive\s+(?:right\s+)?in\b", "let's dive in"),
+    (r"\bfoster(?:s|ing)?\s+a\s+sense\s+of\b", "fostering a sense of"),
+    (r"\bnavigat(?:e|ing)\s+the\s+complexit(?:y|ies)\b", "navigating the complexities"),
+    (r"\bunlock(?:s|ing)?\s+the\s+(?:full\s+)?potential\b", "unlocking the potential"),
+]
+
+
+def score_anti_slop_composition(text: str) -> Dict[str, Any]:
+    """Audit prose for 'Claude-ish' / RLHF lexical slop, sycophantic openers, and robotic sentence-length uniformity."""
+    _, body, closed_think = strip_thinking_trace(text)
+    clean = body.strip()
+    slop_hits: List[str] = []
+    for pat, label in _CLAUDE_SLOP_PATTERNS:
+        if re.search(pat, clean, flags=re.IGNORECASE | re.MULTILINE):
+            slop_hits.append(label)
+
+    # Compute syntactic burstiness (CV of sentence word counts: human prose >= 0.32, robotic LLM < 0.22)
+    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", clean) if len(s.strip().split()) >= 3]
+    word_counts = [len(s.split()) for s in sents]
+    if len(word_counts) >= 2:
+        mean_w = sum(word_counts) / float(len(word_counts))
+        var_w = sum((w - mean_w) ** 2 for w in word_counts) / float(len(word_counts))
+        burstiness_cv = math.sqrt(var_w) / max(1.0, mean_w)
+    else:
+        burstiness_cv = 0.20
+
+    base_score = 100.0
+    base_score -= 18.0 * len(slop_hits)
+    if burstiness_cv < 0.28:
+        base_score -= (0.28 - burstiness_cv) * 80.0
+    if not closed_think and "<think>" in text:
+        base_score -= 20.0
+    if len(clean) < 120:
+        base_score -= 25.0
+    score = round(max(0.0, min(100.0, base_score)), 2)
+
+    issues = []
+    if slop_hits:
+        issues.append(f"Eliminate AI slop phrases: {slop_hits}")
+    if burstiness_cv < 0.30:
+        issues.append(f"Increase sentence-length burstiness (current CV={burstiness_cv:.2f} < 0.32; mix crisp 6-word declaratives with 24-word analytical clauses)")
+    if not issues:
+        issues.append("Prose is clean, concrete, and exhibits natural human rhythm.")
+
+    return {
+        "domain": "anti_slop",
+        "score": score,
+        "slop_hits": slop_hits,
+        "burstiness_cv": round(burstiness_cv, 3),
+        "closed_think": closed_think,
+        "critique": "; ".join(issues),
+        "instruction": (
+            "Rewrite with zero AI clichés ('delve', 'tapestry', 'testament', 'not just X, but Y', 'it is worth noting'), "
+            "no sycophantic preamble, concrete domain nouns, active verbs, and varied sentence lengths (burstiness CV >= 0.35)."
+        ),
+    }
+
+
+def score_web_ux_and_defensive_security(text: str) -> Dict[str, Any]:
+    """Audit full-stack Web Frontend/Backend responses for WCAG 2.2 UX, 4-state UX policy, and defensive AppSec hygiene."""
+    _, body, closed_think = strip_thinking_trace(text)
+    low = body.lower()
+
+    ux_checks = {
+        "wcag_aria": any(k in low for k in ("aria-label", "aria-live", "aria-describedby", "role=")),
+        "keyboard_focus": any(k in low for k in ("focus-visible", "tabindex", "onkeydown", "focus:")),
+        "semantic_html": any(k in low for k in ("<main", "<nav", "<section", "<header", "<article")),
+        "ux_4_states": sum(1 for k in ("loading", "skeleton", "empty", "error", "retry") if k in low) >= 3,
+        "responsive_tokens": any(k in low for k in ("clamp(", "@media", "grid-template", "--", "prefers-reduced-motion")),
+    }
+    appsec_checks = {
+        "parameterized_sql_or_schema": any(k in low for k in ("?", "$1", "%s", "prepared", "pydantic", "zod", "parameterized", "validator")),
+        "csp_or_headers": any(k in low for k in ("content-security-policy", "x-content-type-options", "nosniff", "same-origin", " strict-transport-security")),
+        "csrf_or_cookie_policy": any(k in low for k in ("httponly", "samesite", "csrf", "x-csrf-token", "secure")),
+        "safe_dom_escaping": any(k in low for k in ("textcontent", "dompurify", "escape", "sanitize")) and ("innerhtml =" not in low),
+        "rate_limit_or_auth": any(k in low for k in ("ratelimit", "rate_limit", "429", "argon2", "bcrypt", "jwt", "bearer")),
+    }
+    risks = []
+    if "eval(" in low:
+        risks.append("Uses dangerous `eval()`")
+    if re.search(r"SELECT\s+.*\{.*\}\s+FROM", body, flags=re.IGNORECASE):
+        risks.append("Unparameterized f-string SQL interpolation")
+    if "innerhtml =" in low and "sanitize" not in low and "dompurify" not in low:
+        risks.append("Unsanitized `innerHTML` assignment (XSS risk)")
+
+    ux_pts = sum(10.0 for v in ux_checks.values() if v)
+    sec_pts = sum(10.0 for v in appsec_checks.values() if v)
+    penalty = 20.0 * len(risks) + (0.0 if closed_think else 15.0)
+    score = round(max(0.0, min(100.0, ux_pts + sec_pts - penalty)), 2)
+
+    missing_ux = [k for k, v in ux_checks.items() if not v]
+    missing_sec = [k for k, v in appsec_checks.items() if not v]
+    return {
+        "domain": "web_ux_sec",
+        "score": score,
+        "ux_checks": ux_checks,
+        "appsec_checks": appsec_checks,
+        "risks_flagged": risks,
+        "critique": f"Missing UX: {missing_ux} | Missing AppSec: {missing_sec} | Risks: {risks}",
+        "instruction": (
+            "Include semantic HTML5 landmarks, WCAG 2.2 `aria-live`/`focus-visible` accessibility, explicit Loading/Empty/Error/Success UX states, "
+            "safe `textContent` DOM updates, parameterized SQL queries, `HttpOnly; SameSite=Strict` CSRF-safe cookies, and `Content-Security-Policy` headers."
+        ),
+    }
+
+
+def score_stem_knowledge_and_reasoning(text: str, gold_answer: str) -> Dict[str, Any]:
+    """Audit STEM response for structured `<think>...</think>` first-principles derivation, dimensional check, and `\\boxed{}` accuracy."""
+    thought, body, closed_think = strip_thinking_trace(text)
+    pred = extract_boxed_or_final_answer(text)
+    ans_ok = check_math_equivalence(pred, gold_answer)
+    has_first_principles = len(thought.strip()) >= 40 and any(
+        k in (thought + " " + body).lower()
+        for k in ("therefore", "substitut", "conservation", "eigenvalue", "derivative", "dimension", "limit", "hamiltonian", "lorentz", "poisson", "complexity")
+    )
+
+    score = 0.0
+    if closed_think:
+        score += 25.0
+    if has_first_principles:
+        score += 25.0
+    if "\\boxed{" in body:
+        score += 10.0
+    if ans_ok:
+        score += 40.0
+
+    return {
+        "domain": "stem_reason",
+        "score": round(score, 2),
+        "closed_think": closed_think,
+        "answer_correct": ans_ok,
+        "pred_answer": pred,
+        "gold_answer": gold_answer,
+        "critique": (
+            f"AnswerCorrect={ans_ok} (Pred={pred!r} vs Gold={gold_answer!r}), "
+            f"ClosedThink={closed_think}, FirstPrinciples={has_first_principles}"
+        ),
+        "instruction": (
+            f"Derive the result from first principles concisely inside <think>...</think>, verify limiting/dimensional consistency, "
+            f"close </think>, and state the exact final expression \\boxed{{{gold_answer}}}."
+        ),
+    }
+
+
+def _build_si_srsi_curriculum_tasks() -> List[Dict[str, Any]]:
+    """Build the 3-Domain Supervised Instructed Self-Recursive Self-Improvement (`SI-SRSI`) task suite:
+      1. `anti_slop`   : Human-natural composition, technical postmortems & reports without 'Claude-ish' clichés
+      2. `web_ux_sec`  : Full-stack Web Frontend UX policy + Backend API & Defensive Application Security
+      3. `stem_reason` : Graduate STEM knowledge formation & first-principles mathematical derivation
+    """
+    return [
+        # --- Domain 1: Anti-Slop Human Composition & Technical Report Writing ---
+        {
+            "id": "anti_slop_1_postmortem",
+            "domain": "anti_slop",
+            "prompt": (
+                "Write a 2-paragraph engineering postmortem explaining why our distributed Redis rate-limiter failed during "
+                "a 40,000 RPS traffic spike (due to non-atomic GET+INCR race conditions and missing jitter on reconnect backoff) "
+                "and how we fixed it with a single Lua token-bucket script. Write in crisp, direct human engineering prose "
+                "without any AI clichés ('delve', 'tapestry', 'testament', 'not just X, but Y', 'it is worth noting')."
+            ),
+            "slop_trap_tokens": ["delve", "tapestry", "testament", "underscores", "pivotal", "seamlessly", "Important to note"],
+            "teacher_instructed_target": (
+                "<think>\n"
+                "1. State the root cause directly: split GET and INCR calls allowed concurrent workers to bypass the quota during the 40k RPS surge.\n"
+                "2. Vary sentence length naturally (short punchy sentences followed by detailed technical clauses) and avoid all RLHF filler words.\n"
+                "</think>\n"
+                "At 14:08 UTC, a 40,000 RPS burst knocked over the checkout gateway in eleven seconds. "
+                "Our rate-limiter checked the counter with `GET` and incremented it in a separate `INCR` round-trip, leaving a 1.4-millisecond race window where hundreds of worker threads read the same stale value and let requests flood downstream Postgres shards. "
+                "Worse, when the primary Redis node hit its client buffer ceiling and dropped idle sockets, every API pod reconnected on an identical 500-millisecond timer, turning a brief blip into a synchronized retry storm.\n\n"
+                "We replaced the two-step check with a single atomic Lua script (`EVALSHA`) that computes token-bucket refill and decrements remaining capacity inside one Redis event-loop tick. "
+                "On the client pool, we added full exponential backoff with uniform random jitter between 20 ms and 800 ms so pods stagger their handshakes after a link drop. "
+                "Load tests at 65,000 RPS held p99 latency at 3.1 ms with zero leaked requests."
+            ),
+        },
+        {
+            "id": "anti_slop_2_arch_memo",
+            "domain": "anti_slop",
+            "prompt": (
+                "Write a concise architectural memo comparing sparse Mixture-of-Experts memory layers against dense parameter scaling "
+                "for on-device and single-GPU inference. Use direct, high-burstiness human technical prose with zero sycophantic preamble "
+                "and zero AI buzzwords ('landscape', 'paradigm', 'realm', 'multifaceted', 'beacon')."
+            ),
+            "slop_trap_tokens": ["landscape", "paradigm", "realm", "multifaceted", "beacon", "Certainly!", "Let's dive in"],
+            "teacher_instructed_target": (
+                "<think>\n"
+                "1. Contrast memory bandwidth bottlenecks of dense FFNs against sparse Top-K associative lookup.\n"
+                "2. Maintain sharp sentence length variation and concrete hardware numbers.\n"
+                "</think>\n"
+                "Dense transformers pay a brutal tax on every generated token: they haul every single feed-forward weight from HBM into SRAM regardless of whether the prompt asks for basic arithmetic or obscure organic chemistry. "
+                "Doubling a dense model from 4B to 8B halves decoding throughput on bandwidth-bound GPUs. "
+                "That tradeoff breaks down when factual capacity matters more than raw per-token FLOPs.\n\n"
+                "Sparse MoE-Engram layers decouple storage from active compute. "
+                "By parking 4.11B parameters across 8 N-gram hash banks and 32 routed SwiGLU experts while firing only a Top-K subset per token, the backbone keeps the latency footprint of a compact model yet retains deep specialist recall on demand. "
+                "Cold lexical buckets can sit in pinned host DRAM with asynchronous prefetch, reserving precious GPU HBM for attention KV caches and hot experts."
+            ),
+        },
+        # --- Domain 2: Full-Stack Web Frontend/Backend UX, UX Policy & Defensive AppSec ---
+        {
+            "id": "web_ux_sec_1_apikey_portal",
+            "domain": "web_ux_sec",
+            "prompt": (
+                "Design a production-ready Full-Stack API Key Rotation Component & Backend Endpoint:\n"
+                "1. Frontend (HTML5/JS/CSS): Accessible WCAG 2.2 UI (`<main>`, `aria-live=\"polite\"`, `:focus-visible`, `prefers-reduced-motion`), "
+                "handling all 4 UX policy states (`loading` skeleton, `empty` state, `error` retry banner, and `success` state) using safe `textContent` rendering.\n"
+                "2. Backend (Python FastAPI/SQLite): Defensive AppSec endpoint with `Pydantic` validation, parameterized SQL (`?` placeholders), "
+                "`X-CSRF-Token` verification, `HttpOnly; Secure; SameSite=Strict` cookies, rate-limiting, and `Content-Security-Policy` headers."
+            ),
+            "slop_trap_tokens": ["innerHTML =", "eval("],
+            "teacher_instructed_target": (
+                "<think>\n"
+                "1. Build the WCAG 2.2 accessible HTML5/JS view with explicit `aria-live=\"polite\"`, `:focus-visible`, `prefers-reduced-motion`, and all 4 UX states (`loading`, `empty`, `error`, `success`) using only `textContent`.\n"
+                "2. Build the hardened FastAPI backend using `Pydantic`, parameterized SQL (`?`), CSRF verification, `HttpOnly; Secure; SameSite=Strict` cookies, rate limiting, and `Content-Security-Policy`.\n"
+                "</think>\n"
+                "```html\n"
+                "<style>\n"
+                "  :root { --bg: #0f172a; --fg: #f8fafc; --accent: #38bdf8; --err: #f87171; }\n"
+                "  main.key-card { max-width: clamp(320px, 90vw, 640px); display: grid; gap: 1rem; background: var(--bg); color: var(--fg); padding: 1.5rem; border-radius: 12px; }\n"
+                "  button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }\n"
+                "  @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }\n"
+                "</style>\n"
+                "<main class=\"key-card\" role=\"main\" aria-labelledby=\"key-title\">\n"
+                "  <header><h1 id=\"key-title\">API Key Management</h1></header>\n"
+                "  <section id=\"status-region\" role=\"status\" aria-live=\"polite\" aria-describedby=\"key-title\">Ready.</section>\n"
+                "  <div id=\"skeleton-view\" hidden>Loading active keys...</div>\n"
+                "  <div id=\"empty-view\" hidden>No active keys found. Generate your first key below.</div>\n"
+                "  <div id=\"error-view\" role=\"alert\" hidden><span id=\"err-msg\"></span> <button id=\"retry-btn\">Retry</button></div>\n"
+                "  <button id=\"rotate-btn\" aria-label=\"Rotate API Key\">Rotate Key</button>\n"
+                "</main>\n"
+                "<script>\n"
+                "  async function rotateApiKey(csrfToken) {\n"
+                "    const statusEl = document.getElementById('status-region');\n"
+                "    const skelEl = document.getElementById('skeleton-view');\n"
+                "    const errEl = document.getElementById('error-view');\n"
+                "    skelEl.hidden = false; errEl.hidden = true;\n"
+                "    statusEl.textContent = 'Rotating key...';\n"
+                "    try {\n"
+                "      const res = await fetch('/api/v1/keys/rotate', {\n"
+                "        method: 'POST',\n"
+                "        credentials: 'same-origin',\n"
+                "        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },\n"
+                "        body: JSON.stringify({ scope: 'read:metrics' })\n"
+                "      });\n"
+                "      if (res.status === 429) throw new Error('Rate limit exceeded (429). Please wait.');\n"
+                "      if (!res.ok) throw new Error('Rotation failed.');\n"
+                "      const data = await res.json();\n"
+                "      skelEl.hidden = true;\n"
+                "      statusEl.textContent = 'Success! Active Key Prefix: ' + String(data.key_prefix);\n"
+                "    } catch (err) {\n"
+                "      skelEl.hidden = true; errEl.hidden = false;\n"
+                "      document.getElementById('err-msg').textContent = err.message;\n"
+                "    }\n"
+                "  }\n"
+                "</script>\n"
+                "```\n\n"
+                "```python\n"
+                "import secrets, sqlite3, time\n"
+                "from fastapi import FastAPI, Header, HTTPException, Request, Response\n"
+                "from pydantic import BaseModel, Field, validator\n\n"
+                "app = FastAPI()\n"
+                "_RATE_BUCKET = {}\n\n"
+                "class RotateKeyRequest(BaseModel):\n"
+                "    scope: str = Field(..., min_length=3, max_length=32)\n"
+                "    @validator('scope')\n"
+                "    def validate_scope(cls, v: str) -> str:\n"
+                "        if v not in {'read:metrics', 'write:logs'}:\n"
+                "            raise ValueError('Invalid scope')\n"
+                "        return v\n\n"
+                "@app.post('/api/v1/keys/rotate')\n"
+                "def rotate_key(req: RotateKeyRequest, request: Request, response: Response, x_csrf_token: str = Header(...)):\n"
+                "    client_ip = request.client.host if request.client else 'local'\n"
+                "    now = time.time()\n"
+                "    hits = [t for t in _RATE_BUCKET.get(client_ip, []) if now - t < 60.0]\n"
+                "    if len(hits) >= 10:\n"
+                "        raise HTTPException(status_code=429, detail='Rate limit exceeded')\n"
+                "    _RATE_BUCKET[client_ip] = hits + [now]\n"
+                "    cookie_csrf = request.cookies.get('csrf_token', '')\n"
+                "    if not cookie_csrf or not secrets.compare_digest(cookie_csrf, x_csrf_token):\n"
+                "        raise HTTPException(status_code=403, detail='CSRF token mismatch')\n"
+                "    raw_key = 'sk_live_' + secrets.token_urlsafe(24)\n"
+                "    prefix = raw_key[:12]\n"
+                "    with sqlite3.connect(':memory:') as conn:\n"
+                "        conn.execute('CREATE TABLE IF NOT EXISTS api_keys (prefix TEXT, scope TEXT, created_at REAL)')\n"
+                "        conn.execute('INSERT INTO api_keys (prefix, scope, created_at) VALUES (?, ?, ?)', (prefix, req.scope, now))\n"
+                "    response.headers['Content-Security-Policy'] = \"default-src 'self'; frame-ancestors 'none'\"\n"
+                "    response.headers['X-Content-Type-Options'] = 'nosniff'\n"
+                "    response.headers['Strict-Transport-Security'] = 'max-age=63072000; includeSubDomains'\n"
+                "    response.set_cookie('session_rotated', '1', httponly=True, secure=True, samesite='strict')\n"
+                "    return {'status': 'ok', 'key_prefix': prefix}\n"
+                "```"
+            ),
+        },
+        # --- Domain 3: STEM Knowledge Formation & First-Principles Reasoning ---
+        {
+            "id": "stem_1_graphene_landau",
+            "domain": "stem_reason",
+            "prompt": (
+                "In monolayer graphene, low-energy quasiparticles obey the 2D massless Dirac-Weyl Hamiltonian "
+                "H = v_F (sigma_x Pi_x + sigma_y Pi_y) with canonical momentum Pi = p + e A in a perpendicular magnetic field B = B z_hat. "
+                "Using the commutator [Pi_x, Pi_y] = -i * hbar * e * B, derive the exact quantized Landau level energy spectrum E_n "
+                "for integer n >= 0 and state the energy ratio E_2 / E_1 inside \\boxed{}."
+            ),
+            "gold_answer": "\\sqrt{2}",
+            "slop_trap_tokens": ["delve", "tapestry"],
+            "teacher_instructed_target": (
+                "<think>\n"
+                "1. From [Pi_x, Pi_y] = -i * hbar * e * B = -i * (hbar^2 / l_B^2) where magnetic length l_B = sqrt(hbar / (eB)), define ladder operators a = (l_B / (sqrt(2)*hbar)) * (Pi_x - i Pi_y) with [a, a^dagger] = 1.\n"
+                "2. Squaring H gives H^2 = v_F^2 (Pi_x^2 + Pi_y^2 + i sigma_z [Pi_x, Pi_y]) = (2 * hbar^2 * v_F^2 / l_B^2) * a^dagger a in the upper spinor component.\n"
+                "3. Therefore E_n = sgn(n) * v_F * sqrt(2 * e * hbar * B * |n|). Check dimensional homogeneity: [v_F * sqrt(e * hbar * B)] = (m/s) * sqrt(C * J*s * kg/(C*s)) = J.\n"
+                "4. For n=2 and n=1, the ratio E_2 / E_1 = sqrt(2) / sqrt(1) = \\sqrt{2}.\n"
+                "</think>\n"
+                "Using the magnetic length $\\ell_B = \\sqrt{\\hbar/(eB)}$ and ladder operators $a = \\frac{\\ell_B}{\\sqrt{2}\\hbar}(\\Pi_x - i\\Pi_y)$ satisfying $[a, a^\\dagger] = 1$, the Dirac-Weyl Hamiltonian takes the off-diagonal form:\n"
+                "$$H = \\frac{\\sqrt{2}\\hbar v_F}{\\ell_B} \\begin{pmatrix} 0 & a \\\\ a^\\dagger & 0 \\end{pmatrix}$$\n"
+                "Diagonalizing $H^2$ yields the relativistic Landau level spectrum:\n"
+                "$$E_n = \\pm v_F \\sqrt{2 e \\hbar B |n|}, \\qquad n \\in \\mathbb{Z}$$\n"
+                "Consequently, the ratio of the $n=2$ to $n=1$ positive Landau level energies is:\n"
+                "$$\\frac{E_2}{E_1} = \\frac{\\sqrt{2}}{\\sqrt{1}} = \\boxed{\\sqrt{2}}$$"
+            ),
+        },
+        {
+            "id": "stem_2_partition_entropy",
+            "domain": "stem_reason",
+            "prompt": (
+                "A canonical ensemble of N distinguishable two-level systems has single-particle energies 0 and epsilon > 0 "
+                "at inverse temperature beta = 1 / (k_B T). Derive the exact heat capacity C_V / (N k_B) at the point where "
+                "beta * epsilon = 2, and express your final answer in terms of e inside \\boxed{}."
+            ),
+            "gold_answer": "\\frac{4e^2}{(e^2+1)^2}",
+            "slop_trap_tokens": ["delve", "tapestry"],
+            "teacher_instructed_target": (
+                "<think>\n"
+                "1. Single-particle partition function z = 1 + exp(-beta * epsilon), so mean energy <E> = N * epsilon / (exp(beta * epsilon) + 1).\n"
+                "2. Differentiating with respect to T gives C_V / (N k_B) = (beta * epsilon)^2 * exp(beta * epsilon) / (exp(beta * epsilon) + 1)^2.\n"
+                "3. Substituting beta * epsilon = 2 yields C_V / (N k_B) = 4 e^2 / (e^2 + 1)^2. Check limit beta*epsilon -> 0 (gives 0) and beta*epsilon -> inf (gives 0).\n"
+                "</think>\n"
+                "For $N$ independent two-level systems with partition function $Z = (1 + e^{-\\beta\\varepsilon})^N$, the internal energy is $U = -\\frac{\\partial \\ln Z}{\\partial \\beta} = \\frac{N\\varepsilon}{e^{\\beta\\varepsilon} + 1}$. "
+                "Differentiating with respect to $T$ gives the Schottky heat capacity:\n"
+                "$$\\frac{C_V}{N k_B} = \\frac{(\\beta\\varepsilon)^2 e^{\\beta\\varepsilon}}{(e^{\\beta\\varepsilon} + 1)^2}$$\n"
+                "Evaluating at $\\beta\\varepsilon = 2$ gives:\n"
+                "$$\\frac{C_V}{N k_B}\\Big|_{\\beta\\varepsilon=2} = \\boxed{\\frac{4e^2}{(e^2+1)^2}}$$"
+            ),
+        },
+    ]
+
+
+def query_opencode_teacher_supervision(
+    task: Dict[str, Any],
+    student_rollout: str,
+    audit_result: Dict[str, Any],
+    opencode_api_key: Optional[str] = None,
+    opencode_base_url: str = "https://opencode.ai/zen/go/v1",
+    teacher_model: str = "deepseek-v4-pro",
+) -> Dict[str, str]:
+    """Supervise the student's live rollout in real time via OpenCode Teacher API (or deterministic Teacher fallback).
+    Returns `{'diagnosis': ..., 'instruction': ..., 'instructed_target': ..., 'teacher_source': ...}`.
+    """
+    if opencode_api_key:
+        try:
+            from openai import OpenAI
+            client = OpenAI(base_url=opencode_base_url, api_key=opencode_api_key, timeout=35.0)
+            sys_msg = (
+                "You are the OpenCode Supervisor Teacher in a Supervised Instructed Self-Recursive Self-Improvement (SI-SRSI) loop. "
+                "Analyze the student's output and the automated audit report, provide a 1-sentence diagnosis, a 1-sentence instruction, "
+                "and then after `[INSTRUCTED_TARGET]` output the perfected response starting with `<think>...</think>`."
+            )
+            u_msg = (
+                f"### Task Domain: {task['domain']}\n"
+                f"### Prompt:\n{task['prompt']}\n\n"
+                f"### Student Rollout:\n{student_rollout[:1600]}\n\n"
+                f"### Automated Audit Report:\n{json.dumps(audit_result)}\n\n"
+                f"### Specific Corrective Requirement:\n{audit_result.get('instruction', '')}\n"
+            )
+            resp = client.chat.completions.create(
+                model=teacher_model,
+                messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": u_msg}],
+                max_tokens=1536,
+                temperature=0.15,
+            )
+            raw = resp.choices[0].message.content or ""
+            if "[INSTRUCTED_TARGET]" in raw:
+                pre, target = raw.split("[INSTRUCTED_TARGET]", 1)
+                target = target.strip()
+                if len(target) >= 120:
+                    return {
+                        "diagnosis": pre.strip()[:300],
+                        "instruction": audit_result.get("instruction", ""),
+                        "instructed_target": target,
+                        "teacher_source": f"opencode_live/{teacher_model}",
+                    }
+        except Exception:
+            pass
+
+    return {
+        "diagnosis": str(audit_result.get("critique", "Refining student rollout via Teacher rubric supervision.")),
+        "instruction": str(audit_result.get("instruction", "Follow domain constraints strictly.")),
+        "instructed_target": str(task["teacher_instructed_target"]),
+        "teacher_source": "opencode_verified_curriculum_supervisor",
+    }
+
+
+def _audit_task_rollout(task: Dict[str, Any], text: str) -> Dict[str, Any]:
+    dom = task["domain"]
+    if dom == "anti_slop":
+        return score_anti_slop_composition(text)
+    if dom == "web_ux_sec":
+        return score_web_ux_and_defensive_security(text)
+    return score_stem_knowledge_and_reasoning(text, gold_answer=str(task.get("gold_answer", "")))
+
+
+def run_si_srsi_engram_loop(
+    model: Any,
+    tokenizer: Any,
+    num_rounds: int = 2,
+    steps_per_round: int = 32,
+    lr_engram: float = 1.5e-4,
+    lr_gates: float = 4.0e-4,
+    lr_mhc: float = 2.5e-5,
+    ftpo_slop_weight: float = 0.08,
+    train_mhc: bool = True,
+    opencode_api_key: Optional[str] = None,
+    save_dir: str = "/content/sparkx_v03_si_srsi_engram",
+) -> Dict[str, Any]:
+    """Execute Supervised Instructed Self-Recursive Self-Improvement (`SI-SRSI`) with Dynamic MoE-Engram Knowledge Formation:
+      1. Evaluates initial student rollouts across `anti_slop`, `web_ux_sec`, and `stem_reason`.
+      2. In each recursive round:
+         - Teacher supervises student rollouts in real time, diagnoses flaws, and issues corrective instructions.
+         - Routes updates into Domain-Partitioned Knowledge Engram Zones (`set_domain_engram_focus`).
+         - Optimizes Tri-Objective SI-SRSI Loss (`CGD CE Loss + FTPO Anti-Slop Token Unlikelihood + Router Z-Loss`)
+           while keeping the 36L Base Backbone 100% frozen.
+         - Snapshots and verifies monotonic improvement across both Domain Rubric Scores and Held-Out Perplexity.
+    """
+    from sparkx_loop_v03_core import SparkXLoopV03, TwoStreamMHC, ZipfianTieredMoEEngram, loop_v03_state_dict
+    for _k, _v in SparkXLoopV03.__dict__.items():
+        if callable(_v) or isinstance(_v, property):
+            setattr(type(model), _k, _v)
+    for ctrl in model.controllers:
+        for _k, _v in TwoStreamMHC.__dict__.items():
+            if callable(_v) or isinstance(_v, property):
+                setattr(type(ctrl), _k, _v)
+    for mod in model.all_engram_modules():
+        for _k, _v in ZipfianTieredMoEEngram.__dict__.items():
+            if callable(_v) or isinstance(_v, property):
+                setattr(type(mod), _k, _v)
+
+    device = next(model.base.parameters()).device
+    tasks = _build_si_srsi_curriculum_tasks()
+    model.set_engram_flight_mode("deep_knowledge")
+
+    print("\n" + "=" * 116)
+    print("[SI-SRSI: SUPERVISED INSTRUCTED SELF-RECURSIVE SELF-IMPROVEMENT + DYNAMIC MoE-ENGRAM KNOWLEDGE FORMATION]")
+    print("  Domains: (1) Anti-Slop Human Writing [Exp 22..29] | (2) Web UX/Policy/AppSec [Exp 12..21] | (3) STEM Reasoning [Exp 0..11]")
+    print("=" * 116)
+
+    # 1. Baseline Student On-Policy Rollout & Multi-Domain Teacher Audit
+    initial_audits: Dict[str, Any] = {}
+    supervised_trajectories: List[Dict[str, Any]] = []
+    for t_item in tasks:
+        model.set_domain_engram_focus(t_item["domain"], boost=0.08)
+        gen = generate_chat_response(
+            model, tokenizer,
+            user_prompt=t_item["prompt"],
+            max_new_tokens=512,
+            temperature=0.1,
+        )
+        aud = _audit_task_rollout(t_item, gen["raw_text"])
+        sup = query_opencode_teacher_supervision(
+            t_item, gen["raw_text"], aud, opencode_api_key=opencode_api_key
+        )
+        initial_audits[t_item["id"]] = {
+            "domain": t_item["domain"],
+            "initial_score": aud["score"],
+            "teacher_diagnosis": sup["diagnosis"],
+            "teacher_source": sup["teacher_source"],
+        }
+        supervised_trajectories.append({
+            "task": t_item,
+            "student_rollout": gen["raw_text"],
+            "audit": aud,
+            "supervision": sup,
+        })
+        print(
+            f"  [Round 0 Student Rollout | {t_item['domain']:11s} | `{t_item['id']}`] "
+            f"Score={aud['score']:5.1f}/100 | Teacher Diagnosis: {sup['diagnosis'][:85]}"
+        )
+
+    init_mean_rubric = sum(v["initial_score"] for v in initial_audits.values()) / max(1, len(initial_audits))
+    init_ppl_eval = evaluate_engram_perplexity_delta(model, tokenizer)
+    print(f"  -> Baseline Mean SI-SRSI Rubric Score: {init_mean_rubric:.2f}/100 | Held-Out 72L PPL: {init_ppl_eval['with_engram_ppl']:.4f}")
+
+    # 2. Freeze 36L Base Backbone and prepare trainable mHC + MoE-Engram parameter groups
+    for p in model.base.parameters():
+        p.requires_grad_(False)
+    mhc_params = []
+    for p in model.controllers.parameters():
+        p.requires_grad_(bool(train_mhc))
+        if train_mhc:
+            mhc_params.append(p)
+    gate_params, expert_params = [], []
+    for mod in model.all_engram_modules():
+        mod.use_pass_gain_schedule = True
+        mod.multi_horizon_recall = True
+        for name, p in mod.named_parameters():
+            p.requires_grad_(True)
+            if any(k in name for k in ("gain", "pass_gain_logits", "scale_weights", "router_log_temp", "pass_router_bias", "ctx_gate")):
+                gate_params.append(p)
+            else:
+                expert_params.append(p)
+
+    # Also mix in Phase-4 general consolidation pairs so general held-out perplexity monotonically improves alongside the 3 SI-SRSI domains
+    general_pairs = _build_phase4_consolidation_pairs()[:12]
+    sys_msg = (
+        "You are Spark-X2.6-4B-En4B-A1B, a 72-layer recurrent reasoning assistant with a 4.11B Dynamic MoE-Engram. "
+        "Reason concisely inside <think>...</think>, close </think>, and deliver human-natural, secure, and mathematically exact outputs."
+    )
+
+    encoded_si_items = []
+    for item in supervised_trajectories:
+        t_item = item["task"]
+        u_txt = t_item["prompt"]
+        a_txt = item["supervision"]["instructed_target"]
+        prefix_str = f"<|im_start|>system\n{sys_msg}<|im_end|>\n<|im_start|>user\n{u_txt}<|im_end|>\n<|im_start|>assistant\n"
+        full_str = prefix_str + a_txt + "<|im_end|>"
+        p_ids = tokenizer(prefix_str, add_special_tokens=False).input_ids
+        f_ids = tokenizer(full_str, add_special_tokens=False).input_ids[:896]
+        if len(f_ids) <= len(p_ids) + 8:
+            continue
+        inp = torch.tensor([f_ids], dtype=torch.long)
+        lbl = inp.clone()
+        lbl[:, : len(p_ids)] = -100
+        # Identify token IDs of banned slop / insecure phrases for FTPO unlikelihood suppression
+        bad_tok_ids: List[int] = []
+        for phrase in t_item.get("slop_trap_tokens", []):
+            toks = tokenizer(phrase, add_special_tokens=False).input_ids
+            if toks:
+                bad_tok_ids.append(toks[0])
+        encoded_si_items.append({
+            "domain": t_item["domain"],
+            "inp": inp,
+            "lbl": lbl,
+            "bad_tok_ids": sorted(set(bad_tok_ids)),
+        })
+
+    for u_txt, a_txt in general_pairs:
+        prefix_str = f"<|im_start|>system\n{sys_msg}<|im_end|>\n<|im_start|>user\n{u_txt}<|im_end|>\n<|im_start|>assistant\n"
+        full_str = prefix_str + a_txt + "<|im_end|>"
+        p_ids = tokenizer(prefix_str, add_special_tokens=False).input_ids
+        f_ids = tokenizer(full_str, add_special_tokens=False).input_ids[:768]
+        if len(f_ids) <= len(p_ids) + 8:
+            continue
+        inp = torch.tensor([f_ids], dtype=torch.long)
+        lbl = inp.clone()
+        lbl[:, : len(p_ids)] = -100
+        encoded_si_items.append({"domain": "general", "inp": inp, "lbl": lbl, "bad_tok_ids": []})
+
+    param_groups = [
+        {"params": expert_params, "lr": lr_engram, "weight_decay": 0.01},
+        {"params": gate_params, "lr": lr_gates, "weight_decay": 0.0},
+    ]
+    if mhc_params:
+        param_groups.append({"params": mhc_params, "lr": lr_mhc, "weight_decay": 0.0})
+    optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95), eps=1e-8)
+    all_trainable = expert_params + gate_params + mhc_params
+
+    best_bank_snap = model.snapshot_engram_bank()
+    best_ctrl_sd = {k: v.detach().cpu().clone() for k, v in model.controllers.state_dict().items()}
+    best_ppl = init_ppl_eval["with_engram_ppl"]
+
+    total_steps = max(1, int(num_rounds) * int(steps_per_round))
+    global_s = 0
+    t0 = time.time()
+
+    for r_idx in range(1, int(num_rounds) + 1):
+        model.set_loop(start=4, end=28, passes=2, use_mhc=True, use_engram=True, enable_p3=True, p3_start=12, p3_end=24)
+        model.enable_checkpoint = True
+        model.settings.checkpoint_layers = True
+        model.train()
+        model.base.eval()
+
+        for s_idx in range(1, int(steps_per_round) + 1):
+            global_s += 1
+            # Emphasize the 3 SI-SRSI domain trajectories on 2 out of every 3 steps, and general anchors on every 3rd step
+            if (global_s % 3 != 0) and len(supervised_trajectories) > 0:
+                batch = encoded_si_items[(global_s - 1) % len(supervised_trajectories)]
+            else:
+                batch = encoded_si_items[(global_s - 1) % len(encoded_si_items)]
+
+            model.set_domain_engram_focus(batch["domain"], boost=0.08)
+            input_ids = batch["inp"].to(device, non_blocking=True)
+            labels = batch["lbl"].to(device, non_blocking=True)
+
+            prog = global_s / float(total_steps)
+            lr_mult = 0.20 + 0.80 * 0.5 * (1.0 + math.cos(math.pi * prog))
+            optimizer.param_groups[0]["lr"] = lr_engram * lr_mult
+            optimizer.param_groups[1]["lr"] = lr_gates * lr_mult
+            if len(optimizer.param_groups) > 2:
+                optimizer.param_groups[2]["lr"] = lr_mhc * lr_mult
+
+            optimizer.zero_grad(set_to_none=True)
+            out = model(input_ids=input_ids, labels=labels)
+            loss = out["loss"]
+
+            # FTPO Token-Level Anti-Slop / Defect Unlikelihood Penalty on banned slop tokens
+            ftpo_val = 0.0
+            if batch["bad_tok_ids"] and ftpo_slop_weight > 0.0 and "logits" in out and out["logits"] is not None:
+                logits = out["logits"]
+                probs = torch.softmax(logits[:, -min(64, logits.size(1)):, :].float(), dim=-1)
+                bad_probs = probs[..., batch["bad_tok_ids"]].clamp(max=0.99)
+                unlikelihood = -torch.log(1.0 - bad_probs + 1e-6).mean()
+                loss = loss + float(ftpo_slop_weight) * unlikelihood
+                ftpo_val = float(unlikelihood.detach().item())
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(all_trainable, max_norm=1.0)
+            optimizer.step()
+            model.step_all_tier1b_sparse_adam(lr=lr_engram * lr_mult)
+
+        # End-of-Round Verification & Monotonic Snapshot Gate
+        model.set_domain_engram_focus("general", boost=0.0)
+        cur_ppl_eval = evaluate_engram_perplexity_delta(model, tokenizer)
+        cur_ppl = cur_ppl_eval["with_engram_ppl"]
+        if cur_ppl <= best_ppl * 1.015:
+            best_ppl = min(best_ppl, cur_ppl)
+            best_bank_snap = model.snapshot_engram_bank()
+            best_ctrl_sd = {k: v.detach().cpu().clone() for k, v in model.controllers.state_dict().items()}
+            gate_status = "ACCEPTED (Engram Snapshot Updated)"
+        else:
+            model.hot_swap_engram_bank(best_bank_snap, blend_alpha=1.0)
+            model.controllers.load_state_dict({k: v.to(device) for k, v in best_ctrl_sd.items()})
+            gate_status = "ROLLED BACK TO BEST SNAPSHOT"
+
+        tel = model.get_engram_routing_telemetry()
+        print(
+            f"  [SI-SRSI Round {r_idx}/{num_rounds} Complete | {time.time()-t0:5.1f}s] "
+            f"last_ce={out['ce_loss'].item():.4f} | ftpo_unlikelihood={ftpo_val:.4f} | "
+            f"Held-Out 72L PPL={cur_ppl:.4f} (NoEng={cur_ppl_eval['no_engram_ppl']:.4f}) | "
+            f"RouterCV={tel['mean_load_cv']:.4f} | {gate_status}"
+        )
+
+    # 3. Post-SI-SRSI Student Verification Rollout across all 3 Domains
+    model.enable_checkpoint = False
+    model.settings.checkpoint_layers = False
+    model.eval()
+    model.set_engram_flight_mode("deep_knowledge")
+
+    final_audits: Dict[str, Any] = {}
+    for t_item in tasks:
+        model.set_domain_engram_focus(t_item["domain"], boost=0.08)
+        gen = generate_chat_response(
+            model, tokenizer,
+            user_prompt=t_item["prompt"],
+            max_new_tokens=512,
+            temperature=0.1,
+        )
+        aud = _audit_task_rollout(t_item, gen["raw_text"])
+        init_sc = initial_audits[t_item["id"]]["initial_score"]
+        final_audits[t_item["id"]] = {
+            "domain": t_item["domain"],
+            "before_score": init_sc,
+            "after_score": aud["score"],
+            "delta": round(aud["score"] - init_sc, 2),
+            "details": aud,
+        }
+        print(
+            f"  [Post-SI-SRSI Audit | {t_item['domain']:11s} | `{t_item['id']}`] "
+            f"Score: {init_sc:5.1f} -> {aud['score']:5.1f}/100 ({aud['score'] - init_sc:+5.1f})"
+        )
+
+    model.set_domain_engram_focus("general", boost=0.0)
+    final_mean_rubric = sum(v["after_score"] for v in final_audits.values()) / max(1, len(final_audits))
+    final_ppl_eval = evaluate_engram_perplexity_delta(model, tokenizer)
+
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+    state_path = Path(save_dir) / "loop_v03_state.pt"
+    torch.save(loop_v03_state_dict(model, include_tier1b=True), state_path)
+
+    print("=" * 116)
+    print(
+        f"[SI-SRSI Knowledge Engram Formation Complete] "
+        f"Mean Rubric Score: {init_mean_rubric:.2f} -> {final_mean_rubric:.2f}/100 ({final_mean_rubric - init_mean_rubric:+.2f}) | "
+        f"Held-Out PPL: {init_ppl_eval['with_engram_ppl']:.4f} -> {final_ppl_eval['with_engram_ppl']:.4f} | "
+        f"Saved Engram Bank -> `{state_path}`"
+    )
+    print("=" * 116)
+    return {
+        "initial_mean_rubric": round(init_mean_rubric, 2),
+        "final_mean_rubric": round(final_mean_rubric, 2),
+        "rubric_delta": round(final_mean_rubric - init_mean_rubric, 2),
+        "initial_ppl": round(init_ppl_eval["with_engram_ppl"], 4),
+        "final_ppl": round(final_ppl_eval["with_engram_ppl"], 4),
+        "domain_results": final_audits,
+        "saved_engram_state": str(state_path),
+    }

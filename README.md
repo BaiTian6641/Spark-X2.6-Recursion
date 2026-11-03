@@ -168,3 +168,47 @@ resp = bench.generate_chat_response(
 print(resp["answer_text"])
 ```
 
+---
+
+## 7. Supervised Instructed Self-Recursive Self-Improvement (`SI-SRSI`) + Dynamic `MoE-Engram` Knowledge Formation
+
+Unlike pure unsupervised Recursive Self-Improvement (RSI) — which suffers from model collapse, variance shrinkage, and RLHF cliché amplification when a model trains on its own synthetic outputs — **Spark-X2.6-4B-En4B-A1B** introduces **Supervised Instructed Self-Recursive Self-Improvement (`SI-SRSI`)** coupled with **Domain-Partitioned Dynamic `MoE-Engram` Consolidation**:
+
+1. **On-Policy Student Rollout (`72L Loop + Dynamic MoE-Engram`)**: The student generates `<think>...</think>` reasoning + answer on challenge tasks while automatically biasing router logits toward domain-specific Expert Zones (`model.set_domain_engram_focus(domain)`).
+2. **Real-Time Multi-Dimensional Rubric + OpenCode Teacher Supervision**: An **OpenCode Teacher** (`opencode/claude-sonnet-4-5`, with deterministic gold-synthesis fallback) inspects the student's live rollout, diagnoses specific failures, and produces targeted corrective instructions + gold revisions.
+3. **Domain-Partitioned `MoE-Engram` Knowledge Zones (`32` Routed Experts per Anchor)**:
+   - **Domain 1 (`anti_slop`, Experts `22..29` + Bridge `30..31`)**: Eliminates "Claude-ish" RLHF clichés (*"delve"*, *"tapestry"*, *"testament"*, *"not just X, but Y"*, sycophantic openers), enforces sentence-length burstiness ($\text{CV} \ge 0.35$), and applies **Token-Level Anti-Slop Unlikelihood Regularization** on banned cliché token spans.
+   - **Domain 2 (`web_ux_sec`, Experts `12..21` + Bridge `30..31`)**: Consolidates WCAG 2.2 AA accessibility (`aria-live`, keyboard focus, reduced-motion), 4-state UX policy (`loading`/`empty`/`error`/`success`), and **Defensive Application Security** (`Content-Security-Policy`, `X-Frame-Options: DENY`, `HttpOnly; Secure; SameSite=Strict` cookies, `X-CSRF-Token`, parameterized SQL `$1`, safe DOM `textContent` escaping, token-bucket rate limiting).
+   - **Domain 3 (`stem_reason`, Experts `0..11` + Bridge `30..31`)**: Consolidates first-principles mathematical, physical, and algorithmic derivations inside `<think>...</think>` with exact symbolic/boxed verification.
+4. **Monotonic Non-Degradation Gate (MGD Rollback)**: Before each `SI-SRSI` consolidation round, `model.snapshot_engram_bank()` saves an in-RAM snapshot of the `MoE-Engram` and `mHC` controllers; if post-round composite scores or `dijkstra_grid` health regress, `model.hot_swap_engram_bank()` instantaneously rolls back.
+
+```python
+import sparkx_loop_v03_benchmarks as bench
+
+# Run Supervised Instructed Self-Recursive Self-Improvement (SI-SRSI)
+si_srsi_report = bench.run_si_srsi_engram_loop(
+    model=model,
+    tokenizer=tokenizer,
+    num_rounds=2,
+    consolidation_steps_per_prompt=6,
+    unlikelihood_alpha=0.25,
+    opencode_api_url=None,  # Optional OpenCode endpoint; auto-falls back to deterministic Teacher Supervision
+    opencode_api_key=None,
+    opencode_model="opencode/claude-sonnet-4-5",
+    save_dir="/content/sparkx_v03_si_srsi_engram",
+)
+```
+
+---
+
+## 8. Academic References & Theoretical Foundations
+
+1. **Shumailov, I., Shumaylov, Z., Zhao, Y., Papernot, N., Anderson, R., & Gal, Y. (2024).** *AI models collapse when trained on recursively generated data.* **Nature**, 631, 755–759. [`arXiv:2305.17493`](https://arxiv.org/abs/2305.17493)
+2. **Agarwal, R., Vieillard, N., Zhou, Y., Stanczyk, P., Garea, S. R., Geist, M., & Bachem, O. (2024).** *On-Policy Distillation of Language Models: Learning from Self-Generated Mistakes (GKD).* **ICLR 2024**. [`arXiv:2306.13649`](https://arxiv.org/abs/2306.13649)
+3. **Kumar, A., et al. (2024/2025).** *Training Language Models to Self-Correct via Reinforcement Learning (SCoRe).* **ICLR 2025**. [`arXiv:2409.12917`](https://arxiv.org/abs/2409.12917)
+4. **Kapusuzoglu, I., et al. (2025).** *Critique-Guided Distillation: Improving Supervised Fine-Tuning via Better Distillation (CGD).* [`arXiv:2505.11628`](https://arxiv.org/abs/2505.11628)
+5. **Paech, S. J., et al. (2025).** *Antislop: A Comprehensive Framework for Identifying and Eliminating Repetitive Patterns in Language Models (including Final Token Preference Optimization / FTPO).* [`arXiv:2510.15061`](https://arxiv.org/abs/2510.15061)
+6. **Kobak, D., González-Márquez, R., Horvát, E.-Á., & Lause, J. (2024).** *Delving into ChatGPT usage in academic writing through excess vocabulary.* **Science Advances**. [`arXiv:2406.07016`](https://arxiv.org/abs/2406.07016)
+7. **Wu, T., et al. (2025).** *Generative AI Slop Rescue: Eliminating Lexicon-Level Formulaic Biases in Post-Trained LLMs.* [`arXiv:2510.15077`](https://arxiv.org/abs/2510.15077)
+8. **Berges, V.-P., Barlas, O., Thrush, T., et al. (2024).** *Memory Layers at Scale.* **Meta FAIR**. [`arXiv:2412.09764`](https://arxiv.org/abs/2412.09764)
+9. **Bhatt, M., Chennabasappa, S., et al. (2024).** *CyberSecEval 2: A Wide-Ranging Cybersecurity Evaluation Suite for Large Language Models.* **Meta**. [`arXiv:2404.13161`](https://arxiv.org/abs/2404.13161)

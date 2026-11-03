@@ -141,6 +141,13 @@ def build_default_cfg() -> Dict[str, Any]:
         'PHASE4_STEPS': 150,
         'PHASE4_TRAIN_MHC': True,
 
+        # Phase-5 Supervised Instructed Self-Recursive Self-Improvement (`SI-SRSI`) + Dynamic MoE-Engram Knowledge Formation
+        #   - Domains: (1) Anti-Slop Human Writing [Exp 22..29], (2) Web UX/Policy/AppSec [Exp 12..21], (3) STEM Reasoning [Exp 0..11]
+        'ENABLE_SI_SRSI_ENGRAM_LOOP': True,
+        'SI_SRSI_ROUNDS': 2,
+        'SI_SRSI_STEPS_PER_ROUND': 32,
+        'SI_SRSI_FTPO_SLOP_WEIGHT': 0.08,
+
         # 16K/24K Context & Sequence Packing (Zero Mid-Thought / Mid-Code Truncation!)
         'MAX_SEQ_LENGTH': 16384,
         'PACK_SEQUENCES': True,
@@ -1598,6 +1605,8 @@ def run_v03_four_stage_training(
     model_cls.set_engram_flight_mode = _core_mod.SparkXLoopV03.set_engram_flight_mode
     model_cls.snapshot_engram_bank = _core_mod.SparkXLoopV03.snapshot_engram_bank
     model_cls.hot_swap_engram_bank = _core_mod.SparkXLoopV03.hot_swap_engram_bank
+    model_cls.set_domain_engram_focus = _core_mod.SparkXLoopV03.set_domain_engram_focus
+    model_cls.auto_detect_and_focus_domain = _core_mod.SparkXLoopV03.auto_detect_and_focus_domain
     model_cls.upcycle_all_engrams_8_to_32 = _core_mod.SparkXLoopV03.upcycle_all_engrams_8_to_32
     model_cls.reset_all_loop_and_engram_to_step0 = _core_mod.SparkXLoopV03.reset_all_loop_and_engram_to_step0
     for ctrl_mod in model.controllers.values():
@@ -2022,6 +2031,31 @@ def run_v03_four_stage_training(
         except Exception as exc:
             print(f"[Phase 4 Post-Training Notice] {exc}", flush=True)
 
+    si_srsi_report = None
+    if cfg.get('ENABLE_SI_SRSI_ENGRAM_LOOP', True) and not budget_reached:
+        try:
+            import sparkx_loop_v03_benchmarks as _bench_mod
+            importlib.reload(_bench_mod)
+            si_srsi_report = _bench_mod.run_si_srsi_engram_loop(
+                model=model,
+                tokenizer=tokenizer,
+                num_rounds=int(cfg.get('SI_SRSI_ROUNDS', 2)),
+                consolidation_steps_per_prompt=int(cfg.get('SI_SRSI_CONSOLIDATION_STEPS_PER_PROMPT', 6)),
+                lr_engram=float(cfg.get('LR_ENGRAM', 1.5e-4)),
+                lr_gates=5.0e-4,
+                lr_mhc=2.5e-5,
+                unlikelihood_alpha=float(cfg.get('SI_SRSI_UNLIKELIHOOD_ALPHA', 0.25)),
+                opencode_api_url=cfg.get('OPENCODE_TEACHER_API_URL'),
+                opencode_api_key=cfg.get('OPENCODE_TEACHER_API_KEY'),
+                opencode_model=str(cfg.get('OPENCODE_TEACHER_MODEL', 'opencode/claude-sonnet-4-5')),
+                save_dir=str(Path(cfg.get('CHECKPOINT_DIR', '/content/checkpoints_v03_r2_3phase')) / f"step_{global_step:05d}_SI_SRSI_Engram"),
+                push_to_hub=False,
+                hub_repo_id=str(cfg.get('HF_REPO_ID', 'TassP0lar/Spark-X2.6-4B-En4B-A1B')),
+                token=hf_token,
+            )
+        except Exception as exc:
+            print(f"[SI-SRSI Knowledge Engram Notice] {exc}", flush=True)
+
     # Activate default On-the-Fly Engram Flight Mode (e.g. 'deep_knowledge' Top-16 + 5-Gram Multi-Horizon Recall) for inference & export
     flight_info = model.set_engram_flight_mode(
         mode=str(cfg.get('ENG_DEFAULT_FLIGHT_MODE', 'deep_knowledge')),
@@ -2040,6 +2074,7 @@ def run_v03_four_stage_training(
         'global_step': global_step,
         'history': history,
         'phase4_report': phase4_report,
+        'si_srsi_report': si_srsi_report,
         'flight_info': flight_info,
         'final_dir': str(final_dir),
     }
