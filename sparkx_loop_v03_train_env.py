@@ -172,7 +172,7 @@ def build_default_cfg() -> Dict[str, Any]:
         #   Phase 1 (Stage 1): Adapt 72L Looped Transformer (mHC only; Backbone FROZEN, MoE-Engram DISABLED)
         #   Phase 2A (Stage 2): Introduce 8-Expert MoE-Engram + 5-Gram Multi-Horizon Recall (Backbone FROZEN, mHC + Engram-8 trainable)
         #   Phase 2B (Stage 3): Upcycle MoE-Engram 8 -> 32 (Top-7) at 16K (Backbone FROZEN, mHC + Engram-32 trainable)
-        #   Phase 3 (Stage 4): Joint Full-Finetuning at 16K (Backbone UNFROZEN at gentle 0.25x mult + mHC + Engram-32)
+        #   Phase 3 (Stage 4): Joint mHC + 32-Expert MoE-Engram Finalization at 16K (Backbone FROZEN to preserve 100% native Spark-X2.6-4B reasoning)
         #   Phase 4 (Post-Training): Backbone-Frozen Joint mHC + MoE-Engram Capability Consolidation (Per-Pass Telescoping Gates)
         'STAGES': [
             {
@@ -227,12 +227,12 @@ def build_default_cfg() -> Dict[str, Any]:
                 'use_mhc': True, 'use_engram': True,
                 'seq_len': 16384,
                 'steps': 90,
-                'freeze_backbone': False,
+                'freeze_backbone': True,
                 'freeze_engram': False,
                 'upcycle_8_to_32': False,
                 'lr_scale': 0.50,
                 'mhc_lr_mult': 0.35,
-                'backbone_lr_mult': 0.25,
+                'backbone_lr_mult': 0.0,
                 'loss_floor': 0.30,
             },
         ],
@@ -1069,12 +1069,23 @@ def tokenize_and_mask_record_16k(
         messages.append({'role': h_turn['role'], 'content': h_turn['content']})
     messages.append({'role': 'user', 'content': rec['user']})
 
-    assistant_body = f"<think>\n{rec['thought'].strip()}\n</think>\n{rec['answer'].strip()}"
-    full_messages = messages + [{'role': 'assistant', 'content': assistant_body}]
+    thought_str = rec['thought'].strip()
+    ans_str = rec['answer'].strip()
+    full_messages = messages + [
+        {
+            'role': 'assistant',
+            'reasoning_content': thought_str,
+            'content': ans_str,
+        }
+    ]
 
     try:
-        prompt_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
-        full_ids = tokenizer.apply_chat_template(full_messages, tokenize=True, add_generation_prompt=False)
+        prompt_ids = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, enable_thinking=True
+        )
+        full_ids = tokenizer.apply_chat_template(
+            full_messages, tokenize=True, add_generation_prompt=False, enable_thinking=True
+        )
         if hasattr(prompt_ids, 'input_ids'):
             prompt_ids = prompt_ids.input_ids
         elif isinstance(prompt_ids, dict) and 'input_ids' in prompt_ids:
@@ -1083,9 +1094,17 @@ def tokenize_and_mask_record_16k(
             full_ids = full_ids.input_ids
         elif isinstance(full_ids, dict) and 'input_ids' in full_ids:
             full_ids = full_ids['input_ids']
+        # Note: Spark-X2.6-4B chat_template.jinja ends prompt_ids (add_generation_prompt=True) with `<|Bot|><think>`,
+        # so mask up to `<|Bot|>` (`prompt_ids[:-1]`) and supervise `<think>{thought}</think>{answer}<｜end▁of▁sentence｜>`.
+        if len(prompt_ids) >= 2 and len(full_ids) > len(prompt_ids) and prompt_ids[-1] == 3:
+            prompt_ids = prompt_ids[:-1]
     except Exception:
-        prompt_str = f"<|im_start|>system\n{sys_text}<|im_end|>\n<|im_start|>user\n{rec['user']}<|im_end|>\n<|im_start|>assistant\n"
-        full_str = prompt_str + assistant_body + "<|im_end|>\n"
+        prompt_str = (
+            f"<｜start▁of▁sentence｜><|System|>{sys_text}"
+            f"<|User|>{rec['user']}"
+            f"<｜start▁of▁sentence｜><|Bot|>"
+        )
+        full_str = f"{prompt_str}<think>{thought_str}</think>{ans_str}<｜end▁of▁sentence｜>"
         prompt_ids = tokenizer.encode(prompt_str, add_special_tokens=False)
         full_ids = tokenizer.encode(full_str, add_special_tokens=False)
 
@@ -2973,8 +2992,8 @@ class SparkXAgenticWorkspace:
             prompt_ids = _enc.to(device)
         except Exception:
             raw_p = (
-                f"<|im_start|>system\n{ood_messages[0]['content']}<|im_end|>\n"
-                f"<|im_start|>user\n{ood_messages[1]['content']}<|im_end|>\n<|im_start|>assistant\n"
+                f"<｜start▁of▁sentence｜><|System|>{ood_messages[0]['content']}"
+                f"<|User|>{ood_messages[1]['content']}<｜start▁of▁sentence｜><|Bot|><think>"
             )
             prompt_ids = self.tokenizer(raw_p, return_tensors='pt').input_ids.to(device)
 
@@ -3109,8 +3128,8 @@ class SparkXAgenticWorkspace:
                 prompt_ids = _enc.to(device)
             except Exception:
                 raw_prompt = (
-                    f"<|im_start|>system\n{messages[0]['content']}<|im_end|>\n"
-                    f"<|im_start|>user\n{messages[-1]['content']}<|im_end|>\n<|im_start|>assistant\n"
+                    f"<｜start▁of▁sentence｜><|System|>{messages[0]['content']}"
+                    f"<|User|>{messages[-1]['content']}<｜start▁of▁sentence｜><|Bot|><think>"
                 )
                 prompt_ids = self.tokenizer(raw_prompt, return_tensors='pt').input_ids.to(device)
 

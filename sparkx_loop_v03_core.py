@@ -2308,11 +2308,13 @@ class SparkXLoopV03(nn.Module):
         stop_ids = set()
         if eos_token_id is not None:
             stop_ids.add(int(eos_token_id))
-        think_reentry_mask = set()
+        think_reentry_mask = {3}  # Token ID 3 is <think> in Spark-X2.6-4B
+        think_close_ids = {4}     # Token ID 4 is </think> in Spark-X2.6-4B
+        close_seq_ids = [4]
         if tokenizer is not None:
             if getattr(tokenizer, 'eos_token_id', None) is not None:
                 stop_ids.add(int(tokenizer.eos_token_id))
-            for stop_str in ('<|im_end|>', '<|endoftext|>', '<|eot_id|>'):
+            for stop_str in ('<｜end▁of▁sentence｜>', '<|im_end|>', '<|endoftext|>', '<|eot_id|>'):
                 try:
                     s_ids = tokenizer.encode(stop_str, add_special_tokens=False)
                     if len(s_ids) == 1:
@@ -2326,15 +2328,50 @@ class SparkXLoopV03(nn.Module):
                         think_reentry_mask.add(int(t_ids[0]))
                 except Exception:
                     pass
+            try:
+                c_ids = tokenizer.encode('</think>', add_special_tokens=False)
+                if len(c_ids) == 1:
+                    think_close_ids.add(int(c_ids[0]))
+                seq_c = tokenizer.encode('\n</think>\n', add_special_tokens=False)
+                if seq_c:
+                    close_seq_ids = [int(x) for x in seq_c]
+            except Exception:
+                pass
 
-        def _sample_step(step_logits: torch.Tensor, gen_list: list[int], think_closed: bool) -> torch.Tensor:
+        min_think_tokens = int(kwargs.get('min_think_tokens', 0) or 0)
+        eff_think_budget: Optional[int] = None
+        if think_budget_tokens is not None and int(think_budget_tokens) > 0:
+            eff_think_budget = min(int(think_budget_tokens), max(64, int(max_new_tokens) - 256))
+        else:
+            # Default safety ceiling so generation never hits max_new_tokens while still inside <think>
+            eff_think_budget = max(128, int(max_new_tokens) - 320) if int(max_new_tokens) >= 512 else None
+
+        # Detect if chat_template.jinja already placed <think> (token 3) at the end of input_ids
+        in_think = bool(out.shape[1] > 0 and int(out[0, -1].item()) in think_reentry_mask)
+        if not in_think and tokenizer is not None and out.shape[1] >= 2:
+            try:
+                prompt_tail = tokenizer.decode(out[0, -4:].tolist(), skip_special_tokens=False)
+                if '<think>' in prompt_tail and '</think>' not in prompt_tail:
+                    in_think = True
+            except Exception:
+                pass
+        think_closed = False
+        gen_list: list[int] = []
+        t0 = time.time()
+
+        def _sample_step(step_logits: torch.Tensor, cur_gen: list[int], is_closed: bool) -> torch.Tensor:
             logits_1d = step_logits[0, -1, :].float().clone()
-            if think_closed and think_reentry_mask:
+            if is_closed and think_reentry_mask:
                 for tid in think_reentry_mask:
                     if 0 <= tid < logits_1d.shape[0]:
                         logits_1d[tid] = -1e9
-            if gen_list and repetition_penalty > 1.0:
-                win = gen_list[-256:]
+            elif not is_closed and min_think_tokens > 0 and len(cur_gen) < min_think_tokens:
+                # Prevent premature </think> or EOS before minimum reasoning depth is reached
+                for tid in (think_close_ids | stop_ids):
+                    if 0 <= tid < logits_1d.shape[0]:
+                        logits_1d[tid] = -1e9
+            if cur_gen and repetition_penalty > 1.0:
+                win = cur_gen[-256:]
                 u_ids = torch.tensor(list(set(win)), dtype=torch.long, device=logits_1d.device)
                 vals = logits_1d[u_ids]
                 rep_p = float(repetition_penalty)
@@ -2357,20 +2394,39 @@ class SparkXLoopV03(nn.Module):
                 return s_idx.gather(-1, choice).unsqueeze(0)
             return torch.multinomial(probs, num_samples=1).unsqueeze(0)
 
-        in_think = False
-        think_closed = False
-        gen_list: list[int] = []
-        t0 = time.time()
         try:
             logits = self.forward_logits(out, past_key_values=cache)
             next_id = _sample_step(logits, gen_list, think_closed)
             tok_int = int(next_id.item())
             gen_list.append(tok_int)
+            if tok_int in think_close_ids:
+                in_think = False
+                think_closed = True
             prev_tok = out[:, -2:]
             out = torch.cat((out, next_id), dim=-1)
             if tok_int in stop_ids:
                 return out
-            for step_i in range(1, max_new_tokens):
+            step_i = 1
+            while step_i < max_new_tokens:
+                # Enforce think_budget_tokens so the model NEVER truncates mid-thought without emitting </think>
+                if not think_closed and eff_think_budget is not None and len(gen_list) >= eff_think_budget:
+                    for cid in close_seq_ids:
+                        if step_i >= max_new_tokens:
+                            break
+                        _ = self.forward_logits(next_id, past_key_values=cache, prev_ids=prev_tok)
+                        prev_tok = out[:, -2:]
+                        next_id = torch.tensor([[cid]], dtype=out.dtype, device=out.device)
+                        gen_list.append(cid)
+                        out = torch.cat((out, next_id), dim=-1)
+                        step_i += 1
+                    in_think = False
+                    think_closed = True
+                    if stream_print:
+                        dt = max(1e-3, time.time() - t0)
+                        print(f"  [72L Budget </think>] Closed </think> at budget={eff_think_budget} tokens ({len(gen_list)/dt:.1f} tok/s).", flush=True)
+                    if step_i >= max_new_tokens:
+                        break
+
                 logits = self.forward_logits(next_id, past_key_values=cache, prev_ids=prev_tok)
                 prev_tok = out[:, -2:]
                 if not think_closed and tokenizer is not None and (len(gen_list) <= 16 or len(gen_list) % 8 == 0):
@@ -2387,7 +2443,11 @@ class SparkXLoopV03(nn.Module):
                 next_id = _sample_step(logits, gen_list, think_closed)
                 tok_int = int(next_id.item())
                 gen_list.append(tok_int)
+                if tok_int in think_close_ids:
+                    in_think = False
+                    think_closed = True
                 out = torch.cat((out, next_id), dim=-1)
+                step_i += 1
 
                 if stream_print and tokenizer is not None and len(gen_list) % 128 == 0:
                     dt = max(1e-3, time.time() - t0)

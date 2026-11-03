@@ -295,31 +295,54 @@ def generate_chat_response(
     tokenizer: Any,
     user_prompt: str,
     system_prompt: str = (
-        "You are Spark-X2.6-4B-En4B-A1B, a precise 72-layer reasoning assistant. "
-        "Reason concisely inside <think>...</think>, close </think>, and provide a direct, accurate final response."
+        "You are Spark-X2.6, an advanced reasoning and engineering assistant. "
+        "Reason step-by-step inside <think>...</think>, close </think>, and provide a precise, complete final response."
     ),
-    max_new_tokens: int = 1536,
+    max_new_tokens: int = 8192,
     temperature: float = 0.1,
-    top_p: float = 0.90,
+    top_p: float = 0.95,
     repetition_penalty: float = 1.03,
-    think_budget_tokens: Optional[int] = 320,
+    think_budget_tokens: Optional[int] = 6144,
+    min_think_tokens: int = 32,
+    thinking_effort: str = "high",
     stream_print: bool = False,
     **kwargs: Any,
 ) -> Dict[str, Any]:
-    """Run a single chat turn through `model.generate_cached` and return structured timing/token metadata."""
+    """Run a single chat turn through `model.generate_cached` using Spark-X2.6-4B's native `<|System|>/<|User|>/<|Bot|><think>` template."""
+    from sparkx_loop_v03_core import SparkXLoopV03, patch_spark_attention_for_loglinear_kv
+    if getattr(type(model), "generate_cached", None) is not SparkXLoopV03.generate_cached:
+        setattr(type(model), "generate_cached", SparkXLoopV03.generate_cached)
+    if not getattr(model.base, "_sparkx_exact_kv_32k", False):
+        patch_spark_attention_for_loglinear_kv(model.base, exact_threshold=32768, recent_window=4096, sink_tokens=32)
+        model.base._sparkx_exact_kv_32k = True
+
     device = next(model.base.parameters()).device
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    enc = tokenizer.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
-    )
+    try:
+        enc = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            enable_thinking=True,
+            thinking_effort=thinking_effort,
+            return_tensors="pt",
+        )
+    except Exception:
+        enc = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
+        )
     input_ids = (enc.input_ids if hasattr(enc, "input_ids") else enc).to(device)
+    prompt_ends_with_think = bool(input_ids.numel() > 0 and int(input_ids[0, -1].item()) == 3)
+
+    # Reserve at least 512 tokens after </think> for the final answer while allowing deep multi-thousand-token CoT
+    reserve_answer_tokens = min(1024, max(256, int(max_new_tokens) // 6))
     eff_think_budget = (
-        min(int(think_budget_tokens), max(128, int(max_new_tokens) // 3))
+        min(int(think_budget_tokens), max(256, int(max_new_tokens) - reserve_answer_tokens))
         if think_budget_tokens is not None
-        else None
+        else max(256, int(max_new_tokens) - reserve_answer_tokens)
     )
     t0 = time.time()
     out_ids = model.generate_cached(
@@ -331,12 +354,17 @@ def generate_chat_response(
         eos_token_id=tokenizer.eos_token_id,
         tokenizer=tokenizer,
         think_budget_tokens=eff_think_budget,
+        min_think_tokens=min_think_tokens,
         stream_print=stream_print,
         **kwargs,
     )
     dt = max(1e-3, time.time() - t0)
     gen_ids = out_ids[0, input_ids.shape[1] :]
     raw_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+    # Spark-X2.6-4B chat_template.jinja places `<think>` (id=3) at the end of `input_ids`,
+    # so prepend `<think>\n` if `gen_ids` began inside `<think>` without repeating the tag.
+    if prompt_ends_with_think and not raw_text.lstrip().startswith("<think>"):
+        raw_text = "<think>\n" + raw_text
     think_text, answer_text, closed_think = strip_thinking_trace(raw_text)
     return {
         "raw_text": raw_text,
@@ -365,8 +393,11 @@ def score_mc_loglikelihood(
         {"role": "user", "content": prompt_text},
     ]
     chat_str = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    prefix = chat_str + "<think>\nEvaluating the options carefully.\n</think>\nThe correct answer is ("
-    ids = tokenizer(prefix, return_tensors="pt").input_ids.to(device)
+    if chat_str.rstrip().endswith("<think>"):
+        prefix = chat_str + "\nEvaluating the options carefully.\n</think>\nThe correct answer is ("
+    else:
+        prefix = chat_str + "<think>\nEvaluating the options carefully.\n</think>\nThe correct answer is ("
+    ids = tokenizer(prefix, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
     logits = model.forward_logits(ids)[0, -1, :].float()
     log_probs = F.log_softmax(logits, dim=-1)
     best_let = choice_letters[0] if choice_letters else "A"
@@ -706,7 +737,8 @@ def run_ifeval_and_ifbench_suite(
     tokenizer: Any,
     max_samples_ifeval: Optional[int] = 25,
     max_samples_ifbench: Optional[int] = 25,
-    max_new_tokens: int = 1280,
+    max_new_tokens: int = 4096,
+    think_budget_tokens: int = 2560,
     output_dir: str = "/content/sparkx_v03_benchmark_results",
     token: Optional[str] = None,
     **kwargs: Any,
@@ -720,7 +752,7 @@ def run_ifeval_and_ifbench_suite(
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     sys_prompt = (
         "You are a precise instruction-following assistant. "
-        "Reason briefly inside <think>...</think> about every formatting, length, keyword, or punctuation constraint, "
+        "Reason inside <think>...</think> about every formatting, length, keyword, or punctuation constraint, "
         "close </think>, and output ONLY the final response that strictly satisfies every constraint."
     )
     results_summary: Dict[str, Any] = {}
@@ -759,6 +791,7 @@ def run_ifeval_and_ifbench_suite(
                 user_prompt=prompt,
                 system_prompt=sys_prompt,
                 max_new_tokens=max_new_tokens,
+                think_budget_tokens=min(int(think_budget_tokens), max(1024, int(max_new_tokens) - 1024)),
                 temperature=0.0,
             )
             final_resp = gen["answer_text"]
@@ -846,7 +879,8 @@ def run_gpqa_diamond_benchmark(
     tokenizer: Any,
     max_samples: Optional[int] = 25,
     mode: str = "hybrid_cot_and_logprob",
-    max_new_tokens: int = 1536,
+    max_new_tokens: int = 8192,
+    think_budget_tokens: int = 6656,
     token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Evaluate Spark-X2.6-4B-En4B-A1B on GPQA Diamond (PhD-level Physics, Chemistry, Biology)."""
@@ -860,7 +894,7 @@ def run_gpqa_diamond_benchmark(
 
     sys_prompt = (
         "You are a PhD-level physicist, chemist, and biologist. "
-        "Reason step-by-step concisely inside <think>...</think>, close </think>, "
+        "Reason step-by-step inside <think>...</think>, close </think>, "
         "and state your final choice clearly as \\boxed{A}, \\boxed{B}, \\boxed{C}, or \\boxed{D}."
     )
 
@@ -911,6 +945,7 @@ def run_gpqa_diamond_benchmark(
                 user_prompt=formatted_q,
                 system_prompt=sys_prompt,
                 max_new_tokens=max_new_tokens,
+                think_budget_tokens=min(int(think_budget_tokens), max(1024, int(max_new_tokens) - 512)),
                 temperature=0.1,
             )
             extracted = extract_boxed_or_final_answer(gen["raw_text"], choices=["A", "B", "C", "D"])
@@ -1012,7 +1047,8 @@ def run_hle_benchmark(
     model: Any,
     tokenizer: Any,
     max_samples: Optional[int] = 20,
-    max_new_tokens: int = 1536,
+    max_new_tokens: int = 8192,
+    think_budget_tokens: int = 6656,
     token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Evaluate Spark-X2.6-4B-En4B-A1B on Humanity's Last Exam (`cais/hle`, text-only questions)."""
@@ -1067,7 +1103,7 @@ def run_hle_benchmark(
     n_total = len(rows)
     sys_prompt = (
         "You are taking Humanity's Last Exam (HLE), a frontier academic benchmark. "
-        "Reason step-by-step concisely inside <think>...</think>, close </think>, "
+        "Reason step-by-step inside <think>...</think>, close </think>, "
         "and put your exact final answer (or single option letter for multiple-choice) inside \\boxed{}."
     )
 
@@ -1084,6 +1120,7 @@ def run_hle_benchmark(
             user_prompt=q,
             system_prompt=sys_prompt,
             max_new_tokens=max_new_tokens,
+            think_budget_tokens=min(int(think_budget_tokens), max(1024, int(max_new_tokens) - 512)),
             temperature=0.1,
         )
         choices = [chr(ord("A") + i) for i in range(10)] if is_mc else None
@@ -1216,7 +1253,8 @@ def run_swe_bench_suite(
     max_samples_pro: Optional[int] = 10,
     max_samples_verified: Optional[int] = 10,
     swebench_pro_config: str = "default",
-    max_new_tokens: int = 1536,
+    max_new_tokens: int = 8192,
+    think_budget_tokens: int = 5120,
     output_dir: str = "/content/sparkx_v03_benchmark_results",
     token: Optional[str] = None,
     **kwargs: Any,
@@ -1233,7 +1271,7 @@ def run_swe_bench_suite(
 
     sys_prompt = (
         "You are an autonomous Principal Software Engineer solving a GitHub repository issue. "
-        "Reason concisely inside <think>...</think> to diagnose the root cause in the provided file snippet, "
+        "Reason inside <think>...</think> to diagnose the root cause in the provided file snippet, "
         "close </think>, and output a valid unified Git patch (`diff --git a/... b/...`) inside a ```diff ... ``` block."
     )
 
@@ -1303,6 +1341,7 @@ def run_swe_bench_suite(
                 user_prompt=user_prompt,
                 system_prompt=sys_prompt,
                 max_new_tokens=max_new_tokens,
+                think_budget_tokens=min(int(think_budget_tokens), max(1024, int(max_new_tokens) - 1536)),
                 temperature=0.1,
             )
             pred_patch = _extract_patch_or_code(gen["raw_text"], default_file=target_file)
@@ -1356,7 +1395,8 @@ def run_humaneval_benchmark(
     model: Any,
     tokenizer: Any,
     max_samples: Optional[int] = 25,
-    max_new_tokens: int = 1280,
+    max_new_tokens: int = 6144,
+    think_budget_tokens: int = 4096,
 ) -> Dict[str, Any]:
     """Run OpenAI `HumanEval` with live Python unit test execution in an isolated subprocess (`Pass@1`)."""
     from datasets import load_dataset
@@ -1367,7 +1407,7 @@ def run_humaneval_benchmark(
 
     sys_prompt = (
         "You are an expert Python 3 software engineer. "
-        "Reason briefly inside <think>...</think>, close </think>, and output the complete Python function implementation "
+        "Reason inside <think>...</think>, close </think>, and output the complete Python function implementation "
         "(including any needed standard-library imports) inside a single ```python ... ``` block."
     )
 
@@ -1389,6 +1429,7 @@ def run_humaneval_benchmark(
             user_prompt=user_prompt,
             system_prompt=sys_prompt,
             max_new_tokens=max_new_tokens,
+            think_budget_tokens=min(int(think_budget_tokens), max(1024, int(max_new_tokens) - 1024)),
             temperature=0.1,
         )
         _, body, _ = strip_thinking_trace(gen["raw_text"])
@@ -1433,7 +1474,8 @@ def run_math500_benchmark(
     model: Any,
     tokenizer: Any,
     max_samples: Optional[int] = 25,
-    max_new_tokens: int = 1536,
+    max_new_tokens: int = 12288,
+    think_budget_tokens: int = 10240,
 ) -> Dict[str, Any]:
     """Run `HuggingFaceH4/MATH-500` across Levels 1–5 with SymPy + canonical LaTeX verification."""
     from datasets import load_dataset
@@ -1443,7 +1485,7 @@ def run_math500_benchmark(
     print(f"[MATH-500] Evaluating {n_total} / {len(ds)} competition math problems...")
 
     sys_prompt = (
-        "You are a competition mathematician. Solve the problem step-by-step concisely inside <think>...</think>, "
+        "You are a competition mathematician. Solve the problem step-by-step inside <think>...</think>, "
         "close </think>, and state the final answer inside \\boxed{}."
     )
 
@@ -1461,6 +1503,7 @@ def run_math500_benchmark(
             user_prompt=prob + "\n\nPut your final answer inside \\boxed{}.",
             system_prompt=sys_prompt,
             max_new_tokens=max_new_tokens,
+            think_budget_tokens=min(int(think_budget_tokens), max(2048, int(max_new_tokens) - 1024)),
             temperature=0.1,
         )
         pred = extract_boxed_or_final_answer(gen["raw_text"])
@@ -1491,16 +1534,142 @@ def run_math500_benchmark(
 # ==============================================================================
 
 _HELD_OUT_EVAL_TEXTS = [
-    "<|im_start|>user\nWrite a Python 3 function using collections.OrderedDict and heapq to merge k sorted streams with TTL expiration.<|im_end|>\n"
-    "<|im_start|>assistant\n<think>\n1. Use a min-heap storing (value, timestamp, stream_idx, item_idx).\n2. Filter expired items where now >= timestamp + ttl.\n</think>\n"
-    "```python\nimport heapq\nfrom collections import OrderedDict\n\ndef merge_ttl_streams(streams, ttl: float, now: float):\n    heap = []\n    out = []\n    for s_idx, stream in enumerate(streams):\n        if stream:\n            val, ts = stream[0]\n            heapq.heappush(heap, (val, ts, s_idx, 0))\n    while heap:\n        val, ts, s_idx, i_idx = heapq.heappop(heap)\n        if now - ts < ttl:\n            out.append(val)\n        if i_idx + 1 < len(streams[s_idx]):\n            nv, nts = streams[s_idx][i_idx + 1]\n            heapq.heappush(heap, (nv, nts, s_idx, i_idx + 1))\n    return out\n```<|im_end|>",
-    "<|im_start|>user\nInitialize a Three.js r128 WebGLRenderer with FogExp2, PerspectiveCamera, and an InstancedMesh of 1000 neon cubes.<|im_end|>\n"
-    "<|im_start|>assistant\n<think>\n1. Create Scene, FogExp2, PerspectiveCamera, and WebGLRenderer.\n2. Use THREE.InstancedMesh with Object3D dummy matrix updates.\n</think>\n"
-    "```javascript\nconst scene = new THREE.Scene();\nscene.fog = new THREE.FogExp2(0x070312, 0.008);\nconst camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);\nconst renderer = new THREE.WebGLRenderer({ antialias: true });\nrenderer.setSize(window.innerWidth, window.innerHeight);\ndocument.body.appendChild(renderer.domElement);\nconst geo = new THREE.BoxGeometry(1, 1, 1);\nconst mat = new THREE.MeshStandardMaterial({ color: 0x00f0ff, emissive: 0xff007f });\nconst inst = new THREE.InstancedMesh(geo, mat, 1000);\nscene.add(inst);\n```<|im_end|>",
-    "<|im_start|>user\nProve that a 2x2 doubly-stochastic matrix M = [[p, 1-p], [1-p, p]] has eigenvalues 1 and 2p-1.<|im_end|>\n"
-    "<|im_start|>assistant\n<think>\n1. Compute trace(M) = 2p and det(M) = p^2 - (1-p)^2 = 2p - 1.\n2. Solve characteristic polynomial lambda^2 - 2p*lambda + (2p - 1) = 0.\n</think>\n"
-    "For $M = \\begin{pmatrix} p & 1-p \\\\ 1-p & p \\end{pmatrix}$, each row sums to $1$, so $\\lambda_1 = 1$. Since $\\text{tr}(M) = \\lambda_1 + \\lambda_2 = 2p$, the second eigenvalue is $\\lambda_2 = 2p - 1 \\in (-1, 1)$ for $p \\in (0, 1)$, bounding $\\|M\\|_2 = 1$.<|im_end|>",
+    "<｜start▁of▁sentence｜><|System|>You are Spark-X2.6, an advanced reasoning and engineering assistant.<|User|>"
+    "Write a Python 3 function using collections.OrderedDict and heapq to merge k sorted streams with TTL expiration."
+    "<｜start▁of▁sentence｜><|Bot|><think>\n1. Use a min-heap storing (value, timestamp, stream_idx, item_idx).\n2. Filter expired items where now >= timestamp + ttl.\n</think>\n"
+    "```python\nimport heapq\nfrom collections import OrderedDict\n\ndef merge_ttl_streams(streams, ttl: float, now: float):\n    heap = []\n    out = []\n    for s_idx, stream in enumerate(streams):\n        if stream:\n            val, ts = stream[0]\n            heapq.heappush(heap, (val, ts, s_idx, 0))\n    while heap:\n        val, ts, s_idx, i_idx = heapq.heappop(heap)\n        if now - ts < ttl:\n            out.append(val)\n        if i_idx + 1 < len(streams[s_idx]):\n            nv, nts = streams[s_idx][i_idx + 1]\n            heapq.heappush(heap, (nv, nts, s_idx, i_idx + 1))\n    return out\n```<｜end▁of▁sentence｜>",
+    "<｜start▁of▁sentence｜><|System|>You are Spark-X2.6, an advanced reasoning and engineering assistant.<|User|>"
+    "Initialize a Three.js r128 WebGLRenderer with FogExp2, PerspectiveCamera, and an InstancedMesh of 1000 neon cubes."
+    "<｜start▁of▁sentence｜><|Bot|><think>\n1. Create Scene, FogExp2, PerspectiveCamera, and WebGLRenderer.\n2. Use THREE.InstancedMesh with Object3D dummy matrix updates.\n</think>\n"
+    "```javascript\nconst scene = new THREE.Scene();\nscene.fog = new THREE.FogExp2(0x070312, 0.008);\nconst camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);\nconst renderer = new THREE.WebGLRenderer({ antialias: true });\nrenderer.setSize(window.innerWidth, window.innerHeight);\ndocument.body.appendChild(renderer.domElement);\nconst geo = new THREE.BoxGeometry(1, 1, 1);\nconst mat = new THREE.MeshStandardMaterial({ color: 0x00f0ff, emissive: 0xff007f });\nconst inst = new THREE.InstancedMesh(geo, mat, 1000);\nscene.add(inst);\n```<｜end▁of▁sentence｜>",
+    "<｜start▁of▁sentence｜><|System|>You are Spark-X2.6, an advanced reasoning and engineering assistant.<|User|>"
+    "Prove that a 2x2 doubly-stochastic matrix M = [[p, 1-p], [1-p, p]] has eigenvalues 1 and 2p-1."
+    "<｜start▁of▁sentence｜><|Bot|><think>\n1. Compute trace(M) = 2p and det(M) = p^2 - (1-p)^2 = 2p - 1.\n2. Solve characteristic polynomial lambda^2 - 2p*lambda + (2p - 1) = 0.\n</think>\n"
+    "For $M = \\begin{pmatrix} p & 1-p \\\\ 1-p & p \\end{pmatrix}$, each row sums to $1$, so $\\lambda_1 = 1$. Since $\\text{tr}(M) = \\lambda_1 + \\lambda_2 = 2p$, the second eigenvalue is $\\lambda_2 = 2p - 1 \\in (-1, 1)$ for $p \\in (0, 1)$, bounding $\\|M\\|_2 = 1$.<｜end▁of▁sentence｜>",
 ]
+
+
+def encode_spark_chat_pair(
+    tokenizer: Any,
+    user_text: str,
+    assistant_text: str,
+    system_text: str = (
+        "You are Spark-X2.6, an advanced reasoning and engineering assistant. "
+        "Reason step-by-step inside <think>...</think>, close </think>, and provide a precise, complete final response."
+    ),
+    max_seq_len: int = 1536,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Encode a `(user_text, assistant_text)` pair using Spark-X2.6-4B's native `chat_template.jinja`
+    with `reasoning_content` separated from `content` so `<|Bot|><think>{thought}</think>{answer}` is supervised cleanly."""
+    thought_part, answer_part, _ = strip_thinking_trace(assistant_text)
+    if not thought_part:
+        thought_part = "Analyze the requirements step-by-step and construct the exact solution."
+    messages = [
+        {"role": "system", "content": system_text},
+        {"role": "user", "content": user_text},
+    ]
+    full_messages = messages + [
+        {
+            "role": "assistant",
+            "reasoning_content": thought_part,
+            "content": answer_part,
+        }
+    ]
+    try:
+        p_ids = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, enable_thinking=True
+        )
+        f_ids = tokenizer.apply_chat_template(
+            full_messages, tokenize=True, add_generation_prompt=False, enable_thinking=True
+        )
+        if hasattr(p_ids, "input_ids"):
+            p_ids = p_ids.input_ids
+        elif isinstance(p_ids, dict) and "input_ids" in p_ids:
+            p_ids = p_ids["input_ids"]
+        if hasattr(f_ids, "input_ids"):
+            f_ids = f_ids.input_ids
+        elif isinstance(f_ids, dict) and "input_ids" in f_ids:
+            f_ids = f_ids["input_ids"]
+        p_ids = list(p_ids)
+        f_ids = list(f_ids)[:max_seq_len]
+        if len(p_ids) >= 2 and len(f_ids) > len(p_ids) and p_ids[-1] == 3:
+            p_ids = p_ids[:-1]
+    except Exception:
+        prefix_str = (
+            f"<｜start▁of▁sentence｜><|System|>{system_text}"
+            f"<|User|>{user_text}<｜start▁of▁sentence｜><|Bot|>"
+        )
+        full_str = f"{prefix_str}<think>\n{thought_part}\n</think>\n{answer_part}<｜end▁of▁sentence｜>"
+        p_ids = tokenizer(prefix_str, add_special_tokens=False).input_ids
+        f_ids = tokenizer(full_str, add_special_tokens=False).input_ids[:max_seq_len]
+
+    if len(f_ids) <= len(p_ids) + 6:
+        return None
+    inp = torch.tensor([f_ids], dtype=torch.long)
+    lbl = inp.clone()
+    lbl[:, : len(p_ids)] = -100
+    return inp, lbl
+
+
+@torch.no_grad()
+def restore_pristine_base_backbone(
+    model: Any,
+    base_model_id: str = "XHToken/Spark-X2.6-4B",
+    soft_reset_mhc_gain: float = 0.35,
+    token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Reload the pristine post-trained 36-layer `XHToken/Spark-X2.6-4B` weights into `model.base` in-place
+    (recovering 100% of the official `Spark-X2.6-4B` AIME/GPQA/IFEval capability if Stage-4 unfreezing drifted `model.base`)
+    while preserving all 8 `ZipfianTieredMoEEngram` (`4.11B`) anchors and 24 `TwoStreamMHC` controllers."""
+    import gc
+    from transformers import AutoModelForCausalLM
+    from sparkx_loop_v03_core import patch_spark_attention_for_loglinear_kv, patch_spark_for_unsloth_triton
+
+    print("=" * 108)
+    print(f"[Pristine Backbone Restoration] Reloading clean 36L weights from `{base_model_id}` into `model.base` (CPU -> GPU in-place)...")
+    t0 = time.time()
+    clean_base = AutoModelForCausalLM.from_pretrained(
+        base_model_id,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+        device_map="cpu",
+        token=token,
+    )
+    clean_sd = clean_base.state_dict()
+    missing, unexpected = model.base.load_state_dict(clean_sd, strict=False)
+    del clean_sd, clean_base
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    patch_spark_for_unsloth_triton(model.base)
+    patch_spark_attention_for_loglinear_kv(model.base, exact_threshold=32768, recent_window=4096, sink_tokens=32)
+    model.base._sparkx_exact_kv_32k = True
+    for p in model.base.parameters():
+        p.requires_grad_(False)
+    model.base.eval()
+
+    # Softly attenuate mHC residual injection gains so Phase-4 smoothly re-aligns controllers to pristine hidden states
+    if soft_reset_mhc_gain is not None and hasattr(model, "controllers"):
+        for ctrl in model.controllers.values():
+            if hasattr(ctrl, "extra_gain") and ctrl.extra_gain is not None:
+                ctrl.extra_gain.data.mul_(float(soft_reset_mhc_gain))
+            if hasattr(ctrl, "p3_extra_gain") and ctrl.p3_extra_gain is not None:
+                ctrl.p3_extra_gain.data.mul_(float(soft_reset_mhc_gain))
+
+    dt = time.time() - t0
+    print(
+        f"[Pristine Backbone Restoration Complete in {dt:.1f}s] "
+        f"`model.base` restored to 100% exact `{base_model_id}` weights (missing={len(missing)}, unexpected={len(unexpected)})."
+    )
+    print("=" * 108)
+    return {
+        "restored_from": base_model_id,
+        "elapsed_sec": round(dt, 2),
+        "missing_keys": len(missing),
+        "unexpected_keys": len(unexpected),
+    }
 
 
 @torch.no_grad()
@@ -1518,7 +1687,7 @@ def evaluate_engram_perplexity_delta(model: Any, tokenizer: Any) -> Dict[str, fl
         model.set_loop(start=4, end=28, passes=2, use_mhc=True, use_engram=use_eng, enable_p3=True, p3_start=12, p3_end=24)
         total_nll, total_toks, total_correct = 0.0, 0, 0
         for txt in _HELD_OUT_EVAL_TEXTS:
-            ids = tokenizer(txt, return_tensors="pt").input_ids.to(device)
+            ids = tokenizer(txt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
             logits = model.forward_logits(ids).float()
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = ids[:, 1:].contiguous()
@@ -1668,7 +1837,7 @@ def run_phase4_engram_consolidation(
     lr_gates: float = 5.0e-4,
     lr_mhc: float = 3.0e-5,
     train_mhc: bool = True,
-    max_seq_len: int = 768,
+    max_seq_len: int = 1536,
     eval_every: int = 20,
     save_dir: str = "/content/sparkx_v03_phase4_consolidated",
     push_to_hub: bool = False,
@@ -1749,26 +1918,21 @@ def run_phase4_engram_consolidation(
     print(f"  Trainable 24x TwoStreamMHC     : {trainable_mhc_cnt/1e6:.2f}M params (train_mhc={train_mhc}, lr_mhc={lr_mhc:.1e})")
     print(f"  Trainable 8x MoE-Engram        : {trainable_eng_cnt/1e9:.3f}B params (32 Experts Top-7, lr_engram={lr_engram:.1e}, lr_gates={lr_gates:.1e})")
 
-    # 4. Build tokenized assistant-masked training batches
+    # 4. Build tokenized assistant-masked training batches using Spark-X2.6-4B's native chat_template.jinja
     raw_pairs = _build_phase4_consolidation_pairs(token=token)
     sys_msg = (
-        "You are Spark-X2.6-4B-En4B-A1B, a precise 72-layer reasoning assistant. "
-        "Reason concisely inside <think>...</think>, close </think>, and provide a direct, accurate final response."
+        "You are Spark-X2.6, an advanced reasoning and engineering assistant. "
+        "Reason step-by-step inside <think>...</think>, close </think>, and provide a precise, complete final response."
     )
     encoded_batches = []
     for u_txt, a_txt in raw_pairs:
-        prefix_str = f"<|im_start|>system\n{sys_msg}<|im_end|>\n<|im_start|>user\n{u_txt}<|im_end|>\n<|im_start|>assistant\n"
-        full_str = prefix_str + a_txt + "<|im_end|>"
-        p_ids = tokenizer(prefix_str, add_special_tokens=False).input_ids
-        f_ids = tokenizer(full_str, add_special_tokens=False).input_ids[:max_seq_len]
-        if len(f_ids) <= len(p_ids) + 8:
-            continue
-        inp = torch.tensor([f_ids], dtype=torch.long)
-        lbl = inp.clone()
-        lbl[:, : len(p_ids)] = -100
-        encoded_batches.append((inp, lbl))
+        enc_pair = encode_spark_chat_pair(
+            tokenizer, u_txt, a_txt, system_text=sys_msg, max_seq_len=max_seq_len
+        )
+        if enc_pair is not None:
+            encoded_batches.append(enc_pair)
 
-    print(f"  Prepared {len(encoded_batches)} assistant-masked consolidation sequences (max_seq_len={max_seq_len}).")
+    print(f"  Prepared {len(encoded_batches)} native Spark-X2.6 assistant-masked consolidation sequences (max_seq_len={max_seq_len}).")
 
     param_groups = [
         {"params": expert_params, "lr": lr_engram, "weight_decay": 0.01},
@@ -1867,6 +2031,8 @@ def run_phase4_engram_consolidation(
 
     meta = dict(getattr(model, "loaded_meta", {}) or {})
     meta["curriculum_version"] = "v03_r2_4phase_mhc_engram_consolidated"
+    meta["base_model"] = "XHToken/Spark-X2.6-4B"
+    meta["merged_standalone"] = False
     meta["phase4_steps"] = num_steps
     meta["phase4_train_mhc"] = bool(train_mhc)
     meta["active_meta"] = state_obj["active_meta"]
@@ -1913,11 +2079,11 @@ def evaluate_dynamic_engram_flight_modes(model: Any, tokenizer: Any) -> Dict[str
     """
     from sparkx_loop_v03_core import SparkXLoopV03, ZipfianTieredMoEEngram
     for _k, _v in SparkXLoopV03.__dict__.items():
-        if callable(_v) or isinstance(_v, property):
+        if not _k.startswith("__") and (callable(_v) or isinstance(_v, property)):
             setattr(type(model), _k, _v)
     for mod in model.all_engram_modules():
         for _k, _v in ZipfianTieredMoEEngram.__dict__.items():
-            if callable(_v) or isinstance(_v, property):
+            if not _k.startswith("__") and (callable(_v) or isinstance(_v, property)):
                 setattr(type(mod), _k, _v)
 
     was_training = model.training
@@ -1961,7 +2127,7 @@ def evaluate_dynamic_engram_flight_modes(model: Any, tokenizer: Any) -> Dict[str
 
         total_nll, total_toks, total_correct = 0.0, 0, 0
         for txt in _HELD_OUT_EVAL_TEXTS:
-            ids = tokenizer(txt, return_tensors="pt").input_ids.to(device)
+            ids = tokenizer(txt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
             logits = model.forward_logits(ids).float()
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = ids[:, 1:].contiguous()
@@ -2018,7 +2184,8 @@ def run_supergpqa_benchmark(
     model: Any,
     tokenizer: Any,
     max_samples: Optional[int] = 20,
-    max_new_tokens: int = 1024,
+    max_new_tokens: int = 8192,
+    think_budget_tokens: int = 6656,
 ) -> Dict[str, Any]:
     """Evaluate `m-a-p/SuperGPQA` (Graduate-Level Multi-Discipline Expert Q&A across 285 disciplines, up to 10 choices A–J)."""
     from datasets import load_dataset
@@ -2033,7 +2200,7 @@ def run_supergpqa_benchmark(
     print(f"[SuperGPQA] Evaluating {n_total} graduate-level multi-discipline questions (up to 10 options A–J)...")
 
     sys_prompt = (
-        "You are a graduate-level domain expert. Analyze the question and options concisely inside <think>...</think>, "
+        "You are a graduate-level domain expert. Analyze the question and options step-by-step inside <think>...</think>, "
         "close </think>, and state the final option letter inside \\boxed{A}.. \\boxed{J}."
     )
     letters = "ABCDEFGHIJ"
@@ -2061,6 +2228,7 @@ def run_supergpqa_benchmark(
             user_prompt=user_prompt,
             system_prompt=sys_prompt,
             max_new_tokens=max_new_tokens,
+            think_budget_tokens=min(int(think_budget_tokens), max(1024, int(max_new_tokens) - 512)),
             temperature=0.1,
         )
         cot_pred = extract_boxed_or_final_answer(gen["raw_text"], choices=valid_letters)
@@ -2099,7 +2267,8 @@ def run_aime_omni_math_benchmark(
     model: Any,
     tokenizer: Any,
     max_samples: Optional[int] = 15,
-    max_new_tokens: int = 1536,
+    max_new_tokens: int = 16384,
+    think_budget_tokens: int = 14336,
 ) -> Dict[str, Any]:
     """Evaluate Olympiad-level competition mathematics combining `Maxwell-Jia/AIME_2024`, `yentinglin/aime_2025`, and `KbsdJames/Omni-MATH`."""
     from datasets import load_dataset
@@ -2137,7 +2306,7 @@ def run_aime_omni_math_benchmark(
     n_total = len(items)
     print(f"[AIME 2024/2025 + Omni-MATH] Evaluating {n_total} Olympiad mathematics problems...")
     sys_prompt = (
-        "You are an International Mathematical Olympiad gold medalist. Solve the problem concisely inside <think>...</think>, "
+        "You are an International Mathematical Olympiad gold medalist. Solve the problem step-by-step inside <think>...</think>, "
         "close </think>, and state the exact final numerical or algebraic answer inside \\boxed{}."
     )
     correct = 0
@@ -2149,6 +2318,7 @@ def run_aime_omni_math_benchmark(
             user_prompt=item["problem"] + "\n\nPut your final answer inside \\boxed{}.",
             system_prompt=sys_prompt,
             max_new_tokens=max_new_tokens,
+            think_budget_tokens=min(int(think_budget_tokens), max(4096, int(max_new_tokens) - 1024)),
             temperature=0.1,
         )
         pred = extract_boxed_or_final_answer(gen["raw_text"])
@@ -2183,7 +2353,8 @@ def run_livecodebench_benchmark(
     model: Any,
     tokenizer: Any,
     max_samples: Optional[int] = 15,
-    max_new_tokens: int = 1280,
+    max_new_tokens: int = 6144,
+    think_budget_tokens: int = 4096,
 ) -> Dict[str, Any]:
     """Evaluate `bigcode/bigcodebench` / `livecodebench` practical & competitive Python code synthesis with sandboxed test execution."""
     from datasets import load_dataset
@@ -2212,7 +2383,7 @@ def run_livecodebench_benchmark(
     n_total = len(rows)
     print(f"[BigCodeBench / LiveCodeBench] Evaluating {n_total} tasks from `{source_name}` with sandboxed test execution...")
     sys_prompt = (
-        "You are an expert Python software engineer. Reason briefly inside <think>...</think>, close </think>, "
+        "You are an expert Python software engineer. Reason inside <think>...</think>, close </think>, "
         "and output the complete, executable Python solution inside a ```python ... ``` block."
     )
     passed = 0
@@ -2228,6 +2399,7 @@ def run_livecodebench_benchmark(
             user_prompt=f"Complete the following Python task:\n\n{prompt_code}",
             system_prompt=sys_prompt,
             max_new_tokens=max_new_tokens,
+            think_budget_tokens=min(int(think_budget_tokens), max(1024, int(max_new_tokens) - 1024)),
             temperature=0.1,
         )
         _, body, _ = strip_thinking_trace(gen["raw_text"])
@@ -3021,12 +3193,12 @@ def run_si_srsi_engram_loop(
     supervised_trajectories: List[Dict[str, Any]] = []
     for t_item in tasks:
         model.set_domain_engram_focus(t_item["domain"], boost=0.08)
-        task_max_new = 1536 if t_item["domain"] == "web_ux_sec" else 1024
+        task_max_new = 4096
         gen = generate_chat_response(
             model, tokenizer,
             user_prompt=t_item["prompt"],
             max_new_tokens=task_max_new,
-            think_budget_tokens=192,
+            think_budget_tokens=2048,
             temperature=0.1,
         )
         aud = _audit_task_rollout(t_item, gen["raw_text"])
@@ -3083,8 +3255,8 @@ def run_si_srsi_engram_loop(
     # Interleave 1:1 with Phase-4 general consolidation pairs so general held-out perplexity stays anchored while forming SI-SRSI domain engrams
     general_pairs = _build_phase4_consolidation_pairs()
     sys_msg = (
-        "You are Spark-X2.6-4B-En4B-A1B, a 72-layer recurrent reasoning assistant with a 4.11B Dynamic MoE-Engram. "
-        "Reason concisely inside <think>...</think>, close </think>, and deliver human-natural, secure, and mathematically exact outputs."
+        "You are Spark-X2.6, an advanced reasoning and engineering assistant. "
+        "Reason step-by-step inside <think>...</think>, close </think>, and deliver human-natural, secure, and mathematically exact outputs."
     )
 
     encoded_domain_items = []
@@ -3092,16 +3264,13 @@ def run_si_srsi_engram_loop(
         t_item = item["task"]
         u_txt = t_item["prompt"]
         a_txt = item["supervision"]["instructed_target"]
-        prefix_str = f"<|im_start|>system\n{sys_msg}<|im_end|>\n<|im_start|>user\n{u_txt}<|im_end|>\n<|im_start|>assistant\n"
-        full_str = prefix_str + a_txt + "<|im_end|>"
-        p_ids = tokenizer(prefix_str, add_special_tokens=False).input_ids
-        max_seq_cap = 1280 if t_item["domain"] == "web_ux_sec" else 896
-        f_ids = tokenizer(full_str, add_special_tokens=False).input_ids[:max_seq_cap]
-        if len(f_ids) <= len(p_ids) + 8:
+        max_seq_cap = 2048 if t_item["domain"] == "web_ux_sec" else 1536
+        pair_tensors = encode_spark_chat_pair(
+            tokenizer, u_txt, a_txt, system_text=sys_msg, max_seq_len=max_seq_cap
+        )
+        if pair_tensors is None:
             continue
-        inp = torch.tensor([f_ids], dtype=torch.long)
-        lbl = inp.clone()
-        lbl[:, : len(p_ids)] = -100
+        inp, lbl = pair_tensors
         # Identify token IDs of banned slop / insecure phrases for FTPO unlikelihood suppression
         bad_tok_ids: List[int] = []
         for phrase in t_item.get("slop_trap_tokens", []):
@@ -3117,15 +3286,12 @@ def run_si_srsi_engram_loop(
 
     encoded_general_items = []
     for u_txt, a_txt in general_pairs:
-        prefix_str = f"<|im_start|>system\n{sys_msg}<|im_end|>\n<|im_start|>user\n{u_txt}<|im_end|>\n<|im_start|>assistant\n"
-        full_str = prefix_str + a_txt + "<|im_end|>"
-        p_ids = tokenizer(prefix_str, add_special_tokens=False).input_ids
-        f_ids = tokenizer(full_str, add_special_tokens=False).input_ids[:768]
-        if len(f_ids) <= len(p_ids) + 8:
+        pair_tensors = encode_spark_chat_pair(
+            tokenizer, u_txt, a_txt, system_text=sys_msg, max_seq_len=1536
+        )
+        if pair_tensors is None:
             continue
-        inp = torch.tensor([f_ids], dtype=torch.long)
-        lbl = inp.clone()
-        lbl[:, : len(p_ids)] = -100
+        inp, lbl = pair_tensors
         encoded_general_items.append({"domain": "general", "inp": inp, "lbl": lbl, "bad_tok_ids": []})
 
     eff_lr_eng = min(float(lr_engram), 4.5e-5)
@@ -3218,12 +3384,12 @@ def run_si_srsi_engram_loop(
         round_audits: Dict[str, Any] = {}
         for t_item in tasks:
             model.set_domain_engram_focus(t_item["domain"], boost=0.08)
-            task_max_new = 1536 if t_item["domain"] == "web_ux_sec" else 1024
+            task_max_new = 4096
             gen = generate_chat_response(
                 model, tokenizer,
                 user_prompt=t_item["prompt"],
                 max_new_tokens=task_max_new,
-                think_budget_tokens=192,
+                think_budget_tokens=2048,
                 temperature=0.1,
             )
             aud = _audit_task_rollout(t_item, gen["raw_text"])
@@ -3304,6 +3470,8 @@ def run_si_srsi_engram_loop(
 
     meta = dict(getattr(model, "loaded_meta", {}) or {})
     meta["curriculum_version"] = "v03_r2_si_srsi_engram_consolidated"
+    meta["base_model"] = "XHToken/Spark-X2.6-4B"
+    meta["merged_standalone"] = False
     meta["si_srsi_rounds"] = num_rounds
     meta["si_srsi_best_round"] = best_round_idx
     meta["active_meta"] = state_obj["active_meta"]
@@ -3360,6 +3528,8 @@ def run_continue_from_hub_engram_expansion(
     lr_mhc: float = 3.0e-5,
     unlikelihood_alpha: float = 0.25,
     default_flight_mode: str = "deep_knowledge",
+    restore_pristine_base: bool = True,
+    base_model_id: str = "XHToken/Spark-X2.6-4B",
     opencode_api_url: Optional[str] = None,
     opencode_api_key: Optional[str] = None,
     opencode_model: str = "opencode/claude-sonnet-4-5",
@@ -3369,7 +3539,9 @@ def run_continue_from_hub_engram_expansion(
     token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Continue training directly from an already-trained `TassP0lar/Spark-X2.6-4B-En4B-A1B` checkpoint:
-    1. Stage A: Joint `mHC` + `MoE-Engram` Multi-Domain Consolidation (`run_phase4_engram_consolidation`).
+    0. Optional Stage 0 (`restore_pristine_base=True`): Restore 100% pristine `XHToken/Spark-X2.6-4B` weights into `model.base`
+       (eliminating any Stage-4 backbone drift while preserving all 8 `MoE-Engram` banks and 24 `TwoStreamMHC` controllers).
+    1. Stage A: Joint `mHC` + `MoE-Engram` Multi-Domain Consolidation (`run_phase4_engram_consolidation`) on native `<|Bot|><think>` template.
     2. Stage B: Supervised Instructed Self-Recursive Self-Improvement (`run_si_srsi_engram_loop`) with OpenCode Teacher Supervision across `anti_slop`, `web_ux_sec`, and `stem_reason`.
     3. Stage C: On-the-Fly Dynamic Engram Flight Mode Ablation (`evaluate_dynamic_engram_flight_modes`) & activation of `default_flight_mode`.
     """
@@ -3377,6 +3549,15 @@ def run_continue_from_hub_engram_expansion(
     print(f"[CONTINUE FROM HUB PIPELINE] Starting from `{hub_repo_id}` -> Stage A (Phase-4) + Stage B (SI-SRSI) + Stage C (Flight Modes)")
     print("=" * 116)
     free_vram_and_prune_checkpoints(model=model, keep_latest_n=1, prune_intermediate_stage_dirs=False)
+
+    restore_res = None
+    if restore_pristine_base:
+        restore_res = restore_pristine_base_backbone(
+            model=model,
+            base_model_id=base_model_id,
+            soft_reset_mhc_gain=0.35,
+            token=token,
+        )
 
     phase4_res = None
     if num_phase4_steps > 0:
@@ -3388,10 +3569,10 @@ def run_continue_from_hub_engram_expansion(
             lr_gates=lr_gates,
             lr_mhc=lr_mhc,
             train_mhc=True,
-            max_seq_len=768,
+            max_seq_len=1536,
             eval_every=max(10, num_phase4_steps // 5),
             save_dir=str(Path(save_dir) / "stageA_phase4"),
-            push_to_hub=False,
+            push_to_hub=(push_to_hub and num_si_srsi_rounds <= 0),
             hub_repo_id=hub_repo_id,
             token=token,
         )
@@ -3423,6 +3604,7 @@ def run_continue_from_hub_engram_expansion(
     print(f"[Continued Hub Checkpoint Ready] Active Engram Flight Mode: {active_flight}")
 
     return {
+        "restore_report": restore_res,
         "phase4_report": phase4_res,
         "si_srsi_report": si_srsi_res,
         "flight_ablation": flight_res,

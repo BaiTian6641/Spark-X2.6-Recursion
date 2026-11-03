@@ -73,10 +73,11 @@ def load_sparkx_loop_v03(
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
     dtype: torch.dtype = torch.bfloat16,
     enable_loglinear_kv: bool = True,
-    loglinear_exact_threshold: int = 4096,
-    loglinear_recent_window: int = 2048,
+    loglinear_exact_threshold: int = 32768,
+    loglinear_recent_window: int = 4096,
     loglinear_sink_tokens: int = 32,
     offload_tier1b_cpu: bool = True,
+    use_pristine_base: bool = True,
     token: Optional[str] = None,
     return_meta: bool = False,
 ):
@@ -122,7 +123,7 @@ def load_sparkx_loop_v03(
     settings_dict['eng_offload_tier1b_cpu'] = offload_tier1b_cpu
     settings = LoopV03Settings(**settings_dict)
 
-    has_merged_backbone = bool(meta.get('merged_standalone', True))
+    has_merged_backbone = bool(meta.get('merged_standalone', True)) and not bool(use_pristine_base)
     backbone_source = repo_or_dir if has_merged_backbone else (base_repo or meta.get('base_model', 'XHToken/Spark-X2.6-4B'))
 
     print(f"[Loader] Loading tokenizer & standalone 36L backbone from `{backbone_source}`...")
