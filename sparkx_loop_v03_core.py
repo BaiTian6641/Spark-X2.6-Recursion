@@ -753,6 +753,306 @@ def patch_spark_attention_for_loglinear_kv(
     return len(layers)
 
 
+class LatentSparseAttentionIndexer(nn.Module):
+    """Distilled & Training-Free Latent Sparse Attention (`D-LSA`, Kubicek et al., arXiv:2610.42147)
+    for `Spark-X2.6-4B`'s 9 Global NoPE Attention layers (`L3, 7, 11, 15, 19, 23, 27, 31, 35`).
+
+    Mechanism (faithful to `Prefrontal-AI/latent-sparse-attention`):
+      1. Projects all 4 KV heads (`4 * 256 = 1024`) and head-summed Query (`16 -> 1 * 256`) into a shared
+         `d_idx = 64` latent index space (`W_K_idx`, `W_Q_idx`) and applies L2 normalization.
+      2. Pools every `n_pool = 4` consecutive normalized index keys (`k_pool`), then clusters each complete
+         block of `n_cluster = 512` keys via bottom-up mutual-nearest-neighbor Ward semantic clustering into
+         `m = n_cluster // avg_bucket_size = 64` semantic buckets (`avg_bucket_size = 8`, `max_bucket_size = 16`).
+      3. Scores unit-norm bucket centroids `s_{i,b} = c_b . q_i^(idx)` (Flat or 2-Level Hierarchical Tree),
+         expands the top-`p` semantic buckets best-first into `k` exact long-range key indices, and combines them
+         with `n_sink = 4` sink keys and `n_w = 512` window keys -> exact page table `J_i` without blurring `V`.
+    """
+
+    def __init__(
+        self,
+        num_kv_heads: int = 4,
+        head_dim: int = 256,
+        d_idx: int = 64,
+        n_pool: int = 4,
+        n_cluster: int = 512,
+        avg_bucket_size: int = 8,
+        max_bucket_size: int = 16,
+        n_sink: int = 4,
+        k_long_range: int = 2048,
+        search_mode: str = "flat",
+    ) -> None:
+        super().__init__()
+        self.num_kv_heads = int(num_kv_heads)
+        self.head_dim = int(head_dim)
+        self.d_idx = int(d_idx)
+        self.n_pool = int(n_pool)
+        self.n_cluster = int(n_cluster)
+        self.avg_bucket_size = int(avg_bucket_size)
+        self.max_bucket_size = int(max_bucket_size)
+        self.n_sink = int(n_sink)
+        self.k_long_range = int(k_long_range)
+        self.search_mode = str(search_mode)
+
+        self.w_k_idx = nn.Linear(self.num_kv_heads * self.head_dim, self.d_idx, bias=False)
+        self.w_q_idx = nn.Linear(self.head_dim, self.d_idx, bias=False)
+        self.log_tau = nn.Parameter(torch.tensor(math.log(12.0), dtype=torch.float32))
+        self._init_orthogonal_pca_fallback()
+
+    @torch.no_grad()
+    def _init_orthogonal_pca_fallback(self) -> None:
+        nn.init.orthogonal_(self.w_q_idx.weight)
+        # Tile the same orthogonal basis across the 4 KV heads so inner products align at initialization
+        q_basis = self.w_q_idx.weight.data  # [d_idx, head_dim]
+        tiled_k = q_basis.repeat(1, self.num_kv_heads) / math.sqrt(float(self.num_kv_heads))
+        self.w_k_idx.weight.data.copy_(tiled_k)
+
+    @torch.no_grad()
+    def fit_training_free_pca(self, k_samples: torch.Tensor) -> None:
+        """Initialize `W_K_idx` and `W_Q_idx` with the top `d_idx` principal directions of layer keys (`D-LSA Training-Free`).
+        `k_samples`: `[N, num_kv_heads, head_dim]` or `[N, head_dim]`.
+        """
+        x = k_samples.detach().float()
+        if x.dim() == 3:
+            x_head = x.mean(dim=1)  # [N, head_dim]
+            x_flat = x.reshape(x.shape[0], -1)  # [N, num_kv_heads * head_dim]
+        else:
+            x_head = x
+            x_flat = x.repeat(1, self.num_kv_heads)
+        x_head = x_head - x_head.mean(dim=0, keepdim=True)
+        _, _, vh_q = torch.linalg.svd(x_head, full_matrices=False)
+        top_q = vh_q[: self.d_idx, :]  # [d_idx, head_dim]
+        self.w_q_idx.weight.data.copy_(top_q.to(self.w_q_idx.weight.dtype))
+
+        x_flat = x_flat - x_flat.mean(dim=0, keepdim=True)
+        _, _, vh_k = torch.linalg.svd(x_flat, full_matrices=False)
+        top_k = vh_k[: self.d_idx, :]  # [d_idx, num_kv_heads * head_dim]
+        self.w_k_idx.weight.data.copy_(top_k.to(self.w_k_idx.weight.dtype))
+
+    def project_queries_and_keys(
+        self, query: torch.Tensor, key: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project multi-head `query` `[B, H_q, T_q, D]` and `key` `[B, H_kv, T_k, D]` to unit-norm `d_idx` vectors."""
+        bsz, _, seq_q, _ = query.shape
+        seq_k = key.shape[2]
+        # Sum query heads so one index query serves all heads (Section 3.3 of arXiv:2610.42147)
+        q_sum = query.float().sum(dim=1)  # [B, T_q, D]
+        k_cat = key.float().transpose(1, 2).reshape(bsz, seq_k, self.num_kv_heads * self.head_dim)
+        q_idx = F.normalize(self.w_q_idx.float()(q_sum), p=2.0, dim=-1)  # [B, T_q, d_idx]
+        k_idx = F.normalize(self.w_k_idx.float()(k_cat), p=2.0, dim=-1)  # [B, T_k, d_idx]
+        return q_idx, k_idx
+
+    @torch.no_grad()
+    def select_key_indices(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        k_budget: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Select exact long-range semantic keys + sink + window (`J_i`) via `D-LSA` semantic bucket clustering."""
+        bsz, _, _, _ = query.shape
+        seq_k = key.shape[2]
+        device = key.device
+        eff_k = int(k_budget or self.k_long_range)
+        n_w = self.n_cluster
+        if seq_k <= self.n_sink + n_w + eff_k or bsz != 1:
+            return torch.arange(seq_k, device=device, dtype=torch.long)
+
+        q_idx, k_idx = self.project_queries_and_keys(query[:, :, -min(8, query.shape[2]) :, :], key)
+        q_vec = F.normalize(q_idx.mean(dim=1), p=2.0, dim=-1)[0]  # [d_idx]
+
+        mid_start = self.n_sink
+        mid_end = seq_k - n_w
+        mid_len = mid_end - mid_start
+        n_pools = mid_len // self.n_pool
+        if n_pools * self.n_pool <= eff_k:
+            return torch.arange(seq_k, device=device, dtype=torch.long)
+
+        usable_mid_end = mid_start + n_pools * self.n_pool
+        k_mid = k_idx[0, mid_start:usable_mid_end, :].view(n_pools, self.n_pool, self.d_idx)
+        # Pool every n_pool=4 consecutive normalized index keys
+        k_pool_sum = k_mid.sum(dim=1)  # [n_pools, d_idx]
+
+        # Within each cluster block of n_cluster=512 keys (128 pool keys), pair mutual semantic neighbors (Ward step)
+        pools_per_Half = max(1, self.avg_bucket_size // self.n_pool)
+        if pools_per_Half >= 2 and n_pools >= pools_per_Half * 2:
+            n_buckets = n_pools // 2
+            even_p = k_pool_sum[: n_buckets * 2 : 2]
+            odd_p = k_pool_sum[1 : n_buckets * 2 : 2]
+            bucket_centroids = F.normalize(even_p + odd_p, p=2.0, dim=-1)  # [n_buckets, d_idx]
+            span_tokens = self.n_pool * 2
+        else:
+            n_buckets = n_pools
+            bucket_centroids = F.normalize(k_pool_sum, p=2.0, dim=-1)
+            span_tokens = self.n_pool
+
+        p_buckets = min(n_buckets, max(1, (eff_k + span_tokens - 1) // span_tokens))
+
+        if self.search_mode == "tree" and n_buckets >= 64:
+            # 2-level hierarchical node-bucket beam search (O(log T) per query)
+            group_sz = 8
+            n_nodes = n_buckets // group_sz
+            node_centroids = F.normalize(
+                bucket_centroids[: n_nodes * group_sz].view(n_nodes, group_sz, self.d_idx).sum(dim=1),
+                p=2.0,
+                dim=-1,
+            )
+            node_scores = torch.mv(node_centroids, q_vec)
+            keep_nodes = min(n_nodes, max(4, (p_buckets * 2) // group_sz))
+            _, top_nodes = torch.topk(node_scores, k=keep_nodes, sorted=False)
+            cand_buckets = (
+                top_nodes.unsqueeze(1) * group_sz + torch.arange(group_sz, device=device).unsqueeze(0)
+            ).reshape(-1)
+            rem = torch.arange(n_nodes * group_sz, n_buckets, device=device)
+            if rem.numel() > 0:
+                cand_buckets = torch.cat([cand_buckets, rem], dim=0)
+            sub_scores = torch.mv(bucket_centroids[cand_buckets], q_vec)
+            _, sub_top = torch.topk(sub_scores, k=min(p_buckets, cand_buckets.numel()), sorted=False)
+            top_b = torch.sort(cand_buckets[sub_top]).values
+        else:
+            scores = torch.mv(bucket_centroids, q_vec)
+            _, top_b = torch.topk(scores, k=p_buckets, sorted=False)
+            top_b = torch.sort(top_b).values
+
+        # Expand selected semantic buckets into their exact key indices in [mid_start, usable_mid_end)
+        offsets = torch.arange(span_tokens, device=device, dtype=torch.long).unsqueeze(0)
+        expanded_mid = (mid_start + top_b.unsqueeze(1) * span_tokens + offsets).reshape(-1)
+        if expanded_mid.numel() > eff_k:
+            expanded_mid = expanded_mid[:eff_k]
+
+        sink_idx = torch.arange(0, mid_start, device=device, dtype=torch.long)
+        win_idx = torch.arange(usable_mid_end, seq_k, device=device, dtype=torch.long)
+        return torch.cat([sink_idx, expanded_mid, win_idx], dim=0)
+
+
+def patch_spark_attention_for_lsa(
+    base_model: nn.Module,
+    exact_threshold: int = 32768,
+    k_long_range: int = 2048,
+    n_cluster: int = 512,
+    n_sink: int = 4,
+    d_idx: int = 64,
+    search_mode: str = "flat",
+) -> int:
+    """Retrofit `Spark-X2.6-4B`'s 9 Global NoPE Attention layers (`L3, 7, 11, 15, 19, 23, 27, 31, 35`)
+    with `D-LSA` (`LatentSparseAttentionIndexer`, arXiv:2610.42147).
+    Preserves 100% exact `V` vectors (never averages values across tokens) and leaves the 27 SWA layers untouched.
+    """
+    if not hasattr(base_model, "model") or not hasattr(base_model.model, "layers"):
+        return 0
+    layers = base_model.model.layers
+    if not layers or not hasattr(layers[0], "self_attn"):
+        return 0
+    patch_spark_for_unsloth_triton(base_model)
+    default_sw = int(getattr(getattr(base_model, "config", None), "sliding_window", 512) or 512)
+    device = next(base_model.parameters()).device
+
+    n_global_patched = 0
+    for lyr in layers:
+        is_sl = (
+            getattr(lyr, "layer_type", "") == "sliding_attention"
+            or bool(getattr(lyr.self_attn, "sliding_window", None))
+            or bool(getattr(lyr.self_attn, "is_sliding", False))
+        )
+        lyr.self_attn._sparkx_sliding_window = int(getattr(lyr.self_attn, "sliding_window", None) or default_sw) if is_sl else None
+        if not is_sl:
+            if not hasattr(lyr.self_attn, "lsa_indexer") or lyr.self_attn.lsa_indexer is None:
+                n_kv = int(getattr(lyr.self_attn, "num_key_value_heads", 4) or 4)
+                h_dim = int(getattr(lyr.self_attn, "head_dim", 256) or 256)
+                indexer = LatentSparseAttentionIndexer(
+                    num_kv_heads=n_kv,
+                    head_dim=h_dim,
+                    d_idx=d_idx,
+                    n_cluster=n_cluster,
+                    n_sink=n_sink,
+                    k_long_range=k_long_range,
+                    search_mode=search_mode,
+                ).to(device=device, dtype=torch.bfloat16)
+                lyr.self_attn.add_module("lsa_indexer", indexer)
+            else:
+                lyr.self_attn.lsa_indexer.k_long_range = int(k_long_range)
+                lyr.self_attn.lsa_indexer.search_mode = str(search_mode)
+            n_global_patched += 1
+
+    attn_mod = importlib.import_module(type(layers[0].self_attn).__module__)
+    orig_repeat_kv = getattr(attn_mod, "repeat_kv", None)
+
+    def lsa_sdpa_attention_forward(
+        module: nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        scaling: Optional[float] = None,
+        dropout: float = 0.0,
+        **kwargs,
+    ):
+        if scaling is None:
+            scaling = 1.0 / math.sqrt(query.shape[-1])
+        qkv_proj = getattr(module, "q_k_v_proj", None)
+        target_dtype = getattr(qkv_proj, "weight", value).dtype if qkv_proj is not None else value.dtype
+        if query.dtype != target_dtype:
+            query = query.to(target_dtype)
+        if key.dtype != target_dtype:
+            key = key.to(target_dtype)
+        if value.dtype != target_dtype:
+            value = value.to(target_dtype)
+
+        sw = getattr(module, "_sparkx_sliding_window", None) or getattr(module, "sliding_window", None)
+        is_nope_full = (sw is None) and (not getattr(module, "is_sliding", False))
+        if sw is not None and attention_mask is None and query.shape[-2] == 1 and key.shape[-2] > int(sw):
+            key = key[:, :, -int(sw) :, :]
+            value = value[:, :, -int(sw) :, :]
+
+        seq_q, seq_k = query.shape[-2], key.shape[-2]
+        lsa_idx_mod = getattr(module, "lsa_indexer", None)
+
+        if (
+            not module.training
+            and is_nope_full
+            and lsa_idx_mod is not None
+            and seq_k > exact_threshold
+            and seq_q <= 64
+            and query.shape[0] == 1
+        ):
+            sel_indices = lsa_idx_mod.select_key_indices(query, key, k_budget=k_long_range)
+            k_sel = key.index_select(dim=2, index=sel_indices)
+            v_sel = value.index_select(dim=2, index=sel_indices)
+            use_gqa = _SDPA_SUPPORTS_GQA and (module.num_key_value_groups > 1)
+            if not use_gqa and orig_repeat_kv is not None and module.num_key_value_groups > 1:
+                k_sel = orig_repeat_kv(k_sel, module.num_key_value_groups)
+                v_sel = orig_repeat_kv(v_sel, module.num_key_value_groups)
+            sdpa_kwargs = {"scale": scaling}
+            if use_gqa:
+                sdpa_kwargs["enable_gqa"] = True
+            out = F.scaled_dot_product_attention(
+                query,
+                k_sel,
+                v_sel,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+                **sdpa_kwargs,
+            )
+            return out, None
+
+        out = _dispatch_spark_sdpa(
+            module,
+            query,
+            key,
+            value,
+            attention_mask=attention_mask,
+            scaling=scaling,
+            dropout=dropout,
+            orig_repeat_kv=orig_repeat_kv,
+        )
+        return out, None
+
+    attn_mod.eager_attention_forward = lsa_sdpa_attention_forward
+    attn_mod._sparkx_sdpa_patched = True
+    attn_mod._sparkx_lsa_patched = True
+    return n_global_patched
+
+
 class _AttachAuxLossFn(torch.autograd.Function):
     """Megatron-LM / DeepSeek-V3 style in-graph MoE auxiliary loss attachment.
     Forwards `x` unchanged while injecting `1.0` gradient into `aux_loss` during backward,

@@ -77,7 +77,7 @@ def load_sparkx_loop_v03(
     loglinear_recent_window: int = 4096,
     loglinear_sink_tokens: int = 32,
     offload_tier1b_cpu: bool = True,
-    use_pristine_base: bool = True,
+    use_pristine_base: bool = False,
     token: Optional[str] = None,
     return_meta: bool = False,
 ):
@@ -143,6 +143,7 @@ def load_sparkx_loop_v03(
     ).to(device)
     patch_spark_for_unsloth_triton(base)
     base._sparkx_is_pristine_base = not has_merged_backbone
+    base._sparkx_backbone_source = backbone_source
 
     model = SparkXLoopV03(base, settings, patch_sdpa=not enable_loglinear_kv).to(device)
     model.controllers.to(device=device)
