@@ -386,7 +386,7 @@ def verify_single_ifeval_constraint(resp: str, inst_id: str, kw: Dict[str, Any])
         except Exception:
             return True
 
-    # 10. IFBench OOD fallback checks (word length, acrostics, JSON keys, etc.)
+    # 10. IFBench OOD constraint checks (count:*, words:*, sentence:*, format:*, repeat:*, custom:*)
     if "no_letter" in inst_id or "forbidden_letter" in inst_id:
         let = str(kw.get("letter", kw.get("forbidden_letter", ""))).lower()
         return (let not in text.lower()) if let else True
@@ -394,6 +394,94 @@ def verify_single_ifeval_constraint(resp: str, inst_id: str, kw: Dict[str, Any])
         max_len = int(kw.get("max_length", kw.get("length", 10)))
         words = re.findall(r"\b[a-zA-Z]+\b", text)
         return all(len(w) <= max_len for w in words)
+    if inst_id.startswith("count:") or "count" in inst_id:
+        if "unique" in inst_id:
+            words = [w.lower() for w in re.findall(r"\b\w+\b", text)]
+            target = int(kw.get("N", kw.get("num_words", kw.get("count", 1))))
+            return _compare_relation(len(set(words)), target, kw.get("relation", "at least"))
+        if "punctuation" in inst_id:
+            p_cnt = len(re.findall(r"[^\w\s]", text))
+            target = int(kw.get("N", kw.get("count", 1)))
+            return _compare_relation(p_cnt, target, kw.get("relation", "at least"))
+        if "conjunction" in inst_id:
+            conjs = len(re.findall(r"\b(?:and|but|or|nor|for|yet|so|because|although|since|unless|while)\b", text, flags=re.IGNORECASE))
+            target = int(kw.get("N", kw.get("count", 1)))
+            return _compare_relation(conjs, target, kw.get("relation", "at least"))
+        if "pronoun" in inst_id:
+            prons = len(re.findall(r"\b(?:i|me|my|mine|we|us|our|ours|you|your|yours|he|him|his|she|her|hers|it|its|they|them|their|theirs)\b", text, flags=re.IGNORECASE))
+            target = int(kw.get("N", kw.get("count", 1)))
+            return _compare_relation(prons, target, kw.get("relation", "at least"))
+        if "number" in inst_id or "digit" in inst_id:
+            nums = len(re.findall(r"\b\d+(?:\.\d+)?\b", text))
+            target = int(kw.get("N", kw.get("count", 1)))
+            return _compare_relation(nums, target, kw.get("relation", "at least"))
+    if inst_id.startswith("words:") or "words:" in inst_id:
+        words = re.findall(r"\b[A-Za-z]+\b", text)
+        if not words:
+            return False
+        if "alphabetical" in inst_id:
+            low = [w.lower() for w in words[: min(len(words), int(kw.get("N", len(words))))]]
+            return low == sorted(low)
+        if "vowel" in inst_id:
+            v_cnt = sum(1 for w in words if w[0].lower() in "aeiou")
+            return _compare_relation(v_cnt, int(kw.get("N", kw.get("count", 1))), kw.get("relation", "at least"))
+        if "consonant" in inst_id:
+            c_cnt = sum(1 for w in words if w[0].lower() not in "aeiou")
+            return _compare_relation(c_cnt, int(kw.get("N", kw.get("count", 1))), kw.get("relation", "at least"))
+        if "odd_even" in inst_id or "alternating" in inst_id:
+            return all((len(words[i]) % 2) != (len(words[i - 1]) % 2) for i in range(1, min(len(words), 8)))
+        if "palindrome" in inst_id:
+            pals = [w for w in words if len(w) >= 3 and w.lower() == w.lower()[::-1]]
+            return len(pals) >= int(kw.get("N", kw.get("count", 1)))
+        if "last_first" in inst_id or "chain" in inst_id:
+            return all(words[i][0].lower() == words[i - 1][-1].lower() for i in range(1, min(len(words), 6)))
+        if "start_same" in inst_id or "alliteration" in inst_id:
+            let = str(kw.get("letter", words[0][0])).lower()
+            return sum(1 for w in words if w[0].lower() == let) >= max(3, int(0.6 * len(words)))
+    if inst_id.startswith("sentence:") or "sentence:" in inst_id:
+        sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+        if not sents:
+            return False
+        if "all_caps" in inst_id:
+            nth = int(kw.get("N", kw.get("nth_sentence", 1))) - 1
+            return 0 <= nth < len(sents) and sents[nth].isupper()
+        if "word_count" in inst_id or "length" in inst_id:
+            target = int(kw.get("N", kw.get("num_words", 10)))
+            return all(_compare_relation(_count_words(s), target, kw.get("relation", "less than")) for s in sents)
+        if "question" in inst_id:
+            q_cnt = sum(1 for s in sents if s.endswith("?"))
+            return _compare_relation(q_cnt, int(kw.get("N", kw.get("count", 1))), kw.get("relation", "at least"))
+        if "exclamation" in inst_id:
+            e_cnt = sum(1 for s in sents if s.endswith("!"))
+            return _compare_relation(e_cnt, int(kw.get("N", kw.get("count", 1))), kw.get("relation", "at least"))
+    if inst_id.startswith("format:") or "format:" in inst_id:
+        if "table" in inst_id or "markdown_table" in inst_id:
+            return "|" in text and bool(re.search(r"\|\s*:?-+:", text))
+        if "code_block" in inst_id or "fenced" in inst_id:
+            return "```" in text
+        if "numbered" in inst_id or "ordered_list" in inst_id:
+            items = re.findall(r"^\s*\d+[\.\)]\s+", text, flags=re.MULTILINE)
+            return len(items) >= int(kw.get("N", kw.get("count", 1)))
+        if "xml" in inst_id or "html" in inst_id:
+            return bool(re.search(r"<([a-zA-Z0-9_]+)>.*?</\1>", text, flags=re.DOTALL))
+        if "yaml" in inst_id:
+            return bool(re.search(r"^[a-zA-Z0-9_]+\s*:\s*\S+", text, flags=re.MULTILINE))
+        if "csv" in inst_id:
+            lines = [ln for ln in text.splitlines() if "," in ln]
+            return len(lines) >= 2
+        if "parentheses" in inst_id or "brackets" in inst_id:
+            return "(" in text and ")" in text
+    if inst_id.startswith("repeat:") or "repeat:" in inst_id:
+        phrase = str(kw.get("phrase", kw.get("word", kw.get("sentence", kw.get("prompt_to_repeat", ""))))).strip()
+        if phrase:
+            cnt = len(re.findall(re.escape(phrase), text, flags=re.IGNORECASE))
+            return _compare_relation(cnt, int(kw.get("N", kw.get("count", 1))), kw.get("relation", "at least"))
+    # Generic keyword/phrase fallback for any other custom IFBench instruction with explicit kwargs
+    for k_name in ("keyword", "word", "phrase", "target", "end_phrase", "start_phrase", "marker"):
+        if k_name in kw and kw[k_name]:
+            val_str = str(kw[k_name]).strip()
+            if val_str and val_str.lower() not in text.lower():
+                return False
 
     return True
 
@@ -425,6 +513,40 @@ def verify_ifeval_item(resp: str, instruction_id_list: List[str], kwargs_list: L
         "inst_strict": strict_flags,
         "inst_loose": loose_flags,
     }
+
+
+def _ensure_ifbench_official_verifier() -> Any:
+    """Auto-clone `allenai/IFBench` and ensure NLTK resources so all 58 official IFBench OOD rules run natively."""
+    ifb_dir = Path("/content/IFBench")
+    if not ifb_dir.exists():
+        try:
+            subprocess.run(
+                ["git", "clone", "--depth", "1", "https://github.com/allenai/IFBench.git", str(ifb_dir)],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=45,
+            )
+        except Exception:
+            pass
+    try:
+        import nltk  # type: ignore
+        for pkg in ("punkt", "punkt_tab", "stopwords", "averaged_perceptron_tagger", "averaged_perceptron_tagger_eng"):
+            try:
+                nltk.download(pkg, quiet=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if ifb_dir.exists():
+        if str(ifb_dir) not in sys.path:
+            sys.path.insert(0, str(ifb_dir))
+        try:
+            import evaluation_lib as ifb_eval_lib  # type: ignore
+            return ifb_eval_lib
+        except Exception:
+            return None
+    return None
 
 
 def run_ifeval_and_ifbench_suite(
@@ -467,16 +589,7 @@ def run_ifeval_and_ifbench_suite(
         i_strict_hits, i_loose_hits, i_total = 0, 0, 0
         jsonl_rows = []
 
-        # Optional official AllenAI IFBench verifier hook if cloned locally
-        ifbench_official_fn = None
-        if bench_name == "IFBench" and Path("/content/IFBench").exists():
-            if "/content/IFBench" not in sys.path:
-                sys.path.insert(0, "/content/IFBench")
-            try:
-                import evaluation_lib as ifb_eval_lib  # type: ignore
-                ifbench_official_fn = ifb_eval_lib
-            except Exception:
-                ifbench_official_fn = None
+        ifbench_official_fn = _ensure_ifbench_official_verifier() if bench_name == "IFBench" else None
 
         for idx in range(n_total):
             row = ds[idx]
@@ -1274,7 +1387,7 @@ def _build_phase4_consolidation_pairs(token: Optional[str] = None) -> List[Tuple
     """Build a high-precision, test-disjoint pool of `(user_prompt, assistant_target)` pairs across Math, Science, SWE Diffs & IFEval."""
     from datasets import load_dataset
     pairs: List[Tuple[str, str]] = [
-        # 1. Strict IFEval / IFBench formatting & constraint exemplars
+        # 1. Strict IFEval / IFBench formatting & multi-constraint exemplars
         (
             "Explain how a Fenwick tree computes prefix sums in O(log n) time without using any commas in your response.",
             "<think>\n1. Explain binary indexed tree prefix sums in O(log n).\n2. Strictly avoid every comma character in the final output.\n</think>\n"
@@ -1287,6 +1400,21 @@ def _build_phase4_consolidation_pairs(token: Optional[str] = None) -> List[Tuple
             "<think>\n1. Output ONLY a valid JSON object with the three requested keys.\n</think>\n"
             "{\n  \"algorithm\": \"Dijkstra Shortest Path\",\n  \"time_complexity\": \"O((V + E) log V)\",\n  \"space_complexity\": \"O(V)\"\n}",
         ),
+        (
+            "Provide exactly 3 bullet points explaining why doubly-stochastic Sinkhorn matrices stabilize deep recurrent transformers. End your response with the exact phrase: Done.",
+            "<think>\n1. Use 3 markdown bullet points starting with `- `.\n2. End with `Done.`.\n</think>\n"
+            "- Doubly-stochastic matrices have non-negative entries whose rows and columns each sum to 1, bounding their spectral norm by 1.\n"
+            "- Convex combinations of the primary residual stream and highway stream prevent exponential gradient or activation explosion across 72 recurrent visits.\n"
+            "- Zero-gated identity initialization guarantees exact Pass-1 backbone fidelity while smoothly unlocking Pass-2 and Pass-3 deliberation.\n"
+            "Done.",
+        ),
+        (
+            "Write two distinct one-sentence summaries of Bell's theorem separated by exactly six asterisks ******. Do not use any commas.",
+            "<think>\n1. Write two different one-sentence summaries without commas.\n2. Separate them with `******`.\n</think>\n"
+            "Bell's theorem proves that no local hidden-variable theory can reproduce all statistical predictions of quantum mechanics.\n"
+            "******\n"
+            "Quantum entanglement violates Bell inequalities and confirms that nature is fundamentally non-local.",
+        ),
         # 2. SWE-bench unified diff patch exemplars
         (
             "Repository: `cachetools/ttl_cache`\nTarget File to Patch: `src/ttl_cache.py`\n"
@@ -1297,6 +1425,15 @@ def _build_phase4_consolidation_pairs(token: Optional[str] = None) -> List[Tuple
             "<think>\n1. The bug is `if now > expiry:` which fails when `now == expiry`.\n2. Replace `>` with `>=` in `src/ttl_cache.py`.\n</think>\n"
             "```diff\n--- a/src/ttl_cache.py\n+++ b/src/ttl_cache.py\n@@ -4,7 +4,7 @@\n         if key not in self.store:\n             return -1\n         val, expiry = self.store[key]\n-        if now > expiry:\n+        if now >= expiry:\n             del self.store[key]\n             return -1\n         self.store.move_to_end(key)\n```",
         ),
+        (
+            "Repository: `graphlib/shortest_path`\nTarget File to Patch: `graphlib/dijkstra.py`\n"
+            "### Problem Statement\n`dijkstra_grid` pops `(cost, r, c)` from the heap but never skips stale heap entries where `cost > dist[r][c]`, causing TLE on dense grids.\n"
+            "### Relevant Pre-Patch Code Context from `graphlib/dijkstra.py`\n"
+            "```python\n    while heap:\n        cost, r, c = heapq.heappop(heap)\n        if r == R - 1 and c == C - 1:\n            return cost\n```\n"
+            "Generate the minimal unified Git diff inside a ```diff ... ``` block.",
+            "<think>\n1. Add `if cost > dist[r][c]: continue` right after `heapq.heappop(heap)`.\n</think>\n"
+            "```diff\n--- a/graphlib/dijkstra.py\n+++ b/graphlib/dijkstra.py\n@@ -1,4 +1,6 @@\n     while heap:\n         cost, r, c = heapq.heappop(heap)\n+        if cost > dist[r][c]:\n+            continue\n         if r == R - 1 and c == C - 1:\n             return cost\n```",
+        ),
         # 3. Graduate Physics / Chemistry / Math (GPQA / HLE style)
         (
             "Consider a 1D quantum harmonic oscillator with Hamiltonian H = hbar * omega * (a^dagger a + 1/2). "
@@ -1306,6 +1443,16 @@ def _build_phase4_consolidation_pairs(token: Optional[str] = None) -> List[Tuple
             "3. The ratio is [(hbar*omega)^2 * N] / [(hbar*omega * N)^2] = 1/N.\n</think>\n"
             "Since the photon number $n = a^\\dagger a$ in a coherent state $|\\alpha\\rangle$ is Poisson-distributed with mean $\\langle n \\rangle = |\\alpha|^2 = N$ and variance $\\text{Var}(n) = N$, we have:\n"
             "$$\\frac{\\text{Var}(H)}{(\\langle H \\rangle - \\frac{1}{2}\\hbar\\omega)^2} = \\frac{(\\hbar\\omega)^2 N}{(\\hbar\\omega N)^2} = \\boxed{\\frac{1}{N}}$$",
+        ),
+        (
+            "A relativistic particle of rest mass m and kinetic energy K = 2 m c^2 collides elastically head-on with a stationary photon of energy E_0 << m c^2. "
+            "What is the maximum energy E_max of the backscattered photon to leading order in E_0? Put the ratio E_max / E_0 in \\boxed{}.",
+            "<think>\n1. Total energy E = K + m c^2 = 3 m c^2, so Lorentz factor gamma = 3.\n"
+            "2. Velocity beta = sqrt(1 - 1/gamma^2) = sqrt(8/9) = 2*sqrt(2)/3.\n"
+            "3. For inverse Compton head-on backscattering with E_0 << m c^2, the Doppler boost factor squared is (1 + beta) / (1 - beta) = (1 + beta)^2 * gamma^2 = (3 + 2*sqrt(2))^2 = 17 + 12*sqrt(2).\n</think>\n"
+            "For $K = 2mc^2$, the Lorentz factor is $\\gamma = 1 + K/(mc^2) = 3$ and $\\beta = \\sqrt{1 - \\gamma^{-2}} = \\frac{2\\sqrt{2}}{3}$. "
+            "In the Thomson limit $E_0 \\ll mc^2$, a head-on backscattered photon receives a double Lorentz Doppler boost:\n"
+            "$$\\frac{E_{\\max}}{E_0} = \\frac{1 + \\beta}{1 - \\beta} = \\gamma^2(1 + \\beta)^2 = (3 + 2\\sqrt{2})^2 = \\boxed{17 + 12\\sqrt{2}}$$",
         ),
     ]
 
@@ -1357,6 +1504,8 @@ def run_phase4_engram_consolidation(
     num_steps: int = 80,
     lr_engram: float = 1.5e-4,
     lr_gates: float = 5.0e-4,
+    lr_mhc: float = 3.0e-5,
+    train_mhc: bool = True,
     max_seq_len: int = 768,
     eval_every: int = 20,
     save_dir: str = "/content/sparkx_v03_phase4_consolidated",
@@ -1364,22 +1513,28 @@ def run_phase4_engram_consolidation(
     hub_repo_id: str = "TassP0lar/Spark-X2.6-4B-En4B-A1B",
     token: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Phase 4: Freeze the 36L backbone & 24 `TwoStreamMHC` controllers (`100%` reasoning preservation)
-    and train ONLY the 8 `ZipfianTieredMoEEngram` anchors (`4.0B` Total / `1.0B` Active, `32` Experts `Top-7`)
+    """Phase 4: Freeze the 36L base backbone (`model.base`, `100%` language & `<think>` preservation)
+    and jointly finalize the 24 `TwoStreamMHC` 72-Layer Recurrence Controllers (`model.controllers`)
+    and the 8 `ZipfianTieredMoEEngram` anchors (`4.11B` Total / `1.10B` Active, `32` Experts `Top-7`)
     with per-pass telescoping gates (`[0.35, 0.15, 0.05]`) and a monotonic held-out Perplexity gate."""
     import copy
     from sparkx_loop_v03_core import (
         SparkXLoopV03,
+        TwoStreamMHC,
         ZipfianTieredMoEEngram,
         loop_v03_state_dict,
     )
 
     device = next(model.base.parameters()).device
 
-    # 1. Hot-bind latest methods and ensure `pass_gain_logits` exists on all 8 in-memory Engram modules
+    # 1. Hot-bind latest methods on model, 24 TwoStreamMHC controllers, and 8 ZipfianTieredMoEEngram anchors
     for _k, _v in SparkXLoopV03.__dict__.items():
         if callable(_v) or isinstance(_v, property):
             setattr(type(model), _k, _v)
+    for ctrl in model.controllers:
+        for _k, _v in TwoStreamMHC.__dict__.items():
+            if callable(_v) or isinstance(_v, property):
+                setattr(type(ctrl), _k, _v)
     for mod in model.all_engram_modules():
         for _k, _v in ZipfianTieredMoEEngram.__dict__.items():
             if callable(_v) or isinstance(_v, property):
@@ -1396,9 +1551,9 @@ def run_phase4_engram_consolidation(
 
     # 2. Measure Baseline Held-Out Perplexity BEFORE Phase-4 training
     baseline_eval = evaluate_engram_perplexity_delta(model, tokenizer)
-    print("=" * 104)
-    print("[PHASE 4: BACKBONE-FROZEN MoE-ENGRAM CONSOLIDATION] Starting from Step-208 Checkpoint")
-    print("=" * 104)
+    print("=" * 108)
+    print("[PHASE 4: JOINT 72L mHC CONTROLLER + 8-ANCHOR MoE-ENGRAM FINALIZATION] (36L Base Backbone Frozen)")
+    print("=" * 108)
     print(
         f"  Initial Held-Out Audit : "
         f"72L No-Engram PPL = {baseline_eval['no_engram_ppl']:.4f} (CE={baseline_eval['no_engram_ce']:.5f}, Acc={baseline_eval['no_engram_acc']:.2f}%) | "
@@ -1406,11 +1561,15 @@ def run_phase4_engram_consolidation(
         f"Delta_PPL = {baseline_eval['delta_ppl']:+.4f})"
     )
 
-    # 3. Strictly freeze 36L backbone (`model.base`) and 24 `TwoStreamMHC` controllers (`model.controllers`)
+    # 3. Strictly freeze 36L backbone (`model.base`) and configure trainable `mHC` + `MoE-Engram` parameter groups
     for p in model.base.parameters():
         p.requires_grad_(False)
+
+    mhc_params = []
     for p in model.controllers.parameters():
-        p.requires_grad_(False)
+        p.requires_grad_(bool(train_mhc))
+        if train_mhc:
+            mhc_params.append(p)
 
     gate_params, expert_params = [], []
     for mod in model.all_engram_modules():
@@ -1421,10 +1580,12 @@ def run_phase4_engram_consolidation(
             else:
                 expert_params.append(p)
 
-    trainable_cnt = sum(p.numel() for p in gate_params) + sum(p.numel() for p in expert_params)
-    frozen_cnt = sum(p.numel() for p in model.base.parameters()) + sum(p.numel() for p in model.controllers.parameters())
-    print(f"  Frozen Params (Backbone + mHC) : {frozen_cnt/1e9:.3f}B (100% protected from drift)")
-    print(f"  Trainable MoE-Engram Params    : {trainable_cnt/1e9:.3f}B across 8 anchors (32 Experts, Top-7)")
+    trainable_eng_cnt = sum(p.numel() for p in gate_params) + sum(p.numel() for p in expert_params)
+    trainable_mhc_cnt = sum(p.numel() for p in mhc_params)
+    frozen_cnt = sum(p.numel() for p in model.base.parameters()) + (0 if train_mhc else sum(p.numel() for p in model.controllers.parameters()))
+    print(f"  Frozen 36L Base Backbone       : {frozen_cnt/1e9:.3f}B params (100% protected from drift)")
+    print(f"  Trainable 24x TwoStreamMHC     : {trainable_mhc_cnt/1e6:.2f}M params (train_mhc={train_mhc}, lr_mhc={lr_mhc:.1e})")
+    print(f"  Trainable 8x MoE-Engram        : {trainable_eng_cnt/1e9:.3f}B params (32 Experts Top-7, lr_engram={lr_engram:.1e}, lr_gates={lr_gates:.1e})")
 
     # 4. Build tokenized assistant-masked training batches
     raw_pairs = _build_phase4_consolidation_pairs(token=token)
@@ -1447,17 +1608,22 @@ def run_phase4_engram_consolidation(
 
     print(f"  Prepared {len(encoded_batches)} assistant-masked consolidation sequences (max_seq_len={max_seq_len}).")
 
+    param_groups = [
+        {"params": expert_params, "lr": lr_engram, "weight_decay": 0.01},
+        {"params": gate_params, "lr": lr_gates, "weight_decay": 0.0},
+    ]
+    if mhc_params:
+        param_groups.append({"params": mhc_params, "lr": lr_mhc, "weight_decay": 0.0})
+
     optimizer = torch.optim.AdamW(
-        [
-            {"params": expert_params, "lr": lr_engram, "weight_decay": 0.01},
-            {"params": gate_params, "lr": lr_gates, "weight_decay": 0.0},
-        ],
+        param_groups,
         betas=(0.9, 0.95),
         eps=1e-8,
     )
 
     best_ce = baseline_eval["with_engram_ce"]
     best_eval = dict(baseline_eval)
+    best_ctrl_sd = copy.deepcopy(model.controllers.state_dict())
     best_engram_sd = copy.deepcopy(model.engram.state_dict())
     best_backbone_engrams_sd = copy.deepcopy(model.backbone_engrams.state_dict())
 
@@ -1468,6 +1634,7 @@ def run_phase4_engram_consolidation(
     # Keep frozen backbone in eval mode so dropout/norm buffers inside base never shift
     model.base.eval()
 
+    all_trainable_params = expert_params + gate_params + mhc_params
     t_start = time.time()
     for step in range(1, num_steps + 1):
         inp_cpu, lbl_cpu = encoded_batches[(step - 1) % len(encoded_batches)]
@@ -1483,6 +1650,8 @@ def run_phase4_engram_consolidation(
             lr_mult = 0.15 + 0.85 * 0.5 * (1.0 + math.cos(math.pi * prog))
         optimizer.param_groups[0]["lr"] = lr_engram * lr_mult
         optimizer.param_groups[1]["lr"] = lr_gates * lr_mult
+        if len(optimizer.param_groups) > 2:
+            optimizer.param_groups[2]["lr"] = lr_mhc * lr_mult
 
         optimizer.zero_grad(set_to_none=True)
         out = model(input_ids=input_ids, labels=labels)
@@ -1490,7 +1659,7 @@ def run_phase4_engram_consolidation(
         ce_loss = out["ce_loss"]
         z_loss = out["z_loss"]
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(expert_params + gate_params, max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(all_trainable_params, max_norm=1.0)
         optimizer.step()
         model.step_all_tier1b_sparse_adam(lr=lr_engram * lr_mult)
 
@@ -1500,21 +1669,26 @@ def run_phase4_engram_consolidation(
             if improved:
                 best_ce = cur_eval["with_engram_ce"]
                 best_eval = dict(cur_eval)
+                best_ctrl_sd = copy.deepcopy(model.controllers.state_dict())
                 best_engram_sd = copy.deepcopy(model.engram.state_dict())
                 best_backbone_engrams_sd = copy.deepcopy(model.backbone_engrams.state_dict())
             p_scales = torch.sigmoid(model.engram.pass_gain_logits.detach().float()[:3]).tolist()
+            p2_mhc_gain = sum(float(torch.tanh(c.extra_gain.detach()).abs().item()) for c in model.controllers) / len(model.controllers)
+            p3_mhc_gain = sum(float(torch.tanh(c.p3_extra_gain.detach()).abs().item()) for c in model.controllers[8:20]) / 12.0
             z_val = float(z_loss.item()) if hasattr(z_loss, "item") else float(z_loss)
             elapsed = time.time() - t_start
             print(
                 f"  [Phase-4 Step {step:3d}/{num_steps:3d} | {elapsed:5.1f}s] "
-                f"train_ce={ce_loss.item():.4f} | z_loss={z_val:.6f} | "
-                f"Held-Out PPL: NoEng={cur_eval['no_engram_ppl']:.4f} -> EngON={cur_eval['with_engram_ppl']:.4f} "
+                f"train_ce={ce_loss.item():.4f} | z={z_val:.5f} | "
+                f"Held-Out PPL: NoEng={cur_eval['no_engram_ppl']:.4f} -> Full72L={cur_eval['with_engram_ppl']:.4f} "
                 f"(Delta={cur_eval['delta_ppl']:+.4f}, Acc={cur_eval['with_engram_acc']:.2f}%) | "
-                f"pass_scales=[P1:{p_scales[0]:.2f}, P2:{p_scales[1]:.2f}, P3:{p_scales[2]:.2f}] "
+                f"mHC=[P2:{p2_mhc_gain:.3f}, P3:{p3_mhc_gain:.3f}] | "
+                f"Eng=[P1:{p_scales[0]:.2f}, P2:{p_scales[1]:.2f}, P3:{p_scales[2]:.2f}] "
                 f"{'★ NEW BEST' if improved else ''}"
             )
 
-    # 5. Restore best validated MoE-Engram weights and return model to fast inference mode
+    # 5. Restore best validated mHC + MoE-Engram weights and return model to fast inference mode
+    model.controllers.load_state_dict(best_ctrl_sd)
     model.engram.load_state_dict(best_engram_sd)
     model.backbone_engrams.load_state_dict(best_backbone_engrams_sd)
     model.enable_checkpoint = False
@@ -1528,8 +1702,9 @@ def run_phase4_engram_consolidation(
     torch.save(state_obj, state_path)
 
     meta = dict(getattr(model, "loaded_meta", {}) or {})
-    meta["curriculum_version"] = "v03_r2_4phase_consolidated"
+    meta["curriculum_version"] = "v03_r2_4phase_mhc_engram_consolidated"
     meta["phase4_steps"] = num_steps
+    meta["phase4_train_mhc"] = bool(train_mhc)
     meta["active_meta"] = state_obj["active_meta"]
     meta.setdefault("metrics", {})
     meta["metrics"]["held_out_ppl_no_engram"] = round(best_eval["no_engram_ppl"], 4)
@@ -1537,13 +1712,13 @@ def run_phase4_engram_consolidation(
     meta["metrics"]["held_out_acc_with_engram"] = round(best_eval["with_engram_acc"], 2)
     cfg_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
-    print("=" * 104)
+    print("=" * 108)
     print(
         f"[Phase 4 Complete] Held-Out Perplexity Improved: "
         f"{baseline_eval['with_engram_ppl']:.4f} -> {best_eval['with_engram_ppl']:.4f} "
         f"(vs 72L No-Engram {best_eval['no_engram_ppl']:.4f}, Net Engram Gain = {best_eval['delta_ppl']:+.4f} PPL)"
     )
-    print(f"  Saved consolidated state to `{state_path}`")
+    print(f"  Saved consolidated 72L mHC + MoE-Engram state to `{state_path}`")
 
     if push_to_hub and token:
         try:
@@ -1555,10 +1730,11 @@ def run_phase4_engram_consolidation(
         except Exception as e:
             print(f"  [Hub Upload Warning] Could not upload to `{hub_repo_id}`: {e}")
 
-    print("=" * 104)
+    print("=" * 108)
     return {
         "baseline_eval": baseline_eval,
         "best_eval": best_eval,
         "saved_state_path": str(state_path),
     }
+
 
