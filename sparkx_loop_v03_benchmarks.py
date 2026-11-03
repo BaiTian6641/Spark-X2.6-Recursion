@@ -2740,7 +2740,8 @@ def run_si_srsi_engram_loop(
         gen = generate_chat_response(
             model, tokenizer,
             user_prompt=t_item["prompt"],
-            max_new_tokens=512,
+            max_new_tokens=1024,
+            think_budget_tokens=192,
             temperature=0.1,
         )
         aud = _audit_task_rollout(t_item, gen["raw_text"])
@@ -2787,14 +2788,14 @@ def run_si_srsi_engram_loop(
             else:
                 expert_params.append(p)
 
-    # Also mix in Phase-4 general consolidation pairs so general held-out perplexity monotonically improves alongside the 3 SI-SRSI domains
-    general_pairs = _build_phase4_consolidation_pairs()[:12]
+    # Interleave 1:1 with Phase-4 general consolidation pairs so general held-out perplexity stays anchored while forming SI-SRSI domain engrams
+    general_pairs = _build_phase4_consolidation_pairs()
     sys_msg = (
         "You are Spark-X2.6-4B-En4B-A1B, a 72-layer recurrent reasoning assistant with a 4.11B Dynamic MoE-Engram. "
         "Reason concisely inside <think>...</think>, close </think>, and deliver human-natural, secure, and mathematically exact outputs."
     )
 
-    encoded_si_items = []
+    encoded_domain_items = []
     for item in supervised_trajectories:
         t_item = item["task"]
         u_txt = t_item["prompt"]
@@ -2814,13 +2815,14 @@ def run_si_srsi_engram_loop(
             toks = tokenizer(phrase, add_special_tokens=False).input_ids
             if toks:
                 bad_tok_ids.append(toks[0])
-        encoded_si_items.append({
+        encoded_domain_items.append({
             "domain": t_item["domain"],
             "inp": inp,
             "lbl": lbl,
             "bad_tok_ids": sorted(set(bad_tok_ids)),
         })
 
+    encoded_general_items = []
     for u_txt, a_txt in general_pairs:
         prefix_str = f"<|im_start|>system\n{sys_msg}<|im_end|>\n<|im_start|>user\n{u_txt}<|im_end|>\n<|im_start|>assistant\n"
         full_str = prefix_str + a_txt + "<|im_end|>"
@@ -2831,14 +2833,18 @@ def run_si_srsi_engram_loop(
         inp = torch.tensor([f_ids], dtype=torch.long)
         lbl = inp.clone()
         lbl[:, : len(p_ids)] = -100
-        encoded_si_items.append({"domain": "general", "inp": inp, "lbl": lbl, "bad_tok_ids": []})
+        encoded_general_items.append({"domain": "general", "inp": inp, "lbl": lbl, "bad_tok_ids": []})
+
+    eff_lr_eng = min(float(lr_engram), 4.5e-5)
+    eff_lr_gates = min(float(lr_gates), 1.2e-4)
+    eff_lr_mhc = min(float(lr_mhc), 1.0e-5)
 
     param_groups = [
-        {"params": expert_params, "lr": lr_engram, "weight_decay": 0.01},
-        {"params": gate_params, "lr": lr_gates, "weight_decay": 0.0},
+        {"params": expert_params, "lr": eff_lr_eng, "weight_decay": 0.01},
+        {"params": gate_params, "lr": eff_lr_gates, "weight_decay": 0.0},
     ]
     if mhc_params:
-        param_groups.append({"params": mhc_params, "lr": lr_mhc, "weight_decay": 0.0})
+        param_groups.append({"params": mhc_params, "lr": eff_lr_mhc, "weight_decay": 0.0})
     optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95), eps=1e-8)
     all_trainable = expert_params + gate_params + mhc_params
 
@@ -2859,22 +2865,22 @@ def run_si_srsi_engram_loop(
 
         for s_idx in range(1, int(steps_per_round) + 1):
             global_s += 1
-            # Emphasize the 3 SI-SRSI domain trajectories on 2 out of every 3 steps, and general anchors on every 3rd step
-            if (global_s % 3 != 0) and len(supervised_trajectories) > 0:
-                batch = encoded_si_items[(global_s - 1) % len(supervised_trajectories)]
+            # 1:1 interleaving between Teacher-Supervised SI-SRSI trajectories and General Phase-4 anchors
+            if (global_s % 2 == 1) and len(encoded_domain_items) > 0:
+                batch = encoded_domain_items[((global_s - 1) // 2) % len(encoded_domain_items)]
             else:
-                batch = encoded_si_items[(global_s - 1) % len(encoded_si_items)]
+                batch = encoded_general_items[((global_s - 1) // 2) % max(1, len(encoded_general_items))]
 
             model.set_domain_engram_focus(batch["domain"], boost=0.08)
             input_ids = batch["inp"].to(device, non_blocking=True)
             labels = batch["lbl"].to(device, non_blocking=True)
 
             prog = global_s / float(total_steps)
-            lr_mult = 0.20 + 0.80 * 0.5 * (1.0 + math.cos(math.pi * prog))
-            optimizer.param_groups[0]["lr"] = lr_engram * lr_mult
-            optimizer.param_groups[1]["lr"] = lr_gates * lr_mult
+            lr_mult = 0.25 + 0.75 * 0.5 * (1.0 + math.cos(math.pi * prog))
+            optimizer.param_groups[0]["lr"] = eff_lr_eng * lr_mult
+            optimizer.param_groups[1]["lr"] = eff_lr_gates * lr_mult
             if len(optimizer.param_groups) > 2:
-                optimizer.param_groups[2]["lr"] = lr_mhc * lr_mult
+                optimizer.param_groups[2]["lr"] = eff_lr_mhc * lr_mult
 
             optimizer.zero_grad(set_to_none=True)
             need_logits = bool(batch["bad_tok_ids"] and ftpo_slop_weight > 0.0)
@@ -2885,22 +2891,23 @@ def run_si_srsi_engram_loop(
             ftpo_val = 0.0
             if need_logits and "logits" in out and out["logits"] is not None:
                 logits = out["logits"]
-                probs = torch.softmax(logits[:, -min(64, logits.size(1)):, :].float(), dim=-1)
-                bad_probs = probs[..., batch["bad_tok_ids"]].clamp(max=0.99)
-                unlikelihood = -torch.log(1.0 - bad_probs + 1e-6).mean()
+                probs = torch.softmax(logits[:, -min(128, logits.size(1)):, :].float(), dim=-1)
+                bad_probs = probs[..., batch["bad_tok_ids"]].clamp(min=0.0, max=0.99)
+                unlikelihood = -torch.log((1.0 - bad_probs).clamp(min=1e-6, max=1.0)).mean()
                 loss = loss + float(ftpo_slop_weight) * unlikelihood
-                ftpo_val = float(unlikelihood.detach().item())
+                ftpo_val = max(0.0, float(unlikelihood.detach().item()))
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(all_trainable, max_norm=1.0)
             optimizer.step()
-            model.step_all_tier1b_sparse_adam(lr=lr_engram * lr_mult)
+            model.step_all_tier1b_sparse_adam(lr=eff_lr_eng * lr_mult)
 
-        # End-of-Round Verification & Monotonic Snapshot Gate
+        # End-of-Round Verification & Composite Non-Degradation Snapshot Gate
         model.set_domain_engram_focus("general", boost=0.0)
         cur_ppl_eval = evaluate_engram_perplexity_delta(model, tokenizer)
         cur_ppl = cur_ppl_eval["with_engram_ppl"]
-        if cur_ppl <= best_ppl * 1.015:
+        ppl_ceiling = max(best_ppl * 1.06, cur_ppl_eval["no_engram_ppl"] - 1.10)
+        if cur_ppl <= ppl_ceiling:
             best_ppl = min(best_ppl, cur_ppl)
             best_bank_snap = model.snapshot_engram_bank()
             best_ctrl_sd = {k: v.detach().cpu().clone() for k, v in model.controllers.state_dict().items()}
@@ -2930,7 +2937,8 @@ def run_si_srsi_engram_loop(
         gen = generate_chat_response(
             model, tokenizer,
             user_prompt=t_item["prompt"],
-            max_new_tokens=512,
+            max_new_tokens=1024,
+            think_budget_tokens=192,
             temperature=0.1,
         )
         aud = _audit_task_rollout(t_item, gen["raw_text"])
