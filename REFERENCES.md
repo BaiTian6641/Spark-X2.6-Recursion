@@ -167,6 +167,102 @@ Used in [`patch_spark_attention_for_long_context`](file:///storage/emulated/10/D
 
 ---
 
+### 1.5 Latent Sparse Attention (`D-LSA`), Nested Learning, Sleep-Time Memory Compilation & Null-Space Knowledge Editing (`AlphaEdit`)
+Used in [`LatentSparseAttentionIndexer`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_loop_v03_core.py#L756-L1025), [`ZipfianTieredMoEEngram.compile_clusters_alphaedit`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_loop_v03_core.py#L1867-L2096), [`SparkXLoopV03.run_sleep_time_memory_compiler`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_loop_v03_core.py#L2627-L2779), and [`validate_vertical_sleep_memory_compiler`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_loop_v03_benchmarks.py#L3909-L4062) to implement horizontal working attention (`D-LSA`) coupled with vertical sleep-time memory consolidation (`LSA -> AlphaEdit Null-Space MoE-Engram`):
+
+1. **Latent Sparse Attention: Extending Transformative Context to 10M Tokens via Semantic Index Clustering (`D-LSA` & `T-LSA`)**
+   - **Authors:** Petr Kubicek et al. (*Prefrontal AI*)
+   - **Preprint & Code:** `arXiv:2610.42147` (2026), [https://github.com/Prefrontal-AI/latent-sparse-attention](https://github.com/Prefrontal-AI/latent-sparse-attention)
+2. **AlphaEdit: Null-Space Constrained Knowledge Editing for Language Models**
+   - **Authors:** Junfeng Fang, Houcheng Jiang, Kun Wang, Yunshan Ma, Shi Jie, Xiang Wang, Xiangnan He, Tat-Seng Chua
+   - **Publication:** *International Conference on Learning Representations (ICLR 2025, Outstanding Paper)*, [arXiv:2410.02355](https://arxiv.org/abs/2410.02355)
+3. **Nested Learning: The Illusion of Deep Learning Architectures**
+   - **Authors:** Ali Behrouz, Meisam Razaviyayn, Peilin Zhong, Vahab Mirrokni (*Google Research*)
+   - **Publication:** *Advances in Neural Information Processing Systems (NeurIPS 2025)*, [arXiv:2512.24695](https://arxiv.org/abs/2512.24695)
+4. **Titans: Learning to Memorize at Test Time**
+   - **Authors:** Ali Behrouz, Peilin Zhong, Vahab Mirrokni (*Google Research*)
+   - **Preprint:** [arXiv:2501.00663](https://arxiv.org/abs/2501.00663) (2025)
+5. **Sleep-Time Compute: Beyond Inference Scaling at Test-Time**
+   - **Authors:** Kevin Lin, Charlie Snell, Yu Wang, Charles Packer, Sarah Wooders, Ion Stoica, Joseph E. Gonzalez (*Letta & UC Berkeley*)
+   - **Preprint:** [arXiv:2504.13171](https://arxiv.org/abs/2504.13171) (2025)
+6. **Cartridges: Lightweight and General-Purpose Long Context Representations via Self-Study**
+   - **Authors:** Sabri Eyuboglu, Ryan Ehrlich, Simran Arora, Neel Guha, Dylan Zinsley, Emily Liu, Will Tennien, Atri Rudra, James Zou, Azalia Mirhoseini, Christopher Ré (*Hazy Research, Stanford University*)
+   - **Preprint:** [arXiv:2506.06266](https://arxiv.org/abs/2506.06266) (2025)
+7. **Doc-to-LoRA (`D2L`): Learning to Instantly Internalize Contexts**
+   - **Authors:** Rujikorn Charakorn, Edoardo Cetin, Yujin Tang, Robert Tjarko Lange (*Sakana AI*)
+   - **Preprint:** [arXiv:2602.15902](https://arxiv.org/abs/2602.15902) (2026)
+8. **Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention (`NSA`)**
+   - **Authors:** Jingyang Yuan et al. (*DeepSeek-AI & Peking University*)
+   - **Preprint:** [arXiv:2502.11089](https://arxiv.org/abs/2502.11089) (2025)
+
+```bibtex
+@article{kubicek2026lsa,
+  title={Latent Sparse Attention: Extending Transformative Context to 10M Tokens via Semantic Index Clustering},
+  author={Kubicek, Petr and others},
+  journal={arXiv preprint arXiv:2610.42147},
+  year={2026},
+  url={https://github.com/Prefrontal-AI/latent-sparse-attention}
+}
+
+@inproceedings{fang2025alphaedit,
+  title={AlphaEdit: Null-Space Constrained Knowledge Editing for Language Models},
+  author={Fang, Junfeng and Jiang, Houcheng and Wang, Kun and Ma, Yunshan and Jie, Shi and Wang, Xiang and He, Xiangnan and Chua, Tat-Seng},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2025},
+  url={https://arxiv.org/abs/2410.02355}
+}
+
+@inproceedings{behrouz2025nested,
+  title={Nested Learning: The Illusion of Deep Learning Architectures},
+  author={Behrouz, Ali and Razaviyayn, Meisam and Zhong, Peilin and Mirrokni, Vahab},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2025},
+  url={https://arxiv.org/abs/2512.24695}
+}
+
+@article{behrouz2025titans,
+  title={Titans: Learning to Memorize at Test Time},
+  author={Behrouz, Ali and Zhong, Peilin and Mirrokni, Vahab},
+  journal={arXiv preprint arXiv:2501.00663},
+  year={2025},
+  url={https://arxiv.org/abs/2501.00663}
+}
+
+@article{lin2025sleeptime,
+  title={Sleep-Time Compute: Beyond Inference Scaling at Test-Time},
+  author={Lin, Kevin and Snell, Charlie and Wang, Yu and Packer, Charles and Wooders, Sarah and Stoica, Ion and Gonzalez, Joseph E.},
+  journal={arXiv preprint arXiv:2504.13171},
+  year={2025},
+  url={https://arxiv.org/abs/2504.13171}
+}
+
+@article{eyuboglu2025cartridges,
+  title={Cartridges: Lightweight and General-Purpose Long Context Representations via Self-Study},
+  author={Eyuboglu, Sabri and Ehrlich, Ryan and Arora, Simran and Guha, Neel and Zinsley, Dylan and Liu, Emily and Tennien, Will and Rudra, Atri and Zou, James and Mirhoseini, Azalia and R{\'e}, Christopher},
+  journal={arXiv preprint arXiv:2506.06266},
+  year={2025},
+  url={https://arxiv.org/abs/2506.06266}
+}
+
+@article{charakorn2026doctolora,
+  title={Doc-to-LoRA: Learning to Instantly Internalize Contexts},
+  author={Charakorn, Rujikorn and Cetin, Edoardo and Tang, Yujin and Lange, Robert Tjarko},
+  journal={arXiv preprint arXiv:2602.15902},
+  year={2026},
+  url={https://arxiv.org/abs/2602.15902}
+}
+
+@article{yuan2025nsa,
+  title={Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention},
+  author={Yuan, Jingyang and Gao, Huazuo and Dai, Damai and Luo, Junyu and Zhao, Liang and Zhang, Zhengyan and Xie, Zhenda and Wei, Y. X. and Wang, Lean and Xiao, Zhiping and Wang, Yuqing and Ruan, Chong and Zhang, Ming and Liang, Wenfeng and Zeng, Wangding},
+  journal={arXiv preprint arXiv:2502.11089},
+  year={2025},
+  url={https://arxiv.org/abs/2502.11089}
+}
+```
+
+---
+
 ## 2. Curated Training & Evaluation Datasets (26 Hugging Face Sources)
 
 ### 2.1 Scientific Reasoning & PhD/University STEM Chain-of-Thought
