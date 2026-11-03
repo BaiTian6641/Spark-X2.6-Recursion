@@ -14,6 +14,7 @@ from sparkx_loop_v03_core import (
     count_en4b_a1b_params,
     load_loop_v03_state_dict,
     patch_spark_attention_for_loglinear_kv,
+    patch_spark_attention_for_lsa,
     patch_spark_for_unsloth_triton,
 )
 
@@ -149,6 +150,8 @@ def load_sparkx_loop_v03(
     model.controllers.to(device=device)
     model.engram.to(device=device)
     model.backbone_engrams.to(device=device)
+    if hasattr(model, 'esm'):
+        model.esm.to(device=device)
 
     load_loop_v03_state_dict(model, state, strict=False)
     active_meta = meta.get('active_meta', state.get('active_meta', {}))
@@ -171,11 +174,9 @@ def load_sparkx_loop_v03(
     )
 
     if enable_loglinear_kv:
-        patch_spark_attention_for_loglinear_kv(
+        patch_spark_attention_for_lsa(
             model.base,
             exact_threshold=loglinear_exact_threshold,
-            recent_window=loglinear_recent_window,
-            sink_tokens=loglinear_sink_tokens,
         )
         model.base._sparkx_exact_kv_32k = bool(loglinear_exact_threshold >= 32768)
 

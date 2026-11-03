@@ -755,6 +755,9 @@ def patch_spark_attention_for_loglinear_kv(
         if value.dtype != target_dtype:
             value = value.to(target_dtype)
 
+        if getattr(module, '_capture_sleep_qkv', False) and getattr(module, '_sleep_last_qkv', None) is None:
+            module._sleep_last_qkv = (query.detach(), key.detach(), value.detach())
+
         sw = getattr(module, '_sparkx_sliding_window', None) or getattr(module, 'sliding_window', None)
         is_nope_full = (sw is None) and (not getattr(module, 'is_sliding', False))
         if sw is not None and attention_mask is None and query.shape[-2] == 1 and key.shape[-2] > int(sw):
@@ -901,26 +904,47 @@ class LatentSparseAttentionIndexer(nn.Module):
             top_k = top_k_3d.reshape(self.d_idx, -1)
         self.w_k_idx.weight.data.copy_(top_k.to(self.w_k_idx.weight.dtype))
 
+    def _prepare_query_input(self, query: torch.Tensor) -> torch.Tensor:
+        q_f = query.float()
+        if q_f.dim() == 3:
+            q_f = q_f.permute(1, 0, 2).unsqueeze(0)  # [T, H_q, D] -> [1, H_q, T, D]
+        if self.use_rope_free_slice and self.rope_dim > 0:
+            q_f = q_f.clone()
+            q_f[..., : self.rope_dim] = 0.0
+        return q_f.sum(dim=1)  # [B, T_q, D]
+
+    def _prepare_key_input(self, key: torch.Tensor) -> torch.Tensor:
+        k_f = key.float()
+        if k_f.dim() == 3:
+            k_f = k_f.permute(1, 0, 2).unsqueeze(0)  # [T, H_kv, D] -> [1, H_kv, T, D]
+        bsz, _, seq_k, _ = k_f.shape
+        if self.use_rope_free_slice and self.rope_dim > 0:
+            k_f = k_f.clone()
+            k_f[..., : self.rope_dim] = 0.0
+        return k_f.transpose(1, 2).reshape(bsz, seq_k, self.num_kv_heads * self.head_dim)
+
+    def project_queries(self, query: torch.Tensor) -> torch.Tensor:
+        was_3d = query.dim() == 3
+        q_sum = self._prepare_query_input(query)
+        q_idx = F.normalize(F.linear(q_sum, self.w_q_idx.weight.float()), p=2.0, dim=-1, eps=1e-6)
+        return q_idx[0] if was_3d else q_idx
+
+    def project_keys(self, key: torch.Tensor) -> torch.Tensor:
+        was_3d = key.dim() == 3
+        k_cat = self._prepare_key_input(key)
+        k_idx = F.normalize(F.linear(k_cat, self.w_k_idx.weight.float()), p=2.0, dim=-1, eps=1e-6)
+        return k_idx[0] if was_3d else k_idx
+
     def project_queries_and_keys(
         self, query: torch.Tensor, key: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Project multi-head `query` `[B, H_q, T_q, D]` and `key` `[B, H_kv, T_k, D]` to unit-norm `d_idx` vectors
         using the RoPE-free pass-through slice (`dims [rope_dim:head_dim]`) without mutating module dtype (fixes M8, m1).
         """
-        bsz, _, seq_q, _ = query.shape
-        seq_k = key.shape[2]
-        q_f = query.float()
-        k_f = key.float()
-        if self.use_rope_free_slice and self.rope_dim > 0:
-            q_f = q_f.clone()
-            k_f = k_f.clone()
-            q_f[..., : self.rope_dim] = 0.0
-            k_f[..., : self.rope_dim] = 0.0
-        # Sum query heads so one index query serves all heads (Section 3.3 of arXiv:2610.42147)
-        q_sum = q_f.sum(dim=1)  # [B, T_q, D]
-        k_cat = k_f.transpose(1, 2).reshape(bsz, seq_k, self.num_kv_heads * self.head_dim)
-        q_idx = F.normalize(F.linear(q_sum, self.w_q_idx.weight.float()), p=2.0, dim=-1)  # [B, T_q, d_idx]
-        k_idx = F.normalize(F.linear(k_cat, self.w_k_idx.weight.float()), p=2.0, dim=-1)  # [B, T_k, d_idx]
+        q_sum = self._prepare_query_input(query)
+        k_cat = self._prepare_key_input(key)
+        q_idx = F.normalize(F.linear(q_sum, self.w_q_idx.weight.float()), p=2.0, dim=-1, eps=1e-6)  # [B, T_q, d_idx]
+        k_idx = F.normalize(F.linear(k_cat, self.w_k_idx.weight.float()), p=2.0, dim=-1, eps=1e-6)  # [B, T_k, d_idx]
         return q_idx, k_idx
 
     @torch.no_grad()
