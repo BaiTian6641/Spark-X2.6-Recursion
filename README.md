@@ -138,14 +138,27 @@ model, tokenizer = load_sparkx_loop_v03(
 phase4_report = bench.run_phase4_engram_consolidation(
     model,
     tokenizer,
-    num_steps=80,
+    num_steps=120,
     lr_engram=1.5e-4,
     lr_gates=5.0e-4,
     lr_mhc=3.0e-5,
     train_mhc=True,
 )
 
-# 3. Generate with 72-Layer Recurrent Deliberation (<think>...</think>)
+# 3. Switch MoE-Engram Flight Mode ON THE FLY (Zero Retraining!)
+#    - 'fast'           : Top-4 + 1 Shared =  5 Experts/tok (~0.88B Active / 4.11B Total, 3-gram)
+#    - 'balanced'       : Top-7 + 1 Shared =  8 Experts/tok (~1.14B Active / 4.11B Total, 3-gram)
+#    - 'deep_knowledge' : Elastic Top-16 + 1 Shared = 17 Experts/tok (~1.93B Active / 4.11B Total, 5-gram 9-probe)
+#    - 'max_recall'     : Elastic Top-24 + 1 Shared = 25 Experts/tok (~2.64B Active / 4.11B Total, 5-gram 9-probe)
+#    - 'full_dense'     : Elastic Top-32 + 1 Shared = 33 Experts/tok (~3.34B Active / 4.11B Total, 5-gram 9-probe)
+flight_info = model.set_engram_flight_mode("deep_knowledge")
+print(flight_info)
+
+# 4. Hot-Swap or Federate Domain-Specific Engram Knowledge Banks in <25ms
+bank_snapshot = model.snapshot_engram_bank()
+swap_stats = model.hot_swap_engram_bank(bank_snapshot, blend_alpha=1.0)  # Use 0 < blend_alpha < 1 to interpolate banks!
+
+# 5. Generate with 72-Layer Recurrent Deliberation (<think>...</think>)
 resp = bench.generate_chat_response(
     model,
     tokenizer,
@@ -154,3 +167,4 @@ resp = bench.generate_chat_response(
 )
 print(resp["answer_text"])
 ```
+

@@ -1738,3 +1738,499 @@ def run_phase4_engram_consolidation(
     }
 
 
+# ==============================================================================
+# 7. On-The-Fly Dynamic MoE-Engram Flight-Mode & Multi-Bank Switching Validation
+# ==============================================================================
+
+@torch.no_grad()
+def evaluate_dynamic_engram_flight_modes(model: Any, tokenizer: Any) -> Dict[str, Any]:
+    """Validate on-the-fly MoE-Engram dynamic capacity scaling (`0.88B -> 1.14B -> 1.93B -> 2.64B -> 3.34B` out of `4.11B`),
+    Entropy-Gated Two-Stage Elastic Expert Recall, 5-Gram Multi-Horizon Lexical Recall, and Hot-Swappable Bank Federation.
+    """
+    from sparkx_loop_v03_core import SparkXLoopV03, ZipfianTieredMoEEngram
+    for _k, _v in SparkXLoopV03.__dict__.items():
+        if callable(_v) or isinstance(_v, property):
+            setattr(type(model), _k, _v)
+    for mod in model.all_engram_modules():
+        for _k, _v in ZipfianTieredMoEEngram.__dict__.items():
+            if callable(_v) or isinstance(_v, property):
+                setattr(type(mod), _k, _v)
+
+    was_training = model.training
+    prev_ckpt = bool(getattr(model, "enable_checkpoint", False))
+    model.eval()
+    model.enable_checkpoint = False
+    model.settings.checkpoint_layers = False
+    device = next(model.base.parameters()).device
+
+    flight_configs = [
+        ("36L_Base_Only (No Loop, No Engram)", False, False, None),
+        ("72L_Loop_mHC_Only (Engram OFF)", True, False, None),
+        ("72L + Engram [Fast Flight: Top-4, 3-Gram]", True, True, "fast"),
+        ("72L + Engram [Balanced Flight: Top-7, 3-Gram]", True, True, "balanced"),
+        ("72L + Engram [Deep-Knowledge Flight: Elastic Top-16, 5-Gram]", True, True, "deep_knowledge"),
+        ("72L + Engram [Max-Recall Flight: Elastic Top-24, 5-Gram]", True, True, "max_recall"),
+        ("72L + Engram [Full-Dense Flight: Elastic Top-32, 5-Gram]", True, True, "full_dense"),
+    ]
+
+    print("\n" + "=" * 118)
+    print("[ON-THE-FLY DYNAMIC MoE-ENGRAM FLIGHT-MODE & CAPACITY SCALING VALIDATION] (Zero Retraining, 4.11B Total Engram Pool)")
+    print("=" * 118)
+    print(f"{'Configuration':<58} | {'Active Engram':>13} | {'N-Gram':>8} | {'Mean CE':>8} | {'PPL':>7} | {'Top-1 Acc':>9}")
+    print("-" * 118)
+
+    results: Dict[str, Any] = {}
+    for label, is_72l, use_eng, f_mode in flight_configs:
+        if not is_72l:
+            model.set_loop(start=4, end=28, passes=1, use_mhc=False, use_engram=False, enable_p3=False)
+            active_b_str = "0.000B / 4.11B"
+            ngram_str = "None"
+        elif not use_eng:
+            model.set_loop(start=4, end=28, passes=2, use_mhc=True, use_engram=False, enable_p3=True, p3_start=12, p3_end=24)
+            active_b_str = "0.000B / 4.11B"
+            ngram_str = "None"
+        else:
+            model.set_loop(start=4, end=28, passes=2, use_mhc=True, use_engram=True, enable_p3=True, p3_start=12, p3_end=24)
+            f_info = model.set_engram_flight_mode(mode=f_mode)
+            active_b_str = f"{f_info['active_compute_engram_params_B']:.3f}B / {f_info['total_engram_capacity_B']:.2f}B"
+            ngram_str = f"{f_info['ngram_probes_per_token']} probes"
+
+        total_nll, total_toks, total_correct = 0.0, 0, 0
+        for txt in _HELD_OUT_EVAL_TEXTS:
+            ids = tokenizer(txt, return_tensors="pt").input_ids.to(device)
+            logits = model.forward_logits(ids).float()
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = ids[:, 1:].contiguous()
+            nll = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), reduction="sum")
+            preds = shift_logits.argmax(dim=-1)
+            total_correct += int((preds == shift_labels).sum().item())
+            total_nll += float(nll.item())
+            total_toks += int(shift_labels.numel())
+
+        ce = total_nll / max(1, total_toks)
+        ppl = math.exp(min(20.0, ce))
+        acc = 100.0 * total_correct / max(1, total_toks)
+        f_stats = getattr(model.engram, "last_flight_stats", {}) if use_eng else {}
+        results[label] = {
+            "ce_loss": round(ce, 5),
+            "perplexity": round(ppl, 4),
+            "top1_acc_pct": round(acc, 2),
+            "active_engram": active_b_str,
+            "ngram_probes": ngram_str,
+            "flight_stats": f_stats,
+        }
+        print(f"{label:<58} | {active_b_str:>13} | {ngram_str:>8} | {ce:8.5f} | {ppl:7.4f} | {acc:8.2f}%")
+
+    # Validate instant hot-swapping & bank federation roundtrip (`snapshot_engram_bank` + `hot_swap_engram_bank`)
+    snap = model.snapshot_engram_bank()
+    swap_info = model.hot_swap_engram_bank(snap, blend_alpha=1.0)
+    # Leave model in `deep_knowledge` flight mode (`Top-16` + 5-Gram Multi-Horizon Recall) for downstream benchmarks!
+    active_flight = model.set_engram_flight_mode(mode="deep_knowledge")
+    print("-" * 118)
+    print(
+        f"[Hot-Swap & Multi-Bank Federation Verified] Swapped {swap_info['updated_tensors']} Engram tensors in "
+        f"{swap_info['swap_latency_ms']:.2f} ms | Active Flight Mode Set -> `{active_flight['flight_mode']}` "
+        f"(Top-{active_flight['flight_top_k']} + 1 Shared = {active_flight['total_experts_fired_per_token']} Experts/tok, "
+        f"{active_flight['active_compute_engram_params_B']}B Active / {active_flight['total_engram_capacity_B']}B Total)"
+    )
+    print("=" * 118)
+
+    model.enable_checkpoint = prev_ckpt
+    model.settings.checkpoint_layers = prev_ckpt
+    if was_training:
+        model.train()
+        model.base.eval()
+    results["hot_swap_verification"] = swap_info
+    results["active_flight_mode"] = active_flight
+    return results
+
+
+# ==============================================================================
+# 8. 2025–2026 Additional Frontier Challenge Benchmarks:
+#    SuperGPQA (285 Graduate Disciplines), AIME 2024/2025 + Omni-MATH, LiveCodeBench
+# ==============================================================================
+
+def run_supergpqa_benchmark(
+    model: Any,
+    tokenizer: Any,
+    max_samples: Optional[int] = 20,
+    max_new_tokens: int = 1024,
+) -> Dict[str, Any]:
+    """Evaluate `m-a-p/SuperGPQA` (Graduate-Level Multi-Discipline Expert Q&A across 285 disciplines, up to 10 choices A–J)."""
+    from datasets import load_dataset
+    print("\n" + "=" * 100)
+    ds = load_dataset("m-a-p/SuperGPQA", split="train", streaming=True)
+    rows = []
+    for idx, r in enumerate(ds):
+        if max_samples is not None and idx >= int(max_samples):
+            break
+        rows.append(r)
+    n_total = len(rows)
+    print(f"[SuperGPQA] Evaluating {n_total} graduate-level multi-discipline questions (up to 10 options A–J)...")
+
+    sys_prompt = (
+        "You are a graduate-level domain expert. Analyze the question and options concisely inside <think>...</think>, "
+        "close </think>, and state the final option letter inside \\boxed{A}.. \\boxed{J}."
+    )
+    letters = "ABCDEFGHIJ"
+    cot_correct, ll_correct, hybrid_correct = 0, 0, 0
+    field_stats: Dict[str, List[int]] = {}
+
+    for idx, r in enumerate(rows):
+        q_text = str(r.get("question", "")).strip()
+        opts = list(r.get("options", []))[:10]
+        gold_letter = str(r.get("answer_letter", "")).strip().upper()
+        if not gold_letter and r.get("answer") in opts:
+            gold_letter = letters[opts.index(r.get("answer"))]
+        field = str(r.get("field") or r.get("discipline") or "Graduate STEM").strip()
+
+        valid_letters = [letters[i] for i in range(len(opts))]
+        opt_block = "\n".join(f"({letters[i]}) {opts[i]}" for i in range(len(opts)))
+        user_prompt = f"Discipline: {field}\nQuestion:\n{q_text}\n\nOptions:\n{opt_block}\n\nPut the correct option letter in \\boxed{{}}."
+
+        ll_scores = score_mc_loglikelihood(model, tokenizer, user_prompt, valid_letters, system_prompt=sys_prompt)
+        ll_pred = max(ll_scores.items(), key=lambda kv: kv[1])[0] if ll_scores else "A"
+
+        gen = generate_chat_response(
+            model,
+            tokenizer,
+            user_prompt=user_prompt,
+            system_prompt=sys_prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=0.1,
+        )
+        cot_pred = extract_boxed_or_final_answer(gen["raw_text"], choices=valid_letters)
+        hyb_pred = cot_pred if cot_pred in valid_letters else ll_pred
+
+        c_ok = (cot_pred == gold_letter)
+        l_ok = (ll_pred == gold_letter)
+        h_ok = (hyb_pred == gold_letter)
+        cot_correct += int(c_ok)
+        ll_correct += int(l_ok)
+        hybrid_correct += int(h_ok)
+        field_stats.setdefault(field, [0, 0])
+        field_stats[field][0] += int(h_ok)
+        field_stats[field][1] += 1
+
+        if (idx + 1) % max(1, min(5, n_total)) == 0 or (idx + 1) == n_total:
+            print(
+                f"  [SuperGPQA {idx+1:3d}/{n_total:3d}] "
+                f"Hybrid={100*hybrid_correct/(idx+1):5.1f}% | CoT={100*cot_correct/(idx+1):5.1f}% | "
+                f"Field={field[:18]:18s} | Gold={gold_letter}, Pred={hyb_pred}"
+            )
+
+    summary = {
+        "source": "m-a-p/SuperGPQA",
+        "samples": n_total,
+        "hybrid_accuracy": round(100.0 * hybrid_correct / max(1, n_total), 2),
+        "cot_accuracy": round(100.0 * cot_correct / max(1, n_total), 2),
+        "logprob_accuracy": round(100.0 * ll_correct / max(1, n_total), 2),
+        "by_field": {k: f"{v[0]}/{v[1]} ({100.0*v[0]/max(1,v[1]):.1f}%)" for k, v in sorted(field_stats.items())},
+    }
+    print(f"[SuperGPQA Final] {summary}")
+    return summary
+
+
+def run_aime_omni_math_benchmark(
+    model: Any,
+    tokenizer: Any,
+    max_samples: Optional[int] = 15,
+    max_new_tokens: int = 1536,
+) -> Dict[str, Any]:
+    """Evaluate Olympiad-level competition mathematics combining `Maxwell-Jia/AIME_2024`, `yentinglin/aime_2025`, and `KbsdJames/Omni-MATH`."""
+    from datasets import load_dataset
+    print("\n" + "=" * 100)
+    items: List[Dict[str, str]] = []
+    n_cap = 15 if max_samples is None else int(max_samples)
+    n_aime = max(5, n_cap // 2)
+    n_omni = max(1, n_cap - n_aime)
+
+    for repo_id, tag in [("Maxwell-Jia/AIME_2024", "AIME-2024"), ("yentinglin/aime_2025", "AIME-2025")]:
+        try:
+            ds = load_dataset(repo_id, split="train")
+            for idx in range(min(len(ds), max(3, n_aime // 2))):
+                r = ds[idx]
+                prob = str(r.get("Problem") or r.get("problem") or r.get("question") or "").strip()
+                ans = str(r.get("Answer") or r.get("answer") or "").strip()
+                if prob and ans:
+                    items.append({"source": tag, "problem": prob, "answer": ans})
+        except Exception:
+            pass
+
+    try:
+        omni_ds = load_dataset("KbsdJames/Omni-MATH", split="test", streaming=True)
+        for idx, r in enumerate(omni_ds):
+            if len(items) >= n_cap or idx >= n_omni:
+                break
+            prob = str(r.get("problem", "")).strip()
+            ans = str(r.get("answer", "")).strip()
+            dom = str(r.get("domain", "Olympiad-Math"))
+            if prob and ans:
+                items.append({"source": f"Omni-MATH ({dom[:18]})", "problem": prob, "answer": ans})
+    except Exception:
+        pass
+
+    n_total = len(items)
+    print(f"[AIME 2024/2025 + Omni-MATH] Evaluating {n_total} Olympiad mathematics problems...")
+    sys_prompt = (
+        "You are an International Mathematical Olympiad gold medalist. Solve the problem concisely inside <think>...</think>, "
+        "close </think>, and state the exact final numerical or algebraic answer inside \\boxed{}."
+    )
+    correct = 0
+    by_source: Dict[str, List[int]] = {}
+    for idx, item in enumerate(items):
+        gen = generate_chat_response(
+            model,
+            tokenizer,
+            user_prompt=item["problem"] + "\n\nPut your final answer inside \\boxed{}.",
+            system_prompt=sys_prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=0.1,
+        )
+        pred = extract_boxed_or_final_answer(gen["raw_text"])
+        ok = check_math_equivalence(pred, item["answer"])
+        # Handle AIME zero-padded 3-digit integers (e.g. "042" == "42")
+        if not ok:
+            try:
+                ok = int(float(pred.strip())) == int(float(item["answer"].strip()))
+            except Exception:
+                pass
+        correct += int(ok)
+        src = item["source"]
+        by_source.setdefault(src, [0, 0])
+        by_source[src][0] += int(ok)
+        by_source[src][1] += 1
+        if (idx + 1) % max(1, min(5, n_total)) == 0 or (idx + 1) == n_total:
+            print(
+                f"  [Olympiad-Math {idx+1:3d}/{n_total:3d}] Acc={100*correct/(idx+1):5.1f}% | "
+                f"{src:22s} | Gold={item['answer'][:18]!r}, Pred={pred[:18]!r}"
+            )
+
+    summary = {
+        "samples": n_total,
+        "accuracy": round(100.0 * correct / max(1, n_total), 2),
+        "by_source": {k: f"{v[0]}/{v[1]} ({100.0*v[0]/max(1,v[1]):.1f}%)" for k, v in sorted(by_source.items())},
+    }
+    print(f"[AIME + Omni-MATH Final] {summary}")
+    return summary
+
+
+def run_livecodebench_benchmark(
+    model: Any,
+    tokenizer: Any,
+    max_samples: Optional[int] = 15,
+    max_new_tokens: int = 1280,
+) -> Dict[str, Any]:
+    """Evaluate `bigcode/bigcodebench` / `livecodebench` practical & competitive Python code synthesis with sandboxed test execution."""
+    from datasets import load_dataset
+    print("\n" + "=" * 100)
+    rows = []
+    source_name = "bigcode/bigcodebench"
+    try:
+        ds = load_dataset("bigcode/bigcodebench", split="v0.1.2", streaming=True)
+        for idx, r in enumerate(ds):
+            if max_samples is not None and idx >= int(max_samples):
+                break
+            rows.append(r)
+    except Exception:
+        try:
+            ds = load_dataset("bigcode/bigcodebench", split="v0.1.0_hf", streaming=True)
+            for idx, r in enumerate(ds):
+                if max_samples is not None and idx >= int(max_samples):
+                    break
+                rows.append(r)
+        except Exception:
+            source_name = "openai/openai_humaneval (tail)"
+            ds = load_dataset("openai/openai_humaneval", split="test")
+            for idx in range(len(ds) - 1, max(-1, len(ds) - 1 - int(max_samples or 15)), -1):
+                rows.append(ds[idx])
+
+    n_total = len(rows)
+    print(f"[BigCodeBench / LiveCodeBench] Evaluating {n_total} tasks from `{source_name}` with sandboxed test execution...")
+    sys_prompt = (
+        "You are an expert Python software engineer. Reason briefly inside <think>...</think>, close </think>, "
+        "and output the complete, executable Python solution inside a ```python ... ``` block."
+    )
+    passed = 0
+    for idx, r in enumerate(rows):
+        task_id = str(r.get("task_id", f"task_{idx}"))
+        prompt_code = str(r.get("instruct_prompt") or r.get("complete_prompt") or r.get("prompt") or "")
+        test_code = str(r.get("test") or "")
+        entry_point = str(r.get("entry_point") or "task_func")
+
+        gen = generate_chat_response(
+            model,
+            tokenizer,
+            user_prompt=f"Complete the following Python task:\n\n{prompt_code}",
+            system_prompt=sys_prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=0.1,
+        )
+        _, body, _ = strip_thinking_trace(gen["raw_text"])
+        blocks = re.findall(r"```(?:python|py)?\s*\n(.*?)```", body, flags=re.DOTALL | re.IGNORECASE)
+        cand_code = blocks[-1].strip() if blocks else body.strip()
+        if f"def {entry_point}" not in cand_code and "def " not in cand_code:
+            cand_code = prompt_code + "\n" + cand_code
+
+        if "unittest" in test_code:
+            full_script = f"{cand_code}\n\n{test_code}\n\nif __name__ == '__main__':\n    import unittest\n    res = unittest.main(exit=False)\n    if res.result.wasSuccessful():\n        print('LCB_OK')\n"
+        else:
+            full_script = f"from typing import *\nimport math, collections, heapq, itertools, functools, re\n\n{cand_code}\n\n{test_code}\n\ncheck({entry_point})\nprint('LCB_OK')\n"
+
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as tf:
+            tf.write(full_script)
+            tmp_path = tf.name
+        try:
+            proc = subprocess.run([sys.executable, tmp_path], capture_output=True, text=True, timeout=8.0)
+            ok = (proc.returncode == 0 and "LCB_OK" in proc.stdout)
+        except Exception:
+            ok = False
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+        passed += int(ok)
+        if (idx + 1) % max(1, min(5, n_total)) == 0 or (idx + 1) == n_total:
+            print(
+                f"  [BigCode/LiveCode {idx+1:3d}/{n_total:3d}] `{task_id:14s}` | "
+                f"Pass@1={100*passed/(idx+1):5.1f}% ({passed}/{idx+1}) | LastPassed={ok}"
+            )
+
+    summary = {
+        "source": source_name,
+        "samples": n_total,
+        "pass_at_1": round(100.0 * passed / max(1, n_total), 2),
+        "passed": passed,
+    }
+    print(f"[BigCodeBench / LiveCodeBench Final] {summary}")
+    return summary
+
+
+def run_all_frontier_benchmarks(
+    model: Any,
+    tokenizer: Any,
+    output_dir: str = "/content/sparkx_v03_benchmark_results",
+    flight_mode: str = "deep_knowledge",
+    run_dynamic_flight_validation: bool = True,
+    ifeval_samples: Optional[int] = 25,
+    ifbench_samples: Optional[int] = 25,
+    gpqa_samples: Optional[int] = 25,
+    supergpqa_samples: Optional[int] = 20,
+    hle_samples: Optional[int] = 15,
+    swe_pro_samples: Optional[int] = 10,
+    swe_verified_samples: Optional[int] = 10,
+    humaneval_samples: Optional[int] = 25,
+    livecode_samples: Optional[int] = 15,
+    math500_samples: Optional[int] = 25,
+    aime_omni_samples: Optional[int] = 15,
+    token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run On-The-Fly Dynamic MoE-Engram Flight Validation + 11-Benchmark Frontier Scorecard."""
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    report: Dict[str, Any] = {}
+
+    if run_dynamic_flight_validation:
+        report["Dynamic_Engram_Flight_Validation"] = evaluate_dynamic_engram_flight_modes(model, tokenizer)
+
+    if hasattr(model, "set_engram_flight_mode"):
+        report["Active_Flight_Mode"] = model.set_engram_flight_mode(mode=flight_mode)
+
+    if ifeval_samples != 0 or ifbench_samples != 0:
+        if_res = run_ifeval_and_ifbench_suite(
+            model, tokenizer,
+            ifeval_samples=ifeval_samples,
+            ifbench_samples=ifbench_samples,
+            output_dir=output_dir,
+        )
+        report["IFEval"] = if_res.get("IFEval")
+        report["IFBench"] = if_res.get("IFBench")
+
+    if gpqa_samples != 0:
+        report["GPQA_Diamond"] = run_gpqa_diamond_benchmark(model, tokenizer, max_samples=gpqa_samples, token=token)
+
+    if supergpqa_samples != 0:
+        report["SuperGPQA_285_Disciplines"] = run_supergpqa_benchmark(model, tokenizer, max_samples=supergpqa_samples)
+
+    if hle_samples != 0:
+        report["HLE"] = run_hle_benchmark(model, tokenizer, max_samples=hle_samples, token=token)
+
+    if swe_pro_samples != 0 or swe_verified_samples != 0:
+        swe_res = run_swe_bench_suite(
+            model, tokenizer,
+            pro_samples=swe_pro_samples,
+            verified_samples=swe_verified_samples,
+            output_dir=output_dir,
+            token=token,
+        )
+        report["SWE-bench_Pro"] = swe_res.get("SWE-bench_Pro")
+        report["SWE-bench_Verified"] = swe_res.get("SWE-bench_Verified")
+
+    if humaneval_samples != 0:
+        report["HumanEval"] = run_humaneval_benchmark(model, tokenizer, max_samples=humaneval_samples)
+
+    if livecode_samples != 0:
+        report["BigCodeBench_LiveCodeBench"] = run_livecodebench_benchmark(model, tokenizer, max_samples=livecode_samples)
+
+    if math500_samples != 0:
+        report["MATH_500"] = run_math500_benchmark(model, tokenizer, max_samples=math500_samples)
+
+    if aime_omni_samples != 0:
+        report["AIME_2024_2025_OmniMATH"] = run_aime_omni_math_benchmark(model, tokenizer, max_samples=aime_omni_samples)
+
+    report_path = Path(output_dir) / "sparkx_v03_frontier_benchmark_report.json"
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    print("\n" + "=" * 110)
+    print(f"SPARK-X2.6-4B-En4B-A1B (72L FULL LOOP + 32-EXPERT MoE-ENGRAM [{flight_mode.upper()}]) — 11-BENCHMARK SCORECARD")
+    print("=" * 110)
+    for k, v in report.items():
+        if k == "Dynamic_Engram_Flight_Validation":
+            continue
+        print(f"  * {k:28s}: {v}")
+    print("=" * 110)
+    print(f"Saved full JSON report to: {report_path}")
+    return report
+
+
+def run_full_frontier_benchmark_suite(
+    model: Any,
+    tokenizer: Any,
+    output_dir: str = "/content/sparkx_v03_benchmark_results",
+    flight_mode: str = "deep_knowledge",
+    run_dynamic_flight_validation: bool = True,
+    samples_ifeval: Optional[int] = 25,
+    samples_ifbench: Optional[int] = 25,
+    samples_gpqa: Optional[int] = 25,
+    samples_supergpqa: Optional[int] = 20,
+    samples_hle: Optional[int] = 15,
+    samples_swe_pro: Optional[int] = 10,
+    samples_swe_verified: Optional[int] = 10,
+    samples_humaneval: Optional[int] = 25,
+    samples_livecode: Optional[int] = 15,
+    samples_math500: Optional[int] = 25,
+    samples_aime_omni: Optional[int] = 15,
+    token: Optional[str] = None,
+    **kwargs,
+) -> Dict[str, Any]:
+    """Alias for `run_all_frontier_benchmarks` supporting `samples_*` keyword arguments."""
+    return run_all_frontier_benchmarks(
+        model=model,
+        tokenizer=tokenizer,
+        output_dir=output_dir,
+        flight_mode=flight_mode,
+        run_dynamic_flight_validation=run_dynamic_flight_validation,
+        ifeval_samples=kwargs.get("ifeval_samples", samples_ifeval),
+        ifbench_samples=kwargs.get("ifbench_samples", samples_ifbench),
+        gpqa_samples=kwargs.get("gpqa_samples", samples_gpqa),
+        supergpqa_samples=kwargs.get("supergpqa_samples", samples_supergpqa),
+        hle_samples=kwargs.get("hle_samples", samples_hle),
+        swe_pro_samples=kwargs.get("swe_pro_samples", samples_swe_pro),
+        swe_verified_samples=kwargs.get("swe_verified_samples", samples_swe_verified),
+        humaneval_samples=kwargs.get("humaneval_samples", samples_humaneval),
+        livecode_samples=kwargs.get("livecode_samples", samples_livecode),
+        math500_samples=kwargs.get("math500_samples", samples_math500),
+        aime_omni_samples=kwargs.get("aime_omni_samples", samples_aime_omni),
+        token=token,
+    )

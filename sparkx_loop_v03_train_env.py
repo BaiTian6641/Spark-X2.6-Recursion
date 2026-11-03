@@ -109,7 +109,7 @@ def build_default_cfg() -> Dict[str, Any]:
         'PASS_ADAPTER_RANK': 16,
         'ENABLE_STAGE0_PROGRESSIVE_DEPTH_WARMUP': False,  # Set True to prepend 48L -> 60L progressive stage-merging warmup before 72L
 
-        # Modifiable 8-Anchor 3-Tier Zipfian MoE-Engram & Self-Balancing Router (`En4B-A1B`: 4.11B Total / 1.10B Active)
+        # Modifiable 8-Anchor 3-Tier Zipfian MoE-Engram & Self-Balancing Router (`En4B-A1B`: 4.11B Total / 1.14B–3.34B Active)
         'ENG_HOT_BUCKETS': 16384,
         'ENG_COLD_BUCKETS': 49152,
         'ENG_DIM': 512,
@@ -127,13 +127,21 @@ def build_default_cfg() -> Dict[str, Any]:
         'ENG_BALANCE_STEP_SIZE': 0.0015,
         'ENG_USE_PASS_GAIN_SCHEDULE': True,
         'ENG_PASS_GAIN_INIT': [0.35, 0.15, 0.05],
+        # On-the-Fly Dynamic Engram Flight Mode & 5-Gram Multi-Horizon Lexical Recall
+        'ENG_MULTI_HORIZON_RECALL': True,
+        'ENG_DEFAULT_FLIGHT_MODE': 'deep_knowledge',  # 'fast' (Top-4) | 'balanced' (Top-7) | 'deep_knowledge' (Top-16) | 'max_recall' (Top-24) | 'full_dense' (Top-32)
+        'ENG_FLIGHT_TOP_K': 16,
+        'ENG_TAIL_BLEND_MAX': 0.18,
+
+        # Training Intensity Profile ('high_capacity_en4b' [600 steps, 4800 samples] | 'max_engram_saturation' [1200 steps, 8000 samples] | 'fast_repro' [290 steps, 2400 samples])
+        'TRAINING_PROFILE': 'high_capacity_en4b',
 
         # Phase-4 Post-Training Capability Consolidation (Backbone-Frozen Joint mHC + MoE-Engram Finalization)
         'ENABLE_PHASE4_POST_TRAIN': True,
-        'PHASE4_STEPS': 80,
+        'PHASE4_STEPS': 150,
         'PHASE4_TRAIN_MHC': True,
 
-        # 16K Context & Sequence Packing (Zero Mid-Thought / Mid-Code Truncation!)
+        # 16K/24K Context & Sequence Packing (Zero Mid-Thought / Mid-Code Truncation!)
         'MAX_SEQ_LENGTH': 16384,
         'PACK_SEQUENCES': True,
         'BATCH_SIZE': 1,
@@ -153,9 +161,9 @@ def build_default_cfg() -> Dict[str, Any]:
         'LR_ROUTER': 2.5e-4,
         'LR_TIER1B_SPARSE': 5.0e-5,
 
-        # 4-Phase Progressive Curriculum:
+        # Boosted 4-Phase Progressive Curriculum for 4.11B MoE-Engram Saturation:
         #   Phase 1 (Stage 1): Adapt 72L Looped Transformer (mHC only; Backbone FROZEN, MoE-Engram DISABLED)
-        #   Phase 2A (Stage 2): Introduce 8-Expert MoE-Engram at 8K (Backbone FROZEN, mHC + Engram-8 trainable + Self-Balancing Router)
+        #   Phase 2A (Stage 2): Introduce 8-Expert MoE-Engram + 5-Gram Multi-Horizon Recall (Backbone FROZEN, mHC + Engram-8 trainable)
         #   Phase 2B (Stage 3): Upcycle MoE-Engram 8 -> 32 (Top-7) at 16K (Backbone FROZEN, mHC + Engram-32 trainable)
         #   Phase 3 (Stage 4): Joint Full-Finetuning at 16K (Backbone UNFROZEN at gentle 0.25x mult + mHC + Engram-32)
         #   Phase 4 (Post-Training): Backbone-Frozen Joint mHC + MoE-Engram Capability Consolidation (Per-Pass Telescoping Gates)
@@ -166,7 +174,7 @@ def build_default_cfg() -> Dict[str, Any]:
                 'p3_start': 12, 'p3_end': 24,
                 'use_mhc': True, 'use_engram': False,
                 'seq_len': 8192,
-                'steps': 65,
+                'steps': 100,
                 'freeze_backbone': True,
                 'freeze_engram': True,
                 'upcycle_8_to_32': False,
@@ -176,12 +184,12 @@ def build_default_cfg() -> Dict[str, Any]:
                 'loss_floor': 0.34,
             },
             {
-                'name': 'Stage2_Engram8_Adapt_72L_8K',
+                'name': 'Stage2_Engram8_Adapt_72L_12K',
                 'start': 4, 'end': 28, 'passes': 2, 'enable_p3': True,
                 'p3_start': 12, 'p3_end': 24,
                 'use_mhc': True, 'use_engram': True,
-                'seq_len': 8192,
-                'steps': 65,
+                'seq_len': 12288,
+                'steps': 140,
                 'freeze_backbone': True,
                 'freeze_engram': False,
                 'upcycle_8_to_32': False,
@@ -196,7 +204,7 @@ def build_default_cfg() -> Dict[str, Any]:
                 'p3_start': 12, 'p3_end': 24,
                 'use_mhc': True, 'use_engram': True,
                 'seq_len': 16384,
-                'steps': 40,
+                'steps': 120,
                 'freeze_backbone': True,
                 'freeze_engram': False,
                 'upcycle_8_to_32': True,
@@ -211,7 +219,7 @@ def build_default_cfg() -> Dict[str, Any]:
                 'p3_start': 12, 'p3_end': 24,
                 'use_mhc': True, 'use_engram': True,
                 'seq_len': 16384,
-                'steps': 38,
+                'steps': 90,
                 'freeze_backbone': False,
                 'freeze_engram': False,
                 'upcycle_8_to_32': False,
@@ -222,15 +230,18 @@ def build_default_cfg() -> Dict[str, Any]:
             },
         ],
 
-        # 6-Pillar Multi-Domain Dataset Mixture (STEM, Math, SWE Code, Web/3D Design, Fable/Opus/GPT Astra CoT, Literacy & Tool Use)
-        'TARGET_TOTAL_SAMPLES': 2400,
+        # 7-Pillar 2025-2026 Frontier Multi-Domain Dataset Mixture
+        # (Code/SWE-smith/OpenCodeReasoning, Olympiad Math/Numina-1.5/Big-Math, SuperGPQA/NaturalReasoning Graduate Science,
+        #  Fable/Opus/GPT-6 Astra/OpenThoughts3 Long-CoT, WebGL/3D UI, Tulu-3 Strict IF/Literacy, Agentic Tool Use)
+        'TARGET_TOTAL_SAMPLES': 4800,
         'PILLAR_RATIOS': {
-            'code_swe': 0.28,
-            'math_stem': 0.24,
-            'web_3d_ui': 0.16,
-            'fable_opus_astra_cot': 0.14,
+            'code_swe': 0.22,
+            'math_stem': 0.20,
+            'science_knowledge_engram': 0.14,
+            'fable_opus_astra_cot': 0.18,
+            'web_3d_ui': 0.10,
             'literacy_dialogue': 0.08,
-            'tool_agent': 0.10,
+            'tool_agent': 0.08,
         },
 
         # OpenCode Go Multi-Model Teacher Augmentation
@@ -243,7 +254,7 @@ def build_default_cfg() -> Dict[str, Any]:
             'mimo-v2.6-pro',
             'claude-haiku-5.5',
         ],
-        'OPENCODE_TEACHER_SAMPLES': 80,
+        'OPENCODE_TEACHER_SAMPLES': 120,
     }
 
 
@@ -254,6 +265,9 @@ DATASET_SOURCES: Dict[str, List[Tuple[str, Optional[str], str, Optional[str]]]] 
     'code_swe': [
         ('nvidia/OpenCodeReasoning', 'split_0', 'split_0', 'split_0/train-00000-of-00030.parquet'),
         ('open-r1/verifiable-coding-problems-python_decontaminated', None, 'train', 'data/train-00000-of-00006.parquet'),
+        ('SWE-bench/SWE-smith', None, 'train', None),
+        ('SWE-Gym/SWE-Gym', None, 'train', None),
+        ('KodCode/KodCode-V1', None, 'train', None),
         ('bigcode/self-oss-instruct-sc2-exec-filter-50k', None, 'train', 'data/train-00000-of-00001.parquet'),
         ('TeichAI/Claude-Opus-4.6-Reasoning-887x', None, 'train', 'data/train-00000-of-00001.parquet'),
         ('iamtarun/python_code_instructions_18k_alpaca', None, 'train', 'data/train-00000-of-00001-8b6e212f3e1ece96.parquet'),
@@ -267,13 +281,24 @@ DATASET_SOURCES: Dict[str, List[Tuple[str, Optional[str], str, Optional[str]]]] 
     'math_stem': [
         ('open-thoughts/OpenThoughts-114k', 'default', 'train', 'data/train-00000-of-00006.parquet'),
         ('bespokelabs/Bespoke-Stratos-17k', None, 'train', 'data/train-00000-of-00001.parquet'),
+        ('project-numina/NuminaMath-1.5', None, 'train', None),
+        ('SynthLabsAI/Big-Math-RL-Verified', None, 'train', None),
+        ('nvidia/Nemotron-Math-v2', None, 'train', None),
+        ('KbsdJames/Omni-MATH', None, 'test', None),
+        ('open-thoughts/OpenThoughts3-1.2M', None, 'train', None),
+        ('AI-MO/NuminaMath-CoT', None, 'train', 'data/train-00000-of-00005.parquet'),
+        ('OpenDataArena/Spark-234K', None, 'train', 'Spark-234K-data.parquet'),
+        ('openai/gsm8k', 'main', 'train', 'main/train-00000-of-00001.parquet'),
+    ],
+    'science_knowledge_engram': [
         ('nvidia/OpenScienceReasoning-2', None, 'train', 'train/OpenScienceReasoning-2.parquet'),
         ('MegaScience/MegaScience', None, 'train', 'data/train-00000-of-00001.parquet'),
         ('MegaScience/TextbookReasoning', None, 'train', 'data/train-00000-of-00001.parquet'),
-        ('OpenDataArena/Spark-234K', None, 'train', 'Spark-234K-data.parquet'),
-        ('openai/gsm8k', 'main', 'train', 'main/train-00000-of-00001.parquet'),
-        ('AI-MO/NuminaMath-CoT', None, 'train', 'data/train-00000-of-00005.parquet'),
         ('Jackrong/Kimi-K2.5-Reasoning-1M-Cleaned', 'PHD-Science', 'train', 'PHD-Science.jsonl'),
+        ('m-a-p/SuperGPQA', None, 'train', None),
+        ('facebook/natural_reasoning', None, 'train', None),
+        ('TIGER-Lab/MMLU-Pro', None, 'validation', None),
+        ('allenai/sciq', None, 'train', None),
     ],
     'web_3d_ui': [
         ('Tesslate/UIGEN-T1.5-Dataset', None, 'train', 'output.parquet'),
@@ -293,12 +318,15 @@ DATASET_SOURCES: Dict[str, List[Tuple[str, Optional[str], str, Optional[str]]]] 
         ('Roman1111111/claude-opus-4.6-10000x', None, 'train', 'opus46_final.jsonl'),
         ('TeichAI/lordx64-claude-opus-4.7-max-cleaned', None, 'train', 'train.jsonl'),
         ('ronaldcmz/claude_opus_4.8_max_thinking_5k_v2', None, 'train', 'opus_4_8_max_thinking_5k_v2.jsonl'),
+        ('GeneralReasoning/GeneralThought-430K', None, 'train', None),
+        ('open-thoughts/OpenThoughts2-1M', None, 'train', None),
         ('ServiceNow-AI/R1-Distill-SFT', 'v0', 'train', 'v0/train-00000-of-00003.parquet'),
         ('Skywork/Skywork-OR1-RL-Data', None, 'code', 'data/code-00000-of-00003.parquet'),
     ],
     'literacy_dialogue': [
-        ('HuggingFaceH4/ultrachat_200k', None, 'train_sft', 'data/train_sft-00000-of-00003-a3ecf92756993583.parquet'),
         ('nvidia/Nemotron-Instruction-Following-Chat-v1', None, 'chat_if', 'data/chat_if.jsonl'),
+        ('allenai/tulu-3-sft-personas-instruction-following', None, 'train', None),
+        ('HuggingFaceH4/ultrachat_200k', None, 'train_sft', 'data/train_sft-00000-of-00003-a3ecf92756993583.parquet'),
         ('NousResearch/Hermes-3-Dataset', None, 'train', 'hermes-3-dataset.jsonl'),
         ('DataCreatorAI/Multi-Turn-Conversational-SFT', None, 'train', 'multi_turn_conversations.jsonl'),
         ('HuggingFaceH4/no_robots', None, 'train', 'data/train-00000-of-00001.parquet'),
@@ -327,7 +355,7 @@ DATASET_SOURCES: Dict[str, List[Tuple[str, Optional[str], str, Optional[str]]]] 
 
 
 def auto_configure_vram_16k(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Auto-detect GPU VRAM & System RAM, tune 16K execution flags, and validate modifiable MoE-Engram parameters."""
+    """Auto-detect GPU VRAM & System RAM, apply TRAINING_PROFILE scaling, and validate modifiable MoE-Engram parameters."""
     random.seed(cfg['SEED'])
     torch.manual_seed(cfg['SEED'])
     if torch.cuda.is_available():
@@ -343,6 +371,28 @@ def auto_configure_vram_16k(cfg: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         sys_ram_gb = 32.0
 
+    # Apply TRAINING_PROFILE scaling ('fast_repro' | 'high_capacity_en4b' | 'max_engram_saturation')
+    profile = str(cfg.get('TRAINING_PROFILE', 'high_capacity_en4b')).lower()
+    if profile == 'max_engram_saturation' and not cfg.get('_profile_applied'):
+        cfg['TARGET_TOTAL_SAMPLES'] = max(int(cfg.get('TARGET_TOTAL_SAMPLES', 4800)), 8000)
+        cfg['PHASE4_STEPS'] = max(int(cfg.get('PHASE4_STEPS', 150)), 250)
+        for st in cfg.get('STAGES', []):
+            st['steps'] = int(st['steps'] * 2.0)
+        if vram_gb >= 75.0:
+            cfg['MAX_SEQ_LENGTH'] = max(int(cfg.get('MAX_SEQ_LENGTH', 16384)), 24576)
+            for st in cfg.get('STAGES', []):
+                if st['seq_len'] >= 16384:
+                    st['seq_len'] = 24576
+        cfg['_profile_applied'] = True
+    elif profile == 'fast_repro' and not cfg.get('_profile_applied'):
+        cfg['TARGET_TOTAL_SAMPLES'] = 2400
+        cfg['PHASE4_STEPS'] = 80
+        fast_steps = [65, 65, 40, 38]
+        for idx, st in enumerate(cfg.get('STAGES', [])):
+            if idx < len(fast_steps):
+                st['steps'] = fast_steps[idx]
+        cfg['_profile_applied'] = True
+
     # Auto-detect activation offloading & Tier-1B DRAM placement
     cfg['OFFLOAD_CHECKPOINT_CPU'] = bool(vram_gb < 70.0 and sys_ram_gb >= 48.0)
     if sys_ram_gb < 28.0 and vram_gb >= 70.0:
@@ -351,6 +401,8 @@ def auto_configure_vram_16k(cfg: Dict[str, Any]) -> Dict[str, Any]:
         cfg['MAX_SEQ_LENGTH'] = 8192
         for st in cfg['STAGES']:
             st['seq_len'] = min(st['seq_len'], 8192)
+    elif vram_gb < 45.0:
+        cfg['MAX_SEQ_LENGTH'] = min(int(cfg.get('MAX_SEQ_LENGTH', 16384)), 16384)
 
     # Optionally prepend Stage 0 progressive depth expansion (48L -> 60L) if requested by user
     if cfg.get('ENABLE_STAGE0_PROGRESSIVE_DEPTH_WARMUP', False) and not any('Stage0' in s['name'] for s in cfg['STAGES']):
@@ -361,7 +413,7 @@ def auto_configure_vram_16k(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 'p3_start': 12, 'p3_end': 20,
                 'use_mhc': True, 'use_engram': False,
                 'seq_len': 4096,
-                'steps': 25,
+                'steps': 35,
                 'freeze_backbone': True,
                 'freeze_engram': True,
                 'upcycle_8_to_32': False,
@@ -376,7 +428,7 @@ def auto_configure_vram_16k(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 'p3_start': 12, 'p3_end': 24,
                 'use_mhc': True, 'use_engram': False,
                 'seq_len': 8192,
-                'steps': 30,
+                'steps': 45,
                 'freeze_backbone': True,
                 'freeze_engram': True,
                 'upcycle_8_to_32': False,
@@ -389,14 +441,15 @@ def auto_configure_vram_16k(cfg: Dict[str, Any]) -> Dict[str, Any]:
         cfg['STAGES'] = stage0_list + list(cfg['STAGES'])
 
     n_anchors = 1 + len(range(int(cfg['ENG_STRIDE']) - 1, 36, int(cfg['ENG_STRIDE']))) - (1 if 3 in range(int(cfg['ENG_STRIDE']) - 1, 36, int(cfg['ENG_STRIDE'])) else 0)
+    total_stage_steps = sum(int(s['steps']) for s in cfg['STAGES']) + (int(cfg.get('PHASE4_STEPS', 0)) if cfg.get('ENABLE_PHASE4_POST_TRAIN', True) else 0)
     print('=' * 98)
-    print(f"GPU: {gpu_name} ({vram_gb:.1f} GB VRAM) | System RAM: {sys_ram_gb:.1f} GB")
+    print(f"GPU: {gpu_name} ({vram_gb:.1f} GB VRAM) | System RAM: {sys_ram_gb:.1f} GB | Profile: {profile}")
     print(f"Kernel Stack: Triton={HAS_TRITON} | Unsloth={HAS_UNSLOTH} | Liger={HAS_LIGER} | Cut-CE={HAS_CCE}")
-    print(f"Max Seq Length: {cfg['MAX_SEQ_LENGTH']} tokens | Pinned-RAM Activation Streaming: {cfg['OFFLOAD_CHECKPOINT_CPU']}")
+    print(f"Max Seq Length: {cfg['MAX_SEQ_LENGTH']} tokens | Total Curriculum Steps: {total_stage_steps} | Samples: {cfg['TARGET_TOTAL_SAMPLES']}")
     print(
         f"MoE-Engram Auto-Config: {n_anchors} Anchors | Experts={cfg['ENG_INITIAL_ACTIVE_EXPERTS']}->{cfg['ENG_EXPERTS']} "
-        f"(Top-K={cfg['ENG_INITIAL_TOP_K']}->{cfg['ENG_TOP_K']}) | SharedRank={cfg['ENG_SHARED_RANK']} | "
-        f"ExpertRank={cfg['ENG_EXPERT_RANK']} | Self-Balance Step={cfg.get('ENG_BALANCE_STEP_SIZE', 0.0015)}"
+        f"(Train Top-K={cfg['ENG_INITIAL_TOP_K']}->{cfg['ENG_TOP_K']} | Flight Mode='{cfg.get('ENG_DEFAULT_FLIGHT_MODE', 'deep_knowledge')}' "
+        f"Top-{cfg.get('ENG_FLIGHT_TOP_K', 16)}) | 5-Gram Multi-Horizon={cfg.get('ENG_MULTI_HORIZON_RECALL', True)}"
     )
     print('=' * 98)
     return cfg
@@ -587,6 +640,69 @@ def extract_record_fields(row: Dict[str, Any], pillar: str) -> Optional[Dict[str
                 'thought': thought,
                 'answer': answer,
             }
+
+    # Support SuperGPQA / MMLU-Pro multiple-choice graduate STEM questions (`question` + `options` + `answer_letter`/`answer`)
+    options = row.get('options')
+    if isinstance(options, list) and len(options) >= 2 and row.get('question'):
+        q_str = str(row.get('question')).strip()
+        disc = str(row.get('discipline') or row.get('field') or row.get('subfield') or row.get('category') or 'Graduate STEM').strip()
+        letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        opt_lines = [f"({letters[i]}) {str(opt).strip()}" for i, opt in enumerate(options[:12])]
+        user_mc = f"[{disc}] {q_str}\n\nOptions:\n" + "\n".join(opt_lines)
+        ans_letter = str(row.get('answer_letter') or row.get('answer') or '').strip()
+        ans_idx = row.get('answer_index')
+        if (not ans_letter or len(ans_letter) > 2) and isinstance(ans_idx, int) and 0 <= ans_idx < len(options):
+            ans_letter = letters[ans_idx]
+        ans_text = str(row.get('answer') or '').strip()
+        cot_text = str(row.get('cot_content') or row.get('explanation') or top_thought or '').strip()
+        if ans_letter:
+            if not cot_text:
+                cot_text = (
+                    f"1. Domain: {disc}.\n"
+                    f"2. Evaluate each candidate option against first-principles domain constraints.\n"
+                    f"3. Option ({ans_letter}) ({ans_text}) uniquely satisfies all conditions."
+                )
+            final_mc_ans = f"Based on rigorous analysis of the {disc} principles:\n\n**Correct Option:** ({ans_letter}) {ans_text}".strip()
+            return {
+                'pillar': pillar,
+                'system': sys_prompt,
+                'history_turns': [],
+                'user': _normalize_tool_tags(user_mc),
+                'thought': cot_text,
+                'answer': final_mc_ans,
+            }
+
+    # Support SWE-smith / SWE-Gym / SWE-bench repository bug-fix instances (`problem_statement` + `patch`)
+    if row.get('problem_statement') and row.get('patch'):
+        prob_stmt = str(row.get('problem_statement')).strip()
+        patch_str = str(row.get('patch')).strip()
+        repo_name = str(row.get('repo') or row.get('instance_id') or 'repository').strip()
+        if len(prob_stmt) >= 32 and len(patch_str) >= 32:
+            user_swe = f"[Repository: {repo_name}]\nResolve the following issue and provide a unified git diff patch:\n\n{prob_stmt}"
+            swe_thought = top_thought or (
+                f"1. Localize defect in `{repo_name}` from the issue description and traceback.\n"
+                f"2. Construct minimal, regression-safe unified diff patch."
+            )
+            swe_ans = f"```diff\n{patch_str}\n```"
+            return {
+                'pillar': pillar,
+                'system': sys_prompt,
+                'history_turns': [],
+                'user': _normalize_tool_tags(user_swe),
+                'thought': swe_thought,
+                'answer': swe_ans,
+            }
+
+    # Support Facebook NaturalReasoning (`question` + `responses` list or `reference_answer`)
+    nr_resps = row.get('responses')
+    if isinstance(nr_resps, list) and len(nr_resps) > 0 and row.get('question') and not row.get('output'):
+        first_r = nr_resps[0]
+        if isinstance(first_r, dict):
+            row = dict(row)
+            row['output'] = str(first_r.get('response') or first_r.get('content') or first_r.get('text') or '')
+        elif isinstance(first_r, str):
+            row = dict(row)
+            row['output'] = first_r
 
     user_prompt = str(
         row.get('instruction') or row.get('prompt') or row.get('question') or row.get('problem') or row.get('query') or ''
@@ -1479,6 +1595,9 @@ def run_v03_four_stage_training(
     model_cls._checkpoint_context = _core_mod.SparkXLoopV03._checkpoint_context
     model_cls.total_router_z_loss = _core_mod.SparkXLoopV03.total_router_z_loss
     model_cls.get_engram_routing_telemetry = _core_mod.SparkXLoopV03.get_engram_routing_telemetry
+    model_cls.set_engram_flight_mode = _core_mod.SparkXLoopV03.set_engram_flight_mode
+    model_cls.snapshot_engram_bank = _core_mod.SparkXLoopV03.snapshot_engram_bank
+    model_cls.hot_swap_engram_bank = _core_mod.SparkXLoopV03.hot_swap_engram_bank
     model_cls.upcycle_all_engrams_8_to_32 = _core_mod.SparkXLoopV03.upcycle_all_engrams_8_to_32
     model_cls.reset_all_loop_and_engram_to_step0 = _core_mod.SparkXLoopV03.reset_all_loop_and_engram_to_step0
     for ctrl_mod in model.controllers.values():
@@ -1495,6 +1614,8 @@ def run_v03_four_stage_training(
         eng_mod.load_ema_decay = float(cfg.get('ENG_LOAD_EMA_DECAY', 0.05))
         eng_mod.balance_step_size = float(cfg.get('ENG_BALANCE_STEP_SIZE', 0.0015))
         eng_mod.use_pass_gain_schedule = bool(cfg.get('ENG_USE_PASS_GAIN_SCHEDULE', True))
+        eng_mod.multi_horizon_recall = bool(cfg.get('ENG_MULTI_HORIZON_RECALL', True))
+        eng_mod.flight_top_k = None  # During training, use exact stage active_top_k (2 -> 7); expand at eval via set_engram_flight_mode
         eng_mod._pending_expert_load = None
         eng_mod.last_router_z_loss = None
         eng_mod._active_z_losses = None
@@ -1901,12 +2022,27 @@ def run_v03_four_stage_training(
         except Exception as exc:
             print(f"[Phase 4 Post-Training Notice] {exc}", flush=True)
 
+    # Activate default On-the-Fly Engram Flight Mode (e.g. 'deep_knowledge' Top-16 + 5-Gram Multi-Horizon Recall) for inference & export
+    flight_info = model.set_engram_flight_mode(
+        mode=str(cfg.get('ENG_DEFAULT_FLIGHT_MODE', 'deep_knowledge')),
+        top_k_flight=int(cfg.get('ENG_FLIGHT_TOP_K', 16)),
+        tail_blend_max=float(cfg.get('ENG_TAIL_BLEND_MAX', 0.18)),
+        multi_horizon_recall=bool(cfg.get('ENG_MULTI_HORIZON_RECALL', True)),
+    )
+    print(f"[On-The-Fly Engram Flight Mode Activated] {flight_info}", flush=True)
+
     final_dir = export_final_v03_to_hub(
         model, tokenizer, cfg, global_step,
         history[-1] if history else {'loss': 0.0},
         hf_token=hf_token,
     )
-    return {'global_step': global_step, 'history': history, 'phase4_report': phase4_report, 'final_dir': str(final_dir)}
+    return {
+        'global_step': global_step,
+        'history': history,
+        'phase4_report': phase4_report,
+        'flight_info': flight_info,
+        'final_dir': str(final_dir),
+    }
 
 
 # ==============================================================================

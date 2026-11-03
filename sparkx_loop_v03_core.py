@@ -884,6 +884,12 @@ class ZipfianTieredMoEEngram(nn.Module):
             torch.tensor([-0.6190392, -1.7346011, -2.9444390, -2.9444390], dtype=torch.float32)
         )
         self.use_pass_gain_schedule: bool = False
+        # On-the-fly Dynamic Engram Flight Mode & Elastic Knowledge Recall
+        self.flight_mode: str = 'balanced'
+        self.flight_top_k: Optional[int] = None
+        self.elastic_tail_blend_max: float = 0.18
+        self.multi_horizon_recall: bool = False
+        self.last_flight_stats: dict[str, Any] = {}
         self.last_router_z_loss: torch.Tensor = torch.tensor(0.0)
         self._gate_override_tensor: Optional[torch.Tensor] = None
         self._gate_override_ref_val: Optional[float] = None
@@ -1109,9 +1115,14 @@ class ZipfianTieredMoEEngram(nn.Module):
             else [1.0, 1.0, 1.0]
         )
         sw = F.softmax(self.scale_weights.detach().float(), dim=0).tolist()
+        f_top_k = getattr(self, 'flight_top_k', None)
+        eff_k = min(int(f_top_k), e_act) if (f_top_k is not None and int(f_top_k) > 0) else int(self.active_top_k)
         return {
             'active_experts': e_act,
             'active_top_k': int(self.active_top_k),
+            'flight_mode': str(getattr(self, 'flight_mode', 'balanced')),
+            'effective_top_k': eff_k,
+            'multi_horizon_recall': bool(getattr(self, 'multi_horizon_recall', False)),
             'load_cv': round(cv, 4),
             'min_load_ratio': round(min_ratio, 3),
             'max_load_ratio': round(max_ratio, 3),
@@ -1119,6 +1130,7 @@ class ZipfianTieredMoEEngram(nn.Module):
             'gain_sigmoid': round(float(torch.sigmoid(self.gain.detach().float()).item()), 4),
             'pass_scales': [round(x, 3) for x in p_scales],
             'ngram_weights': [round(x, 3) for x in sw],
+            'last_flight_stats': dict(getattr(self, 'last_flight_stats', {})),
         }
 
     @torch.no_grad()
@@ -1171,13 +1183,25 @@ class ZipfianTieredMoEEngram(nn.Module):
         if ngram_indices is None:
             ngram_indices = self.compute_ngram_indices(input_ids, self.total_buckets, prev_ids=prev_ids)
 
+        use_multi_horizon = bool(getattr(self, 'multi_horizon_recall', False))
         # 1. Tier 1A + 1B Lexical N-gram Lookup (cached across recurrent passes during eval!)
-        cache_key = (ngram_indices[0].data_ptr(), ngram_indices[0].shape, param_dtype) if not self.training else None
+        cache_key = (
+            (ngram_indices[0].data_ptr(), ngram_indices[0].shape, param_dtype, use_multi_horizon)
+            if not self.training else None
+        )
         cached_lex = getattr(self, '_eval_lex_cache', None) if not self.training else None
         if cached_lex is not None and cached_lex[0] == cache_key:
             e_lexical, lex_hidden = cached_lex[1], cached_lex[2]
         else:
             e_lexical = self._lookup_tier1_lexical(ngram_indices, input_ids.device, param_dtype)
+            if use_multi_horizon and e_lexical.shape[1] >= 2:
+                # Causal 5-gram multi-horizon contextual trace (9 N-gram bucket probes spanning t-4..t, zero future leakage)
+                e_prev1 = F.pad(e_lexical[:, :-1, :], (0, 0, 1, 0))
+                if e_lexical.shape[1] >= 3:
+                    e_prev2 = F.pad(e_lexical[:, :-2, :], (0, 0, 2, 0))
+                    e_lexical = (0.83 * e_lexical + 0.12 * e_prev1 + 0.05 * e_prev2).to(param_dtype)
+                else:
+                    e_lexical = (0.88 * e_lexical + 0.12 * e_prev1).to(param_dtype)
             if self.training:
                 e_lexical = F.dropout(e_lexical, p=0.20, training=True)
             lex_hidden = self.lexical_up(e_lexical)
@@ -1192,9 +1216,11 @@ class ZipfianTieredMoEEngram(nn.Module):
             h_fused_in = h_norm + lex_hidden
             shared_out = self.shared_down(triton_swiglu(self.shared_gate(h_fused_in), self.shared_up(h_fused_in)))
 
-            # 3. Tier 3: X-MoE Hypersphere Cosine Router + Sigmoid Affinity + ST-MoE Router Z-Loss
+            # 3. Tier 3: X-MoE Hypersphere Cosine Router + Sigmoid Affinity + On-The-Fly Elastic Top-K Recall
             e_act = self.active_experts
-            k_act = min(self.active_top_k, e_act)
+            k_base = min(self.active_top_k, e_act)
+            f_top_k = getattr(self, 'flight_top_k', None)
+            k_act = min(int(f_top_k), e_act) if (f_top_k is not None and int(f_top_k) > 0) else k_base
             p_idx = min(max(int(pass_idx), 0), self.max_passes - 1)
 
             u = F.normalize(self.router_proj(h_norm_f), p=2, dim=-1, eps=1e-6)
@@ -1216,7 +1242,42 @@ class ZipfianTieredMoEEngram(nn.Module):
             sel_scores = scores + self.expert_bias[:e_act]
             _, topk_idx = torch.topk(sel_scores, k=k_act, dim=-1)
             topk_raw = torch.gather(scores, dim=-1, index=topk_idx)
-            topk_gates = (topk_raw / (topk_raw.sum(dim=-1, keepdim=True) + 1e-6)).to(param_dtype)
+
+            if k_act > k_base:
+                # Entropy-Gated Two-Stage Elastic Expert Recall:
+                # Preserves exact primary k_base expert distribution while blending in sharpened tail specialists
+                # (k_base+1 .. k_act) proportional to per-token routing uncertainty H_norm(t)^2.
+                prim_raw = topk_raw[..., :k_base]
+                tail_raw = topk_raw[..., k_base:]
+                prim_gates = prim_raw / (prim_raw.sum(dim=-1, keepdim=True) + 1e-6)
+                tail_sq = tail_raw.pow(2)
+                tail_gates = tail_sq / (tail_sq.sum(dim=-1, keepdim=True) + 1e-6)
+                ent = -(prim_gates * torch.log(prim_gates.clamp(min=1e-7))).sum(dim=-1, keepdim=True)
+                max_ent = math.log(max(2, k_base))
+                ent_norm = (ent / max_ent).clamp(0.0, 1.0)
+                beta_tail = float(getattr(self, 'elastic_tail_blend_max', 0.18))
+                alpha_t = beta_tail * ent_norm.pow(2)
+                combined_gates = torch.cat([
+                    (1.0 - alpha_t) * prim_gates,
+                    alpha_t * tail_gates,
+                ], dim=-1)
+                topk_gates = combined_gates.to(param_dtype)
+                if not self.training:
+                    self.last_flight_stats = {
+                        'k_base': int(k_base),
+                        'k_flight': int(k_act),
+                        'mean_entropy_norm': round(float(ent_norm.mean().item()), 4),
+                        'mean_tail_alpha': round(float(alpha_t.mean().item()), 4),
+                    }
+            else:
+                topk_gates = (topk_raw / (topk_raw.sum(dim=-1, keepdim=True) + 1e-6)).to(param_dtype)
+                if not self.training:
+                    self.last_flight_stats = {
+                        'k_base': int(k_base),
+                        'k_flight': int(k_act),
+                        'mean_entropy_norm': 0.0,
+                        'mean_tail_alpha': 0.0,
+                    }
 
             if self.training:
                 with torch.no_grad():
@@ -1721,11 +1782,142 @@ class SparkXLoopV03(nn.Module):
         return {
             'active_experts': self.engram.active_experts,
             'active_top_k': self.engram.active_top_k,
+            'flight_mode': str(getattr(self.engram, 'flight_mode', 'balanced')),
+            'effective_top_k': int(getattr(self.engram, 'flight_top_k', None) or self.engram.active_top_k),
+            'multi_horizon_recall': bool(getattr(self.engram, 'multi_horizon_recall', False)),
             'mean_load_cv': round(sum(cvs) / max(1, len(cvs)), 4),
             'min_load_ratio': round(min(mins) if mins else 1.0, 3),
             'max_load_ratio': round(max(maxs) if maxs else 1.0, 3),
             'mean_gain_sigmoid': round(sum(gains) / max(1, len(gains)), 4),
             'per_anchor': per_anchor,
+        }
+
+    @torch.no_grad()
+    def set_engram_flight_mode(
+        self,
+        mode: str = 'balanced',
+        top_k_flight: Optional[int] = None,
+        tail_blend_max: Optional[float] = None,
+        multi_horizon_recall: Optional[bool] = None,
+        scale: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Switch all 8 MoE-Engram anchors on the fly to access deeper parametric knowledge without retraining.
+
+        Supported presets (`mode`):
+          - 'fast':           top_k=4,  multi_horizon=False, tail_blend=0.00, scale=0.20 (~0.88B active Engram params)
+          - 'balanced':       top_k=7,  multi_horizon=False, tail_blend=0.00, scale=0.25 (~1.14B active Engram params)
+          - 'deep_knowledge': top_k=16, multi_horizon=True,  tail_blend=0.18, scale=0.25 (~1.93B active Engram params)
+          - 'max_recall':     top_k=24, multi_horizon=True,  tail_blend=0.22, scale=0.25 (~2.64B active Engram params)
+          - 'full_dense':     top_k=32, multi_horizon=True,  tail_blend=0.25, scale=0.25 (~3.34B active Engram params)
+        """
+        presets = {
+            'fast':           {'k': 4,  'mh': False, 'tb': 0.00, 'sc': 0.20},
+            'balanced':       {'k': int(self.engram.active_top_k), 'mh': False, 'tb': 0.00, 'sc': 0.25},
+            'deep_knowledge': {'k': 16, 'mh': True,  'tb': 0.18, 'sc': 0.25},
+            'max_recall':     {'k': 24, 'mh': True,  'tb': 0.22, 'sc': 0.25},
+            'full_dense':     {'k': 32, 'mh': True,  'tb': 0.25, 'sc': 0.25},
+        }
+        p = presets.get(str(mode).lower(), presets['balanced'])
+        eff_k = int(top_k_flight) if top_k_flight is not None else int(p['k'])
+        eff_mh = bool(multi_horizon_recall) if multi_horizon_recall is not None else bool(p['mh'])
+        eff_tb = float(tail_blend_max) if tail_blend_max is not None else float(p['tb'])
+        eff_sc = float(scale) if scale is not None else float(p['sc'])
+
+        n_anchors = len(self.all_engram_modules())
+        for mod in self.all_engram_modules():
+            e_act = int(mod.active_experts)
+            k_clamped = min(max(1, eff_k), e_act)
+            mod.flight_mode = str(mode).lower()
+            mod.flight_top_k = k_clamped if k_clamped != int(mod.active_top_k) else None
+            mod.multi_horizon_recall = eff_mh
+            mod.elastic_tail_blend_max = eff_tb
+            mod.decode_engram_scale = eff_sc
+            mod._eval_lex_cache = None
+
+        # Compute exact active Engram parameter footprint across all 8 anchors
+        m0 = self.engram
+        e_act = int(m0.active_experts)
+        k_used = min(max(1, eff_k), e_act)
+        # Per-anchor active dense + routed SwiGLU + lexical parameters
+        shared_params = m0.width * m0.shared_rank * 3
+        routed_params = k_used * (m0.eng_dim * m0.expert_rank * 2 + m0.expert_rank * m0.width)
+        proj_params = (m0.eng_dim * m0.width * 2) + (m0.width * m0.width * 2)
+        lex_table_params = (m0.hot_buckets + m0.cold_buckets) * 3 * m0.eng_dim
+        active_per_anchor = shared_params + routed_params + proj_params
+        total_per_anchor = shared_params + (m0.num_experts * (m0.eng_dim * m0.expert_rank * 2 + m0.expert_rank * m0.width)) + proj_params + lex_table_params
+        return {
+            'flight_mode': str(mode).lower(),
+            'anchors': n_anchors,
+            'active_experts_pool': e_act,
+            'base_top_k': int(m0.active_top_k),
+            'flight_top_k': k_used,
+            'total_experts_fired_per_token': k_used + 1,  # +1 for 100%-Active Shared SwiGLU Expert
+            'multi_horizon_5gram_recall': eff_mh,
+            'ngram_probes_per_token': 9 if eff_mh else 3,
+            'elastic_tail_blend_max': eff_tb,
+            'decode_engram_scale': eff_sc,
+            'active_compute_engram_params_B': round((active_per_anchor * n_anchors) / 1e9, 3),
+            'total_engram_capacity_B': round((total_per_anchor * n_anchors) / 1e9, 3),
+        }
+
+    @torch.no_grad()
+    def snapshot_engram_bank(self) -> dict[str, Any]:
+        """Take an in-memory CPU snapshot of all 8 MoE-Engram anchors for instant on-the-fly bank switching or blending."""
+        bank = {}
+        for l_idx, mod in self.iter_engram_anchors():
+            sd = {k: v.detach().cpu().clone() for k, v in mod.state_dict().items()}
+            if getattr(mod, 'tier1b_cold_weight', None) is not None:
+                sd['__tier1b_cold_weight__'] = mod.tier1b_cold_weight.detach().cpu().clone()
+            bank[str(l_idx)] = sd
+        return bank
+
+    @torch.no_grad()
+    def hot_swap_engram_bank(
+        self,
+        bank_source: Any,
+        blend_alpha: float = 1.0,
+    ) -> dict[str, Any]:
+        """Hot-swap (`blend_alpha=1.0`) or federate/interpolate (`0 < blend_alpha < 1.0`) an Engram knowledge bank on the fly."""
+        t0 = time.perf_counter()
+        if isinstance(bank_source, str):
+            bank_data = torch.load(bank_source, map_location='cpu', weights_only=False)
+        elif isinstance(bank_source, dict):
+            bank_data = bank_source
+        else:
+            raise ValueError('bank_source must be a file path or a snapshot dictionary')
+
+        alpha = float(max(0.0, min(1.0, blend_alpha)))
+        updated_tensors = 0
+        for l_idx, mod in self.iter_engram_anchors():
+            key = str(l_idx)
+            src_sd = bank_data.get(key) or bank_data.get(f'L{l_idx}')
+            if src_sd is None:
+                continue
+            cur_sd = mod.state_dict()
+            for p_name, cur_t in cur_sd.items():
+                if p_name in src_sd and src_sd[p_name].shape == cur_t.shape:
+                    src_t = src_sd[p_name].to(device=cur_t.device, dtype=cur_t.dtype)
+                    if alpha >= 0.9999:
+                        cur_t.copy_(src_t)
+                    else:
+                        cur_t.lerp_(src_t, alpha)
+                    updated_tensors += 1
+            if '__tier1b_cold_weight__' in src_sd and getattr(mod, 'tier1b_cold_weight', None) is not None:
+                c_src = src_sd['__tier1b_cold_weight__']
+                if c_src.shape == mod.tier1b_cold_weight.shape:
+                    if alpha >= 0.9999:
+                        mod.tier1b_cold_weight.copy_(c_src.to(mod.tier1b_cold_weight.dtype))
+                    else:
+                        mod.tier1b_cold_weight.lerp_(c_src.to(mod.tier1b_cold_weight.dtype), alpha)
+                    updated_tensors += 1
+            mod._eval_lex_cache = None
+            mod._eval_tier1b_gpu = None
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        return {
+            'status': 'ok',
+            'blend_alpha': round(alpha, 3),
+            'updated_tensors': updated_tensors,
+            'swap_latency_ms': round(elapsed_ms, 2),
         }
 
     def total_router_z_loss(self) -> torch.Tensor:
