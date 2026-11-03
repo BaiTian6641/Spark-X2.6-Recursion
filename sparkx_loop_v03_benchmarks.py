@@ -302,7 +302,7 @@ def generate_chat_response(
     temperature: float = 0.1,
     top_p: float = 0.90,
     repetition_penalty: float = 1.03,
-    think_budget_tokens: Optional[int] = None,
+    think_budget_tokens: Optional[int] = 320,
     stream_print: bool = False,
     **kwargs: Any,
 ) -> Dict[str, Any]:
@@ -316,6 +316,11 @@ def generate_chat_response(
         messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
     )
     input_ids = (enc.input_ids if hasattr(enc, "input_ids") else enc).to(device)
+    eff_think_budget = (
+        min(int(think_budget_tokens), max(128, int(max_new_tokens) // 3))
+        if think_budget_tokens is not None
+        else None
+    )
     t0 = time.time()
     out_ids = model.generate_cached(
         input_ids,
@@ -325,7 +330,7 @@ def generate_chat_response(
         repetition_penalty=repetition_penalty,
         eos_token_id=tokenizer.eos_token_id,
         tokenizer=tokenizer,
-        think_budget_tokens=think_budget_tokens,
+        think_budget_tokens=eff_think_budget,
         stream_print=stream_print,
         **kwargs,
     )
@@ -350,11 +355,13 @@ def score_mc_loglikelihood(
     tokenizer: Any,
     prompt_text: str,
     choice_letters: List[str],
-) -> str:
-    """Rank multiple-choice options `(A), (B), (C), (D)` by exact next-token log-probability after `</think>`."""
+    system_prompt: str = "Select the single best option letter.",
+    return_dict: bool = False,
+) -> Any:
+    """Rank multiple-choice options `(A), (B), (C), (D)...` by exact next-token log-probability after `</think>`."""
     device = next(model.base.parameters()).device
     messages = [
-        {"role": "system", "content": "Select the single best option letter (A, B, C, or D)."},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt_text},
     ]
     chat_str = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -362,16 +369,18 @@ def score_mc_loglikelihood(
     ids = tokenizer(prefix, return_tensors="pt").input_ids.to(device)
     logits = model.forward_logits(ids)[0, -1, :].float()
     log_probs = F.log_softmax(logits, dim=-1)
-    best_let = choice_letters[0]
+    best_let = choice_letters[0] if choice_letters else "A"
     best_lp = -1e30
+    scores_map: Dict[str, float] = {}
     for let in choice_letters:
         tok_candidates = tokenizer.encode(let, add_special_tokens=False)
         if tok_candidates:
             lp = float(log_probs[tok_candidates[0]].item())
+            scores_map[let] = lp
             if lp > best_lp:
                 best_lp = lp
                 best_let = let
-    return best_let
+    return scores_map if return_dict else best_let
 
 
 # ==============================================================================
@@ -700,9 +709,14 @@ def run_ifeval_and_ifbench_suite(
     max_new_tokens: int = 1280,
     output_dir: str = "/content/sparkx_v03_benchmark_results",
     token: Optional[str] = None,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """Run `google/IFEval` and `allenai/IFBench_test` and return prompt/instruction-level accuracies."""
     from datasets import load_dataset
+    if "ifeval_samples" in kwargs and kwargs["ifeval_samples"] is not None:
+        max_samples_ifeval = kwargs["ifeval_samples"]
+    if "ifbench_samples" in kwargs and kwargs["ifbench_samples"] is not None:
+        max_samples_ifbench = kwargs["ifbench_samples"]
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     sys_prompt = (
         "You are a precise instruction-following assistant. "
@@ -1205,10 +1219,15 @@ def run_swe_bench_suite(
     max_new_tokens: int = 1536,
     output_dir: str = "/content/sparkx_v03_benchmark_results",
     token: Optional[str] = None,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """Run `ScaleAI/SWE-bench_Pro` and `princeton-nlp/SWE-bench_Verified` (Oracle-Localized Patch Generation)
     and export official `predictions.jsonl` files for `swebench.harness.run_evaluation`."""
     from datasets import load_dataset
+    if "pro_samples" in kwargs and kwargs["pro_samples"] is not None:
+        max_samples_pro = kwargs["pro_samples"]
+    if "verified_samples" in kwargs and kwargs["verified_samples"] is not None:
+        max_samples_verified = kwargs["verified_samples"]
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     results_out: Dict[str, Any] = {}
 
@@ -2033,8 +2052,8 @@ def run_supergpqa_benchmark(
         opt_block = "\n".join(f"({letters[i]}) {opts[i]}" for i in range(len(opts)))
         user_prompt = f"Discipline: {field}\nQuestion:\n{q_text}\n\nOptions:\n{opt_block}\n\nPut the correct option letter in \\boxed{{}}."
 
-        ll_scores = score_mc_loglikelihood(model, tokenizer, user_prompt, valid_letters, system_prompt=sys_prompt)
-        ll_pred = max(ll_scores.items(), key=lambda kv: kv[1])[0] if ll_scores else "A"
+        ll_res = score_mc_loglikelihood(model, tokenizer, user_prompt, valid_letters, system_prompt=sys_prompt)
+        ll_pred = max(ll_res.items(), key=lambda kv: kv[1])[0] if isinstance(ll_res, dict) else str(ll_res)
 
         gen = generate_chat_response(
             model,
@@ -2276,6 +2295,9 @@ def run_all_frontier_benchmarks(
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     report: Dict[str, Any] = {}
 
+    if hasattr(model, "set_domain_engram_focus"):
+        model.set_domain_engram_focus("general", boost=0.0)
+
     if run_dynamic_flight_validation:
         report["Dynamic_Engram_Flight_Validation"] = evaluate_dynamic_engram_flight_modes(model, tokenizer)
 
@@ -2283,14 +2305,20 @@ def run_all_frontier_benchmarks(
         report["Active_Flight_Mode"] = model.set_engram_flight_mode(mode=flight_mode)
 
     if ifeval_samples != 0 or ifbench_samples != 0:
+        if hasattr(model, "set_domain_engram_focus"):
+            model.set_domain_engram_focus("anti_slop", boost=0.05)
         if_res = run_ifeval_and_ifbench_suite(
             model, tokenizer,
-            ifeval_samples=ifeval_samples,
-            ifbench_samples=ifbench_samples,
+            max_samples_ifeval=ifeval_samples,
+            max_samples_ifbench=ifbench_samples,
             output_dir=output_dir,
+            token=token,
         )
         report["IFEval"] = if_res.get("IFEval")
         report["IFBench"] = if_res.get("IFBench")
+
+    if hasattr(model, "set_domain_engram_focus"):
+        model.set_domain_engram_focus("stem_reason", boost=0.06)
 
     if gpqa_samples != 0:
         report["GPQA_Diamond"] = run_gpqa_diamond_benchmark(model, tokenizer, max_samples=gpqa_samples, token=token)
@@ -2301,11 +2329,14 @@ def run_all_frontier_benchmarks(
     if hle_samples != 0:
         report["HLE"] = run_hle_benchmark(model, tokenizer, max_samples=hle_samples, token=token)
 
+    if hasattr(model, "set_domain_engram_focus"):
+        model.set_domain_engram_focus("general", boost=0.0)
+
     if swe_pro_samples != 0 or swe_verified_samples != 0:
         swe_res = run_swe_bench_suite(
             model, tokenizer,
-            pro_samples=swe_pro_samples,
-            verified_samples=swe_verified_samples,
+            max_samples_pro=swe_pro_samples,
+            max_samples_verified=swe_verified_samples,
             output_dir=output_dir,
             token=token,
         )
@@ -2318,11 +2349,17 @@ def run_all_frontier_benchmarks(
     if livecode_samples != 0:
         report["BigCodeBench_LiveCodeBench"] = run_livecodebench_benchmark(model, tokenizer, max_samples=livecode_samples)
 
+    if hasattr(model, "set_domain_engram_focus"):
+        model.set_domain_engram_focus("stem_reason", boost=0.06)
+
     if math500_samples != 0:
         report["MATH_500"] = run_math500_benchmark(model, tokenizer, max_samples=math500_samples)
 
     if aime_omni_samples != 0:
         report["AIME_2024_2025_OmniMATH"] = run_aime_omni_math_benchmark(model, tokenizer, max_samples=aime_omni_samples)
+
+    if hasattr(model, "set_domain_engram_focus"):
+        model.set_domain_engram_focus("general", boost=0.0)
 
     report_path = Path(output_dir) / "sparkx_v03_frontier_benchmark_report.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
