@@ -1038,17 +1038,28 @@ class ZipfianTieredMoEEngram(nn.Module):
 
     @torch.no_grad()
     def step_tier1b_sparse_adam(self, lr: float = 2e-4, beta1: float = 0.9, beta2: float = 0.95, eps: float = 1e-8):
-        """Coalesced sparse Adam update on pinned Host DRAM for Tier 1B (<0.3 ms/step) + Post-Backward Router Bias EMA."""
-        # 1. Update auxiliary-loss-free expert load EMA & router bias AFTER backward/optimizer step
+        """Coalesced sparse Adam update on pinned Host DRAM for Tier 1B (<0.3 ms/step) + Post-Backward Self-Balancing Router EMA."""
+        # 1. Update auxiliary-loss-free expert load EMA, adaptive router bias, and starved-centroid re-anchoring AFTER backward
         #    (never during forward, so gradient checkpointing recomputation is 100% deterministic!)
         pending_load = getattr(self, '_pending_expert_load', None)
         if pending_load is not None:
             e_act = self.active_experts
             load = pending_load.to(device=self.expert_load_ema.device, dtype=torch.float32)
             if load.numel() == e_act:
-                self.expert_load_ema[:e_act].lerp_(load, 0.05)
+                ema_decay = float(getattr(self, 'load_ema_decay', 0.05))
+                self.expert_load_ema[:e_act].lerp_(load, ema_decay)
                 target_load = 1.0 / float(e_act)
-                self.expert_bias[:e_act].add_(0.001 * torch.sign(target_load - self.expert_load_ema[:e_act])).clamp_(-0.5, 0.5)
+                imbalance = (target_load - self.expert_load_ema[:e_act]) / max(1e-6, target_load)
+                base_step = float(getattr(self, 'balance_step_size', 0.0015))
+                adaptive_step = base_step * (0.5 * torch.sign(imbalance) + 0.5 * imbalance.clamp(-2.0, 2.0))
+                self.expert_bias[:e_act].add_(adaptive_step).clamp_(-0.5, 0.5)
+                starved_mask = self.expert_load_ema[:e_act] < (0.15 * target_load)
+                if bool(starved_mask.any().item()):
+                    mean_cent = F.normalize(self.expert_centroids[:e_act].mean(dim=0, keepdim=True), p=2, dim=-1, eps=1e-6)
+                    self.expert_centroids.data[:e_act][starved_mask] = F.normalize(
+                        0.98 * self.expert_centroids.data[:e_act][starved_mask] + 0.02 * mean_cent,
+                        p=2, dim=-1, eps=1e-6,
+                    )
             self._pending_expert_load = None
 
         # 2. Coalesced sparse Adam update for Tier 1B cold N-gram rows
@@ -1080,6 +1091,35 @@ class ZipfianTieredMoEEngram(nn.Module):
         self.tier1b_cold_weight[rows] = w.to(self.tier1b_cold_weight.dtype)
         self._pending_tier1b_leaf = None
         self._pending_tier1b_rows = None
+
+    @torch.no_grad()
+    def routing_balance_summary(self) -> dict[str, Any]:
+        """Return router load balance telemetry (CV, min/max load ratio, temperature, per-pass scales, n-gram weights)."""
+        e_act = max(1, int(self.active_experts))
+        loads = self.expert_load_ema[:e_act].detach().float()
+        target = 1.0 / float(e_act)
+        mean_l = float(loads.mean().item())
+        std_l = float(loads.std(unbiased=False).item()) if e_act > 1 else 0.0
+        cv = std_l / max(1e-6, mean_l)
+        min_ratio = float(loads.min().item()) / max(1e-6, target)
+        max_ratio = float(loads.max().item()) / max(1e-6, target)
+        p_scales = (
+            torch.sigmoid(self.pass_gain_logits.detach().float()[:3]).tolist()
+            if hasattr(self, 'pass_gain_logits') and self.pass_gain_logits is not None
+            else [1.0, 1.0, 1.0]
+        )
+        sw = F.softmax(self.scale_weights.detach().float(), dim=0).tolist()
+        return {
+            'active_experts': e_act,
+            'active_top_k': int(self.active_top_k),
+            'load_cv': round(cv, 4),
+            'min_load_ratio': round(min_ratio, 3),
+            'max_load_ratio': round(max_ratio, 3),
+            'router_temp': round(float(self.router_log_temp.detach().float().exp().item()), 4),
+            'gain_sigmoid': round(float(torch.sigmoid(self.gain.detach().float()).item()), 4),
+            'pass_scales': [round(x, 3) for x in p_scales],
+            'ngram_weights': [round(x, 3) for x in sw],
+        }
 
     @torch.no_grad()
     def reset_parameters_to_step0(self, initial_active_experts: int = 8, initial_top_k: int = 2):
@@ -1665,6 +1705,28 @@ class SparkXLoopV03(nn.Module):
     def step_all_tier1b_sparse_adam(self, lr: float = 2e-4):
         for mod in self.all_engram_modules():
             mod.step_tier1b_sparse_adam(lr=lr)
+
+    @torch.no_grad()
+    def get_engram_routing_telemetry(self) -> dict[str, Any]:
+        """Aggregate router balance CV, min/max load ratio, and per-pass telescoping scales across all 8 Engram anchors."""
+        per_anchor = {}
+        cvs, mins, maxs, gains = [], [], [], []
+        for l_idx, mod in self.iter_engram_anchors():
+            info = mod.routing_balance_summary()
+            per_anchor[f'L{l_idx}'] = info
+            cvs.append(info['load_cv'])
+            mins.append(info['min_load_ratio'])
+            maxs.append(info['max_load_ratio'])
+            gains.append(info['gain_sigmoid'])
+        return {
+            'active_experts': self.engram.active_experts,
+            'active_top_k': self.engram.active_top_k,
+            'mean_load_cv': round(sum(cvs) / max(1, len(cvs)), 4),
+            'min_load_ratio': round(min(mins) if mins else 1.0, 3),
+            'max_load_ratio': round(max(maxs) if maxs else 1.0, 3),
+            'mean_gain_sigmoid': round(sum(gains) / max(1, len(gains)), 4),
+            'per_anchor': per_anchor,
+        }
 
     def total_router_z_loss(self) -> torch.Tensor:
         losses = []

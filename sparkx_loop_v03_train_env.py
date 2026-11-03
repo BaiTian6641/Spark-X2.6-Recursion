@@ -80,7 +80,7 @@ def verify_ngram_causality(model: SparkXLoopV03, vocab_size: int = 167168, devic
 
 
 def build_default_cfg() -> Dict[str, Any]:
-    """Return the default v0.3 16K Unsloth/Triton configuration dictionary."""
+    """Return the default v0.3 16K Unsloth/Triton configuration dictionary (modifiable MoE-Engram, mHC & 6-pillar curriculum)."""
     return {
         # Base & Target Repositories (MUST use post-trained XHToken/Spark-X2.6-4B, never -Base)
         'BASE_MODEL_ID': 'XHToken/Spark-X2.6-4B',
@@ -100,15 +100,16 @@ def build_default_cfg() -> Dict[str, Any]:
         # Unattended Wall-Clock Budget (Colab Pro+ 24h ceiling with 1.5h safety margin)
         'MAX_RUN_HOURS': 22.5,
 
-        # 72-Layer Telescoping Recurrence Geometry
+        # 72-Layer Telescoping Recurrence Geometry (36L Prelude/Core/Coda -> 60L Pass-2 -> 72L Pass-3)
         'LOOP_START': 4,
         'LOOP_END': 28,
         'P3_START': 12,
         'P3_END': 24,
         'MAX_PASSES': 4,
         'PASS_ADAPTER_RANK': 16,
+        'ENABLE_STAGE0_PROGRESSIVE_DEPTH_WARMUP': False,  # Set True to prepend 48L -> 60L progressive stage-merging warmup before 72L
 
-        # 8-Anchor 3-Tier Zipfian MoE-Engram (4.11B Total / 1.10B Active)
+        # Modifiable 8-Anchor 3-Tier Zipfian MoE-Engram & Self-Balancing Router (`En4B-A1B`: 4.11B Total / 1.10B Active)
         'ENG_HOT_BUCKETS': 16384,
         'ENG_COLD_BUCKETS': 49152,
         'ENG_DIM': 512,
@@ -122,6 +123,15 @@ def build_default_cfg() -> Dict[str, Any]:
         'ENG_STRIDE': 4,
         'ENG_OFFLOAD_TIER1B_CPU': True,
         'ENG_Z_LOSS_COEFF': 1e-4,
+        'ENG_LOAD_EMA_DECAY': 0.05,
+        'ENG_BALANCE_STEP_SIZE': 0.0015,
+        'ENG_USE_PASS_GAIN_SCHEDULE': True,
+        'ENG_PASS_GAIN_INIT': [0.35, 0.15, 0.05],
+
+        # Phase-4 Post-Training Capability Consolidation (Backbone-Frozen Joint mHC + MoE-Engram Finalization)
+        'ENABLE_PHASE4_POST_TRAIN': True,
+        'PHASE4_STEPS': 80,
+        'PHASE4_TRAIN_MHC': True,
 
         # 16K Context & Sequence Packing (Zero Mid-Thought / Mid-Code Truncation!)
         'MAX_SEQ_LENGTH': 16384,
@@ -143,11 +153,12 @@ def build_default_cfg() -> Dict[str, Any]:
         'LR_ROUTER': 2.5e-4,
         'LR_TIER1B_SPARSE': 5.0e-5,
 
-        # 3-Phase / 4-Stage Progressive Curriculum:
+        # 4-Phase Progressive Curriculum:
         #   Phase 1 (Stage 1): Adapt 72L Looped Transformer (mHC only; Backbone FROZEN, MoE-Engram DISABLED)
-        #   Phase 2A (Stage 2): Introduce 8-Expert MoE-Engram at 8K (Backbone FROZEN, mHC + Engram-8 trainable)
+        #   Phase 2A (Stage 2): Introduce 8-Expert MoE-Engram at 8K (Backbone FROZEN, mHC + Engram-8 trainable + Self-Balancing Router)
         #   Phase 2B (Stage 3): Upcycle MoE-Engram 8 -> 32 (Top-7) at 16K (Backbone FROZEN, mHC + Engram-32 trainable)
         #   Phase 3 (Stage 4): Joint Full-Finetuning at 16K (Backbone UNFROZEN at gentle 0.25x mult + mHC + Engram-32)
+        #   Phase 4 (Post-Training): Backbone-Frozen Joint mHC + MoE-Engram Capability Consolidation (Per-Pass Telescoping Gates)
         'STAGES': [
             {
                 'name': 'Stage1_Loop_mHC_Adapt_72L_8K',
@@ -211,14 +222,15 @@ def build_default_cfg() -> Dict[str, Any]:
             },
         ],
 
-        # 5-Pillar + Multi-Turn Dataset Targets
+        # 6-Pillar Multi-Domain Dataset Mixture (STEM, Math, SWE Code, Web/3D Design, Fable/Opus/GPT Astra CoT, Literacy & Tool Use)
         'TARGET_TOTAL_SAMPLES': 2400,
         'PILLAR_RATIOS': {
-            'code_swe': 0.35,
-            'web_3d_ui': 0.20,
-            'math_stem': 0.25,
-            'tool_agent': 0.15,
-            'concise_think': 0.05,
+            'code_swe': 0.28,
+            'math_stem': 0.24,
+            'web_3d_ui': 0.16,
+            'fable_opus_astra_cot': 0.14,
+            'literacy_dialogue': 0.08,
+            'tool_agent': 0.10,
         },
 
         # OpenCode Go Multi-Model Teacher Augmentation
@@ -252,17 +264,6 @@ DATASET_SOURCES: Dict[str, List[Tuple[str, Optional[str], str, Optional[str]]]] 
         ('ise-uiuc/Magicoder-Evol-Instruct-110K', None, 'train', 'data-evol_instruct-decontaminated.jsonl'),
         ('m-a-p/CodeFeedback-Filtered-Instruction', None, 'train', 'CodeFeedback-Filtered-Instruction.jsonl'),
     ],
-    'web_3d_ui': [
-        ('Tesslate/UIGEN-T1.5-Dataset', None, 'train', 'output.parquet'),
-        ('kelexine/fable-5-sft-traces', None, 'train', 'data/train-00000-of-00001.parquet'),
-        ('HuggingFaceH4/ultrachat_200k', None, 'train_sft', 'data/train_sft-00000-of-00003-a3ecf92756993583.parquet'),
-        ('cfahlgren1/react-code-instructions', None, 'train', 'data/data_ed7e68fb-44fe-47fc-b603-0279f2f8a7ca.jsonl'),
-        ('HelioAI/Claude-Fable-5-5500x', None, 'train', 'Fable-5-Distill-5500x.jsonl'),
-        ('armand0e/Fable-5-Chat', None, 'train', 'train.jsonl'),
-        ('nvidia/Nemotron-Instruction-Following-Chat-v1', None, 'chat_if', 'data/chat_if.jsonl'),
-        ('NousResearch/Hermes-3-Dataset', None, 'train', 'hermes-3-dataset.jsonl'),
-        ('DataCreatorAI/Multi-Turn-Conversational-SFT', None, 'train', 'multi_turn_conversations.jsonl'),
-    ],
     'math_stem': [
         ('open-thoughts/OpenThoughts-114k', 'default', 'train', 'data/train-00000-of-00006.parquet'),
         ('bespokelabs/Bespoke-Stratos-17k', None, 'train', 'data/train-00000-of-00001.parquet'),
@@ -274,6 +275,35 @@ DATASET_SOURCES: Dict[str, List[Tuple[str, Optional[str], str, Optional[str]]]] 
         ('AI-MO/NuminaMath-CoT', None, 'train', 'data/train-00000-of-00005.parquet'),
         ('Jackrong/Kimi-K2.5-Reasoning-1M-Cleaned', 'PHD-Science', 'train', 'PHD-Science.jsonl'),
     ],
+    'web_3d_ui': [
+        ('Tesslate/UIGEN-T1.5-Dataset', None, 'train', 'output.parquet'),
+        ('kelexine/fable-5-sft-traces', None, 'train', 'data/train-00000-of-00001.parquet'),
+        ('cfahlgren1/react-code-instructions', None, 'train', 'data/data_ed7e68fb-44fe-47fc-b603-0279f2f8a7ca.jsonl'),
+        ('HelioAI/Claude-Fable-5-5500x', None, 'train', 'Fable-5-Distill-5500x.jsonl'),
+        ('armand0e/Fable-5-Chat', None, 'train', 'train.jsonl'),
+    ],
+    'fable_opus_astra_cot': [
+        ('FlaneAI/GPT-6Astra-scientific-research', None, 'train', None),
+        ('Roman1111111/gpt-5.4-step-by-step-reasoning', None, 'train', 'gpt5.4.jsonl'),
+        ('vanty120/Gpt-5.4-Xhigh-Reasoning-2000x', None, 'train', 'train.jsonl'),
+        ('TeichAI/gpt-5.1-high-reasoning-1000x', None, 'train', 'gpt-5.1-1000x.jsonl'),
+        ('MoreThought/Fable-5.1-Max-Reasoning-Filtered-10000x', None, 'train', '10k/train.jsonl'),
+        ('saidutta69/fable-5-premium-v2', None, 'train', None),
+        ('angrygiraffe/claude-opus-4.6-4.7-reasoning-8.7k', None, 'train', None),
+        ('Roman1111111/claude-opus-4.6-10000x', None, 'train', 'opus46_final.jsonl'),
+        ('TeichAI/lordx64-claude-opus-4.7-max-cleaned', None, 'train', 'train.jsonl'),
+        ('ronaldcmz/claude_opus_4.8_max_thinking_5k_v2', None, 'train', 'opus_4_8_max_thinking_5k_v2.jsonl'),
+        ('ServiceNow-AI/R1-Distill-SFT', 'v0', 'train', 'v0/train-00000-of-00003.parquet'),
+        ('Skywork/Skywork-OR1-RL-Data', None, 'code', 'data/code-00000-of-00003.parquet'),
+    ],
+    'literacy_dialogue': [
+        ('HuggingFaceH4/ultrachat_200k', None, 'train_sft', 'data/train_sft-00000-of-00003-a3ecf92756993583.parquet'),
+        ('nvidia/Nemotron-Instruction-Following-Chat-v1', None, 'chat_if', 'data/chat_if.jsonl'),
+        ('NousResearch/Hermes-3-Dataset', None, 'train', 'hermes-3-dataset.jsonl'),
+        ('DataCreatorAI/Multi-Turn-Conversational-SFT', None, 'train', 'multi_turn_conversations.jsonl'),
+        ('HuggingFaceH4/no_robots', None, 'train', 'data/train-00000-of-00001.parquet'),
+        ('armand0e/Fable-5-Chat', None, 'train', 'train.jsonl'),
+    ],
     'tool_agent': [
         ('Locutusque/function-calling-chatml', None, 'train', 'data/train-00000-of-00001-f0b56c6983b4a78f.parquet'),
         ('lilacai/glaive-function-calling-v2-sharegpt', None, 'train', 'data/train-00000-of-00002-6f3344faa23e9b0a.parquet'),
@@ -283,6 +313,7 @@ DATASET_SOURCES: Dict[str, List[Tuple[str, Optional[str], str, Optional[str]]]] 
         ('NousResearch/hermes-function-calling-v1', None, 'train', 'json-mode-agentic.json'),
         ('glaiveai/glaive-function-calling-v2', None, 'train', 'glaive-function-calling-v2.json'),
     ],
+    # Backward-compatible alias for legacy 5-pillar configs
     'concise_think': [
         ('ServiceNow-AI/R1-Distill-SFT', 'v0', 'train', 'v0/train-00000-of-00003.parquet'),
         ('Skywork/Skywork-OR1-RL-Data', None, 'code', 'data/code-00000-of-00003.parquet'),
@@ -295,9 +326,8 @@ DATASET_SOURCES: Dict[str, List[Tuple[str, Optional[str], str, Optional[str]]]] 
 }
 
 
-
 def auto_configure_vram_16k(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Detect GPU VRAM & System RAM and tune 16K execution flags automatically."""
+    """Auto-detect GPU VRAM & System RAM, tune 16K execution flags, and validate modifiable MoE-Engram parameters."""
     random.seed(cfg['SEED'])
     torch.manual_seed(cfg['SEED'])
     if torch.cuda.is_available():
@@ -313,18 +343,62 @@ def auto_configure_vram_16k(cfg: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         sys_ram_gb = 32.0
 
-    # On 80GB+ GPUs (A100/H100), keep activations in GPU HBM; on 24-48GB GPUs (G4/L4/L40), stream activations to pinned host RAM
+    # Auto-detect activation offloading & Tier-1B DRAM placement
     cfg['OFFLOAD_CHECKPOINT_CPU'] = bool(vram_gb < 70.0 and sys_ram_gb >= 48.0)
+    if sys_ram_gb < 28.0 and vram_gb >= 70.0:
+        cfg['ENG_OFFLOAD_TIER1B_CPU'] = False
     if vram_gb < 22.0:
         cfg['MAX_SEQ_LENGTH'] = 8192
         for st in cfg['STAGES']:
             st['seq_len'] = min(st['seq_len'], 8192)
 
-    print('=' * 92)
+    # Optionally prepend Stage 0 progressive depth expansion (48L -> 60L) if requested by user
+    if cfg.get('ENABLE_STAGE0_PROGRESSIVE_DEPTH_WARMUP', False) and not any('Stage0' in s['name'] for s in cfg['STAGES']):
+        stage0_list = [
+            {
+                'name': 'Stage0A_Loop_mHC_Warmup_48L_4K',
+                'start': 8, 'end': 20, 'passes': 2, 'enable_p3': False,
+                'p3_start': 12, 'p3_end': 20,
+                'use_mhc': True, 'use_engram': False,
+                'seq_len': 4096,
+                'steps': 25,
+                'freeze_backbone': True,
+                'freeze_engram': True,
+                'upcycle_8_to_32': False,
+                'lr_scale': 1.0,
+                'mhc_lr_mult': 1.0,
+                'backbone_lr_mult': 0.0,
+                'loss_floor': 0.35,
+            },
+            {
+                'name': 'Stage0B_Loop_mHC_Expand_60L_8K',
+                'start': 4, 'end': 28, 'passes': 2, 'enable_p3': False,
+                'p3_start': 12, 'p3_end': 24,
+                'use_mhc': True, 'use_engram': False,
+                'seq_len': 8192,
+                'steps': 30,
+                'freeze_backbone': True,
+                'freeze_engram': True,
+                'upcycle_8_to_32': False,
+                'lr_scale': 1.0,
+                'mhc_lr_mult': 1.0,
+                'backbone_lr_mult': 0.0,
+                'loss_floor': 0.34,
+            },
+        ]
+        cfg['STAGES'] = stage0_list + list(cfg['STAGES'])
+
+    n_anchors = 1 + len(range(int(cfg['ENG_STRIDE']) - 1, 36, int(cfg['ENG_STRIDE']))) - (1 if 3 in range(int(cfg['ENG_STRIDE']) - 1, 36, int(cfg['ENG_STRIDE'])) else 0)
+    print('=' * 98)
     print(f"GPU: {gpu_name} ({vram_gb:.1f} GB VRAM) | System RAM: {sys_ram_gb:.1f} GB")
     print(f"Kernel Stack: Triton={HAS_TRITON} | Unsloth={HAS_UNSLOTH} | Liger={HAS_LIGER} | Cut-CE={HAS_CCE}")
     print(f"Max Seq Length: {cfg['MAX_SEQ_LENGTH']} tokens | Pinned-RAM Activation Streaming: {cfg['OFFLOAD_CHECKPOINT_CPU']}")
-    print('=' * 92)
+    print(
+        f"MoE-Engram Auto-Config: {n_anchors} Anchors | Experts={cfg['ENG_INITIAL_ACTIVE_EXPERTS']}->{cfg['ENG_EXPERTS']} "
+        f"(Top-K={cfg['ENG_INITIAL_TOP_K']}->{cfg['ENG_TOP_K']}) | SharedRank={cfg['ENG_SHARED_RANK']} | "
+        f"ExpertRank={cfg['ENG_EXPERT_RANK']} | Self-Balance Step={cfg.get('ENG_BALANCE_STEP_SIZE', 0.0015)}"
+    )
+    print('=' * 98)
     return cfg
 
 
@@ -1193,6 +1267,7 @@ def _build_stage_optimizer(
             'router' in name
             or 'expert_centroids' in name
             or name.endswith('.gain')
+            or name.endswith('.pass_gain_logits')
             or name.endswith('.scale_weights')
         ):
             router_params.append(p)
@@ -1403,6 +1478,7 @@ def run_v03_four_stage_training(
     model_cls._apply_layer = _core_mod.SparkXLoopV03._apply_layer
     model_cls._checkpoint_context = _core_mod.SparkXLoopV03._checkpoint_context
     model_cls.total_router_z_loss = _core_mod.SparkXLoopV03.total_router_z_loss
+    model_cls.get_engram_routing_telemetry = _core_mod.SparkXLoopV03.get_engram_routing_telemetry
     model_cls.upcycle_all_engrams_8_to_32 = _core_mod.SparkXLoopV03.upcycle_all_engrams_8_to_32
     model_cls.reset_all_loop_and_engram_to_step0 = _core_mod.SparkXLoopV03.reset_all_loop_and_engram_to_step0
     for ctrl_mod in model.controllers.values():
@@ -1413,8 +1489,12 @@ def run_v03_four_stage_training(
         eng_cls = type(eng_mod)
         eng_cls.forward = _core_mod.ZipfianTieredMoEEngram.forward
         eng_cls.step_tier1b_sparse_adam = _core_mod.ZipfianTieredMoEEngram.step_tier1b_sparse_adam
+        eng_cls.routing_balance_summary = _core_mod.ZipfianTieredMoEEngram.routing_balance_summary
         eng_cls.upcycle_experts_8_to_32 = _core_mod.ZipfianTieredMoEEngram.upcycle_experts_8_to_32
         eng_cls.reset_parameters_to_step0 = _core_mod.ZipfianTieredMoEEngram.reset_parameters_to_step0
+        eng_mod.load_ema_decay = float(cfg.get('ENG_LOAD_EMA_DECAY', 0.05))
+        eng_mod.balance_step_size = float(cfg.get('ENG_BALANCE_STEP_SIZE', 0.0015))
+        eng_mod.use_pass_gain_schedule = bool(cfg.get('ENG_USE_PASS_GAIN_SCHEDULE', True))
         eng_mod._pending_expert_load = None
         eng_mod.last_router_z_loss = None
         eng_mod._active_z_losses = None
@@ -1699,6 +1779,8 @@ def run_v03_four_stage_training(
                 mhc_p2 = sum(p2_gains) / float(max(1, len(p2_gains)))
                 mhc_p3 = (sum(p3_gains) / float(len(p3_gains))) if p3_gains else 0.0
                 mhc_gain = 0.5 * (mhc_p2 + mhc_p3) if p3_gains else mhc_p2
+                rt_info = model.get_engram_routing_telemetry() if (use_engram and hasattr(model, 'get_engram_routing_telemetry')) else {}
+                load_cv = float(rt_info.get('mean_load_cv', 0.0))
 
                 metrics = {
                     'stage': stage_name,
@@ -1714,6 +1796,7 @@ def run_v03_four_stage_training(
                     'mhc_gain': round(mhc_gain, 5),
                     'mhc_p2_gain': round(mhc_p2, 5),
                     'mhc_p3_gain': round(mhc_p3, 5),
+                    'router_load_cv': round(load_cv, 4),
                     'elapsed_hours': round(elapsed_h, 3),
                 }
                 history.append(metrics)
@@ -1722,10 +1805,14 @@ def run_v03_four_stage_training(
                     recent_ce.pop(0)
 
                 if st_step <= 3 or st_step % log_every == 0 or st_step == stage_steps:
+                    rt_str = (
+                        f" | router_cv={load_cv:.3f}(E={model.engram.active_experts},K={model.engram.active_top_k})"
+                        if use_engram else ""
+                    )
                     print(
                         f"[{stage_name} {st_step:4d}/{stage_steps:4d} | Global {global_step:4d}] "
                         f"loss={accum_loss:.4f} (ce={accum_ce:.4f}, z={accum_z:.5f}) | "
-                        f"gnorm={grad_norm:.3f} | mHC={mhc_gain:.4f}(p2={mhc_p2:.4f},p3={mhc_p3:.4f}) | "
+                        f"gnorm={grad_norm:.3f} | mHC={mhc_gain:.4f}(p2={mhc_p2:.4f},p3={mhc_p3:.4f}){rt_str} | "
                         f"{tok_per_s:6.0f} tok/s ({step_dt:4.1f}s/step, sup={step_sup_tokens:,}) | "
                         f"VRAM={vram_alloc:.1f}/{vram_peak:.1f}GB | "
                         f"elapsed={elapsed_h:.2f}h (ETA {stage_eta_m:.1f}m)",
@@ -1789,12 +1876,37 @@ def run_v03_four_stage_training(
             )
         raise
 
+    phase4_report = None
+    if cfg.get('ENABLE_PHASE4_POST_TRAIN', False) and not budget_reached:
+        try:
+            import sparkx_loop_v03_benchmarks as _bench_mod
+            importlib.reload(_bench_mod)
+            p4_steps = int(cfg.get('PHASE4_STEPS', 80))
+            p4_mhc = bool(cfg.get('PHASE4_TRAIN_MHC', True))
+            phase4_report = _bench_mod.run_phase4_engram_consolidation(
+                model=model,
+                tokenizer=tokenizer,
+                num_steps=p4_steps,
+                lr_engram=float(cfg.get('LR_ENGRAM', 1.5e-4)),
+                lr_gates=5.0e-4,
+                lr_mhc=3.0e-5,
+                train_mhc=p4_mhc,
+                max_seq_len=768,
+                eval_every=max(10, p4_steps // 4),
+                save_dir=str(Path(cfg.get('CHECKPOINT_DIR', '/content/checkpoints_v03_r2_3phase')) / f"step_{global_step:05d}_Phase4_Consolidated"),
+                push_to_hub=False,
+                hub_repo_id=str(cfg.get('HF_REPO_ID', 'TassP0lar/Spark-X2.6-4B-En4B-A1B')),
+                token=hf_token,
+            )
+        except Exception as exc:
+            print(f"[Phase 4 Post-Training Notice] {exc}", flush=True)
+
     final_dir = export_final_v03_to_hub(
         model, tokenizer, cfg, global_step,
         history[-1] if history else {'loss': 0.0},
         hf_token=hf_token,
     )
-    return {'global_step': global_step, 'history': history, 'final_dir': str(final_dir)}
+    return {'global_step': global_step, 'history': history, 'phase4_report': phase4_report, 'final_dir': str(final_dir)}
 
 
 # ==============================================================================
