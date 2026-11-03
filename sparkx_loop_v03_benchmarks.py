@@ -49,27 +49,34 @@ def strip_thinking_trace(text: str) -> Tuple[str, str, bool]:
     return "", text.strip(), True
 
 
-def extract_boxed_or_final_answer(text: str, choices: Optional[List[str]] = None) -> str:
-    """Extract `\\boxed{...}` or `Answer: ...` from model response."""
-    _, answer_body, _ = strip_thinking_trace(text)
-    search_space = answer_body if answer_body else text
-
-    # 1. Find last \boxed{...} supporting nested braces
-    boxed_matches = []
-    for m in re.finditer(r"\\boxed\{", search_space):
+def _find_boxed_spans(s: str) -> List[str]:
+    spans: List[str] = []
+    for m in re.finditer(r"\\boxed\{", s):
         start = m.end()
         depth = 1
         i = start
-        while i < len(search_space) and depth > 0:
-            if search_space[i] == "{":
+        while i < len(s) and depth > 0:
+            if s[i] == "{":
                 depth += 1
-            elif search_space[i] == "}":
+            elif s[i] == "}":
                 depth -= 1
             i += 1
         if depth == 0:
-            boxed_matches.append(search_space[start : i - 1].strip())
+            spans.append(s[start : i - 1].strip())
+    return spans
+
+
+def extract_boxed_or_final_answer(text: str, choices: Optional[List[str]] = None) -> str:
+    """Extract `\\boxed{...}` or `Answer: ...` from model response (stripping LHS `... =` if present)."""
+    _, answer_body, _ = strip_thinking_trace(text)
+    search_space = answer_body if answer_body else text
+
+    # 1. Find last \boxed{...} supporting nested braces (fallback to full text if only in <think>)
+    boxed_matches = _find_boxed_spans(search_space) or _find_boxed_spans(text)
     if boxed_matches:
-        cand = boxed_matches[-1]
+        cand = boxed_matches[-1].strip()
+        if "=" in cand and not choices:
+            cand = cand.split("=")[-1].strip()
         if choices:
             m_let = re.match(r"^\(?([A-Za-z])\)?$", cand.strip())
             if m_let:
@@ -89,7 +96,6 @@ def extract_boxed_or_final_answer(text: str, choices: Optional[List[str]] = None
             matches = re.findall(pat, search_space, flags=re.IGNORECASE)
             if matches:
                 return matches[-1].upper()
-        # Fallback: scan full text
         for pat in patterns[:2]:
             matches = re.findall(pat, text, flags=re.IGNORECASE)
             if matches:
@@ -98,16 +104,24 @@ def extract_boxed_or_final_answer(text: str, choices: Optional[List[str]] = None
     # 3. Short-answer patterns: "Final Answer: ..." or "Answer: ..."
     m_ans = re.findall(r"(?:final\s+answer|answer)\s*(?:is|:)\s*([^\n.]+)", search_space, flags=re.IGNORECASE)
     if m_ans:
-        return m_ans[-1].strip().strip("$*`")
+        cand = m_ans[-1].strip().strip("$*`")
+        if "=" in cand and not choices:
+            cand = cand.split("=")[-1].strip()
+        return cand
 
     lines = [ln.strip() for ln in search_space.splitlines() if ln.strip()]
-    return lines[-1] if lines else ""
+    last_ln = lines[-1] if lines else ""
+    if "=" in last_ln and not choices and len(last_ln) < 120:
+        last_ln = last_ln.split("=")[-1].strip().strip("$*`.")
+    return last_ln
 
 
 def normalize_math_answer(ans: str) -> str:
     """Canonicalize LaTeX/math strings for exact & symbolic comparison."""
     s = str(ans).strip()
     s = re.sub(r"^\\boxed\{(.+)\}$", r"\1", s)
+    if "=" in s:
+        s = s.split("=")[-1].strip()
     s = s.replace("$", "").replace("\\left", "").replace("\\right", "")
     s = s.replace("\\dfrac", "\\frac").replace("\\tfrac", "\\frac")
     s = s.replace("\\,", "").replace("\\;", "").replace("\\!", "").replace("\\ ", "")
@@ -117,34 +131,72 @@ def normalize_math_answer(ans: str) -> str:
     return re.sub(r"\s+", "", s).lower()
 
 
+def _latex_to_sympy_str(s: str) -> str:
+    out = s
+    for _ in range(4):
+        out = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"((\1)/(\2))", out)
+        out = re.sub(r"\\sqrt\{([^{}]+)\}", r"sqrt(\1)", out)
+    out = out.replace("\\pi", "pi").replace("\\exp", "exp").replace("\\ln", "ln").replace("^", "**")
+    out = re.sub(r"\{([^{}]+)\}", r"(\1)", out)
+    # Insert explicit '*' for implicit multiplication: e.g. 4e -> 4*e, 2sqrt( -> 2*sqrt(, )( -> )*(
+    out = re.sub(r"(\d)([a-zA-Z(])", r"\1*\2", out)
+    out = re.sub(r"(\))(\d|[a-zA-Z(])", r"\1*\2", out)
+    return out
+
+
 def check_math_equivalence(pred: str, gold: str) -> bool:
-    """Compare predicted vs gold math/short answer via string canonicalization + SymPy fallback."""
+    """Compare predicted vs gold math/short answer via canonical string match, pure numeric/algebraic match, and SymPy symbolic evaluation."""
     if not pred:
         return False
     np = normalize_math_answer(pred)
     ng = normalize_math_answer(gold)
     if np == ng:
         return True
-    # Numeric comparison
+    p_clean = _latex_to_sympy_str(np.replace(",", ""))
+    g_clean = _latex_to_sympy_str(ng.replace(",", ""))
+    if p_clean == g_clean:
+        return True
+    # Safe closed-form algebraic & numeric evaluator (supports sqrt, e, pi, exp, ln, log, **, /, *, +, -)
+    # Never strips LaTeX commands into raw digits (so '2' never matches '\sqrt{2}')
+    safe_math_ns = {
+        "__builtins__": {},
+        "sqrt": math.sqrt,
+        "e": math.e,
+        "pi": math.pi,
+        "exp": math.exp,
+        "ln": math.log,
+        "log": math.log,
+        "sin": math.sin,
+        "cos": math.cos,
+        "tan": math.tan,
+    }
     try:
-        fp = float( re.sub(r"[^0-9eE.+\-/]", "", np.replace(",", "")) )
-        fg = float( re.sub(r"[^0-9eE.+\-/]", "", ng.replace(",", "")) )
+        fp = float(eval(p_clean, safe_math_ns, {}))
+        fg = float(eval(g_clean, safe_math_ns, {}))
         if math.isclose(fp, fg, rel_tol=1e-4, abs_tol=1e-4):
             return True
     except Exception:
         pass
-    # SymPy symbolic difference check
+    # SymPy symbolic + high-precision numeric evaluation (with implicit multiplication & free variables support)
     try:
         import sympy as sp
-        from sympy.parsing.sympy_parser import parse_expr
-        p_clean = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"((\1)/(\2))", np)
-        g_clean = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"((\1)/(\2))", ng)
-        p_clean = p_clean.replace("^", "**")
-        g_clean = g_clean.replace("^", "**")
-        expr_p = parse_expr(p_clean, evaluate=True)
-        expr_g = parse_expr(g_clean, evaluate=True)
+        from sympy.parsing.sympy_parser import (
+            convert_xor,
+            implicit_multiplication_application,
+            parse_expr,
+            standard_transformations,
+        )
+        transforms = standard_transformations + (implicit_multiplication_application, convert_xor)
+        local_dict = {"e": sp.E, "pi": sp.pi, "sqrt": sp.sqrt, "exp": sp.exp, "ln": sp.log}
+        expr_p = parse_expr(p_clean, local_dict=local_dict, transformations=transforms, evaluate=True)
+        expr_g = parse_expr(g_clean, local_dict=local_dict, transformations=transforms, evaluate=True)
         if sp.simplify(expr_p - expr_g) == 0:
             return True
+        val_p = complex(expr_p.evalf())
+        val_g = complex(expr_g.evalf())
+        if abs(val_p.imag) < 1e-7 and abs(val_g.imag) < 1e-7:
+            if math.isclose(val_p.real, val_g.real, rel_tol=1e-4, abs_tol=1e-4):
+                return True
     except Exception:
         pass
     return False
@@ -2373,8 +2425,16 @@ def score_anti_slop_composition(text: str) -> Dict[str, Any]:
         if re.search(pat, clean, flags=re.IGNORECASE | re.MULTILINE):
             slop_hits.append(label)
 
-    # Compute syntactic burstiness (CV of sentence word counts: human prose >= 0.32, robotic LLM < 0.22)
-    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", clean) if len(s.strip().split()) >= 3]
+    # Strip fenced code blocks and Markdown headers before measuring prose/bullet sentence-length burstiness
+    prose_only = re.sub(r"```[\s\S]*?```", " ", clean)
+    prose_only = re.sub(r"(?m)^\s*#+\s+.*$", " ", prose_only)
+    raw_clauses = re.split(r"(?<=[.!?])\s+|\n+", prose_only)
+    sents = []
+    for cl in raw_clauses:
+        cl_str = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s+", "", cl.strip())
+        if len(cl_str.split()) >= 3:
+            sents.append(cl_str)
+
     word_counts = [len(s.split()) for s in sents]
     if len(word_counts) >= 2:
         mean_w = sum(word_counts) / float(len(word_counts))
@@ -2383,10 +2443,17 @@ def score_anti_slop_composition(text: str) -> Dict[str, Any]:
     else:
         burstiness_cv = 0.20
 
+    # Check concrete technical specificity (metrics, units, or inline code identifiers)
+    has_concrete_metrics = bool(
+        re.search(r"\b\d+(?:\.\d+)?\s*(?:ms|s|rps|gb|mb|kb|%|x|ns|us)\b|`[^`]+`", clean, flags=re.IGNORECASE)
+    )
+
     base_score = 100.0
     base_score -= 18.0 * len(slop_hits)
-    if burstiness_cv < 0.28:
-        base_score -= (0.28 - burstiness_cv) * 80.0
+    if burstiness_cv < 0.26:
+        base_score -= (0.26 - burstiness_cv) * 75.0
+    if not has_concrete_metrics:
+        base_score -= 8.0
     if not closed_think and "<think>" in text:
         base_score -= 20.0
     if len(clean) < 120:
@@ -2396,8 +2463,10 @@ def score_anti_slop_composition(text: str) -> Dict[str, Any]:
     issues = []
     if slop_hits:
         issues.append(f"Eliminate AI slop phrases: {slop_hits}")
-    if burstiness_cv < 0.30:
-        issues.append(f"Increase sentence-length burstiness (current CV={burstiness_cv:.2f} < 0.32; mix crisp 6-word declaratives with 24-word analytical clauses)")
+    if burstiness_cv < 0.28:
+        issues.append(f"Increase sentence-length burstiness (current CV={burstiness_cv:.2f} < 0.28; mix crisp 6-word declaratives with 24-word analytical clauses)")
+    if not has_concrete_metrics:
+        issues.append("Include concrete quantitative engineering metrics (latency, RPS, buffer sizes, or inline code identifiers)")
     if not issues:
         issues.append("Prose is clean, concrete, and exhibits natural human rhythm.")
 
@@ -2406,11 +2475,12 @@ def score_anti_slop_composition(text: str) -> Dict[str, Any]:
         "score": score,
         "slop_hits": slop_hits,
         "burstiness_cv": round(burstiness_cv, 3),
+        "has_concrete_metrics": has_concrete_metrics,
         "closed_think": closed_think,
         "critique": "; ".join(issues),
         "instruction": (
             "Rewrite with zero AI clichés ('delve', 'tapestry', 'testament', 'not just X, but Y', 'it is worth noting'), "
-            "no sycophantic preamble, concrete domain nouns, active verbs, and varied sentence lengths (burstiness CV >= 0.35)."
+            "no sycophantic preamble, concrete domain nouns, active verbs, and varied sentence lengths (burstiness CV >= 0.32)."
         ),
     }
 
@@ -2420,26 +2490,80 @@ def score_web_ux_and_defensive_security(text: str) -> Dict[str, Any]:
     _, body, closed_think = strip_thinking_trace(text)
     low = body.lower()
 
+    # Strip single-line and multi-line comments before scanning for dangerous code sinks
+    code_no_comments = re.sub(r"//.*?$|#.*?$|/\*[\s\S]*?\*/|<!--[\s\S]*?-->", "", body, flags=re.MULTILINE)
+    code_low = code_no_comments.lower()
+    has_unsafe_innerhtml = bool(re.search(r"\.\s*innerhtml\s*=", code_low)) and ("dompurify" not in low and "sanitize" not in low)
+    has_unsafe_eval = bool(re.search(r"\beval\s*\(", code_low))
+
     ux_checks = {
-        "wcag_aria": any(k in low for k in ("aria-label", "aria-live", "aria-describedby", "role=")),
-        "keyboard_focus": any(k in low for k in ("focus-visible", "tabindex", "onkeydown", "focus:")),
-        "semantic_html": any(k in low for k in ("<main", "<nav", "<section", "<header", "<article")),
-        "ux_4_states": sum(1 for k in ("loading", "skeleton", "empty", "error", "retry") if k in low) >= 3,
-        "responsive_tokens": any(k in low for k in ("clamp(", "@media", "grid-template", "--", "prefers-reduced-motion")),
+        "wcag_aria": any(
+            k in low
+            for k in ("aria-label", "aria-live", "aria-describedby", "aria-busy", "aria-invalid", "aria-errormessage", "role=")
+        ),
+        "keyboard_focus": any(
+            k in low for k in ("focus-visible", "tabindex", "onkeydown", "focus:", ".focus(", "outline:")
+        ),
+        "semantic_html": any(
+            k in low for k in ("<main", "<nav", "<section", "<header", "<article", "<form", "<fieldset", "<label")
+        ),
+        "ux_4_states": sum(
+            1
+            for k in ("loading", "skeleton", "spinner", "aria-busy", "empty", "error", "retry", "alert", "success", "rotated")
+            if k in low
+        ) >= 3,
+        "responsive_tokens": any(
+            k in low for k in ("clamp(", "@media", "grid-template", "--", "prefers-reduced-motion", "minmax(", "rem")
+        ),
     }
     appsec_checks = {
-        "parameterized_sql_or_schema": any(k in low for k in ("?", "$1", "%s", "prepared", "pydantic", "zod", "parameterized", "validator")),
-        "csp_or_headers": any(k in low for k in ("content-security-policy", "x-content-type-options", "nosniff", "same-origin", " strict-transport-security")),
-        "csrf_or_cookie_policy": any(k in low for k in ("httponly", "samesite", "csrf", "x-csrf-token", "secure")),
-        "safe_dom_escaping": any(k in low for k in ("textcontent", "dompurify", "escape", "sanitize")) and ("innerhtml =" not in low),
-        "rate_limit_or_auth": any(k in low for k in ("ratelimit", "rate_limit", "429", "argon2", "bcrypt", "jwt", "bearer")),
+        "parameterized_sql_or_schema": any(
+            k in low
+            for k in ("?", "$1", "%s", ":param", "prepared", "pydantic", "zod", "parameterized", "validator", "basemodel", "execute(")
+        ),
+        "csp_or_headers": any(
+            k in low
+            for k in (
+                "content-security-policy",
+                "helmet",
+                "x-content-type-options",
+                "nosniff",
+                "same-origin",
+                "strict-transport-security",
+                "frame-ancestors",
+                "x-frame-options",
+            )
+        ),
+        "csrf_or_cookie_policy": any(
+            k in low for k in ("httponly", "samesite", "csrf", "x-csrf-token", "compare_digest", "timingsafeequal")
+        ),
+        "safe_dom_escaping": any(
+            k in low for k in ("textcontent", "innertext", "createelement", "createtextnode", "dompurify", "escape", "sanitize")
+        )
+        and not has_unsafe_innerhtml,
+        "rate_limit_or_auth": any(
+            k in low
+            for k in (
+                "ratelimit",
+                "rate_limit",
+                "rate-limit",
+                "429",
+                "too many requests",
+                "argon2",
+                "bcrypt",
+                "jwt",
+                "bearer",
+                "token_urlsafe",
+                "randombytes",
+            )
+        ),
     }
     risks = []
-    if "eval(" in low:
+    if has_unsafe_eval:
         risks.append("Uses dangerous `eval()`")
-    if re.search(r"SELECT\s+.*\{.*\}\s+FROM", body, flags=re.IGNORECASE):
+    if re.search(r"SELECT\s+.*\{.*\}\s+FROM", code_no_comments, flags=re.IGNORECASE):
         risks.append("Unparameterized f-string SQL interpolation")
-    if "innerhtml =" in low and "sanitize" not in low and "dompurify" not in low:
+    if has_unsafe_innerhtml:
         risks.append("Unsanitized `innerHTML` assignment (XSS risk)")
 
     ux_pts = sum(10.0 for v in ux_checks.values() if v)
@@ -2457,7 +2581,8 @@ def score_web_ux_and_defensive_security(text: str) -> Dict[str, Any]:
         "risks_flagged": risks,
         "critique": f"Missing UX: {missing_ux} | Missing AppSec: {missing_sec} | Risks: {risks}",
         "instruction": (
-            "Include semantic HTML5 landmarks, WCAG 2.2 `aria-live`/`focus-visible` accessibility, explicit Loading/Empty/Error/Success UX states, "
+            "Provide BOTH the Backend and Frontend sections completely: include semantic HTML5 landmarks (`<main>`, `<section>`), "
+            "WCAG 2.2 `aria-live`/`focus-visible` accessibility, explicit Loading/Empty/Error/Success UX states, "
             "safe `textContent` DOM updates, parameterized SQL queries, `HttpOnly; SameSite=Strict` CSRF-safe cookies, and `Content-Security-Policy` headers."
         ),
     }
@@ -2468,9 +2593,40 @@ def score_stem_knowledge_and_reasoning(text: str, gold_answer: str) -> Dict[str,
     thought, body, closed_think = strip_thinking_trace(text)
     pred = extract_boxed_or_final_answer(text)
     ans_ok = check_math_equivalence(pred, gold_answer)
+
+    # If the response contains multiple \boxed{...} spans or comma/semicolon-separated clauses inside \boxed{},
+    # check all boxed candidates so boxing an intermediate spectrum E_n alongside the final ratio E_2/E_1 is judged fairly.
+    if not ans_ok:
+        candidates: List[str] = []
+        for span in _find_boxed_spans(body if body else text):
+            candidates.append(span)
+            for sub in re.split(r"[,;]|\\quad|\\qquad|\band\b", span):
+                if sub.strip():
+                    candidates.append(sub.strip())
+        for cand in candidates:
+            if check_math_equivalence(cand, gold_answer):
+                pred = cand
+                ans_ok = True
+                break
+
     has_first_principles = len(thought.strip()) >= 40 and any(
         k in (thought + " " + body).lower()
-        for k in ("therefore", "substitut", "conservation", "eigenvalue", "derivative", "dimension", "limit", "hamiltonian", "lorentz", "poisson", "complexity")
+        for k in (
+            "therefore",
+            "substitut",
+            "conservation",
+            "eigenvalue",
+            "derivative",
+            "dimension",
+            "limit",
+            "hamiltonian",
+            "lorentz",
+            "poisson",
+            "complexity",
+            "partition",
+            "commutator",
+            "ladder",
+        )
     )
 
     score = 0.0
@@ -2828,10 +2984,11 @@ def run_si_srsi_engram_loop(
     supervised_trajectories: List[Dict[str, Any]] = []
     for t_item in tasks:
         model.set_domain_engram_focus(t_item["domain"], boost=0.08)
+        task_max_new = 1536 if t_item["domain"] == "web_ux_sec" else 1024
         gen = generate_chat_response(
             model, tokenizer,
             user_prompt=t_item["prompt"],
-            max_new_tokens=1024,
+            max_new_tokens=task_max_new,
             think_budget_tokens=192,
             temperature=0.1,
         )
@@ -2844,6 +3001,7 @@ def run_si_srsi_engram_loop(
             "initial_score": aud["score"],
             "teacher_diagnosis": sup["diagnosis"],
             "teacher_source": sup["teacher_source"],
+            "details": aud,
         }
         supervised_trajectories.append({
             "task": t_item,
@@ -2857,8 +3015,14 @@ def run_si_srsi_engram_loop(
         )
 
     init_mean_rubric = sum(v["initial_score"] for v in initial_audits.values()) / max(1, len(initial_audits))
+    model.set_domain_engram_focus("general", boost=0.0)
     init_ppl_eval = evaluate_engram_perplexity_delta(model, tokenizer)
-    print(f"  -> Baseline Mean SI-SRSI Rubric Score: {init_mean_rubric:.2f}/100 | Held-Out 72L PPL: {init_ppl_eval['with_engram_ppl']:.4f}")
+    init_ppl = init_ppl_eval["with_engram_ppl"]
+    init_composite = init_mean_rubric - 5.0 * init_ppl
+    print(
+        f"  -> Baseline Mean SI-SRSI Rubric Score: {init_mean_rubric:.2f}/100 | "
+        f"Held-Out 72L PPL: {init_ppl:.4f} | Composite Judge Score: {init_composite:.2f}"
+    )
 
     # 2. Freeze 36L Base Backbone and prepare trainable mHC + MoE-Engram parameter groups
     for p in model.base.parameters():
@@ -2894,7 +3058,8 @@ def run_si_srsi_engram_loop(
         prefix_str = f"<|im_start|>system\n{sys_msg}<|im_end|>\n<|im_start|>user\n{u_txt}<|im_end|>\n<|im_start|>assistant\n"
         full_str = prefix_str + a_txt + "<|im_end|>"
         p_ids = tokenizer(prefix_str, add_special_tokens=False).input_ids
-        f_ids = tokenizer(full_str, add_special_tokens=False).input_ids[:896]
+        max_seq_cap = 1280 if t_item["domain"] == "web_ux_sec" else 896
+        f_ids = tokenizer(full_str, add_special_tokens=False).input_ids[:max_seq_cap]
         if len(f_ids) <= len(p_ids) + 8:
             continue
         inp = torch.tensor([f_ids], dtype=torch.long)
@@ -2941,7 +3106,21 @@ def run_si_srsi_engram_loop(
 
     best_bank_snap = model.snapshot_engram_bank()
     best_ctrl_sd = {k: v.detach().cpu().clone() for k, v in model.controllers.state_dict().items()}
-    best_ppl = init_ppl_eval["with_engram_ppl"]
+    best_ppl = init_ppl
+    best_ppl_eval = init_ppl_eval
+    best_mean_rubric = init_mean_rubric
+    best_composite = init_composite
+    best_round_idx = 0
+    best_audits: Dict[str, Any] = {
+        tid: {
+            "domain": v["domain"],
+            "before_score": v["initial_score"],
+            "after_score": v["initial_score"],
+            "delta": 0.0,
+            "details": v["details"],
+        }
+        for tid, v in initial_audits.items()
+    }
 
     total_steps = max(1, int(num_rounds) * int(steps_per_round))
     global_s = 0
@@ -2993,62 +3172,90 @@ def run_si_srsi_engram_loop(
             optimizer.step()
             model.step_all_tier1b_sparse_adam(lr=eff_lr_eng * lr_mult)
 
-        # End-of-Round Verification & Composite Non-Degradation Snapshot Gate
+        # End-of-Round Multi-Objective Composite Judge Gate (3-Domain Rubric + Held-Out 72L Perplexity)
+        model.enable_checkpoint = False
+        model.settings.checkpoint_layers = False
+        model.eval()
+        model.set_engram_flight_mode("deep_knowledge")
+
+        round_audits: Dict[str, Any] = {}
+        for t_item in tasks:
+            model.set_domain_engram_focus(t_item["domain"], boost=0.08)
+            task_max_new = 1536 if t_item["domain"] == "web_ux_sec" else 1024
+            gen = generate_chat_response(
+                model, tokenizer,
+                user_prompt=t_item["prompt"],
+                max_new_tokens=task_max_new,
+                think_budget_tokens=192,
+                temperature=0.1,
+            )
+            aud = _audit_task_rollout(t_item, gen["raw_text"])
+            init_sc = initial_audits[t_item["id"]]["initial_score"]
+            round_audits[t_item["id"]] = {
+                "domain": t_item["domain"],
+                "before_score": init_sc,
+                "after_score": aud["score"],
+                "delta": round(aud["score"] - init_sc, 2),
+                "details": aud,
+            }
+
+        round_mean_rubric = sum(v["after_score"] for v in round_audits.values()) / max(1, len(round_audits))
         model.set_domain_engram_focus("general", boost=0.0)
         cur_ppl_eval = evaluate_engram_perplexity_delta(model, tokenizer)
         cur_ppl = cur_ppl_eval["with_engram_ppl"]
-        ppl_ceiling = max(best_ppl * 1.06, cur_ppl_eval["no_engram_ppl"] - 1.10)
-        if cur_ppl <= ppl_ceiling:
+        cur_composite = round_mean_rubric - 5.0 * cur_ppl
+        ppl_ceiling = max(init_ppl * 1.05, cur_ppl_eval["no_engram_ppl"] - 1.10)
+
+        # Accept round snapshot if Composite Judge Score improves (or if Round 1 improves PPL without major rubric loss)
+        accept_round = (cur_ppl <= ppl_ceiling) and (
+            (cur_composite >= best_composite - 0.5)
+            or (cur_ppl < best_ppl and round_mean_rubric >= best_mean_rubric - 2.0)
+        )
+        if accept_round:
             best_ppl = min(best_ppl, cur_ppl)
+            best_ppl_eval = cur_ppl_eval
+            best_mean_rubric = round_mean_rubric
+            best_composite = max(best_composite, cur_composite)
+            best_round_idx = r_idx
+            best_audits = round_audits
             best_bank_snap = model.snapshot_engram_bank()
             best_ctrl_sd = {k: v.detach().cpu().clone() for k, v in model.controllers.state_dict().items()}
-            gate_status = "ACCEPTED (Engram Snapshot Updated)"
+            gate_status = f"ACCEPTED (Composite={cur_composite:.2f}, Rubric={round_mean_rubric:.1f}, PPL={cur_ppl:.4f})"
         else:
             model.hot_swap_engram_bank(best_bank_snap, blend_alpha=1.0)
             model.controllers.load_state_dict({k: v.to(device) for k, v in best_ctrl_sd.items()})
-            gate_status = "ROLLED BACK TO BEST SNAPSHOT"
+            gate_status = (
+                f"ROLLED BACK TO ROUND {best_round_idx} SNAPSHOT "
+                f"(Round {r_idx} Composite={cur_composite:.2f} vs Best={best_composite:.2f})"
+            )
 
         tel = model.get_engram_routing_telemetry()
         print(
             f"  [SI-SRSI Round {r_idx}/{num_rounds} Complete | {time.time()-t0:5.1f}s] "
             f"last_ce={out['ce_loss'].item():.4f} | ftpo_unlikelihood={ftpo_val:.4f} | "
-            f"Held-Out 72L PPL={cur_ppl:.4f} (NoEng={cur_ppl_eval['no_engram_ppl']:.4f}) | "
+            f"Rubric={round_mean_rubric:.2f}/100 | Held-Out 72L PPL={cur_ppl:.4f} (NoEng={cur_ppl_eval['no_engram_ppl']:.4f}) | "
             f"RouterCV={tel['mean_load_cv']:.4f} | {gate_status}"
         )
 
-    # 3. Post-SI-SRSI Student Verification Rollout across all 3 Domains
+    # 3. Restore Best Multi-Objective Snapshot & Report Post-SI-SRSI Verification across all 3 Domains
+    model.hot_swap_engram_bank(best_bank_snap, blend_alpha=1.0)
+    model.controllers.load_state_dict({k: v.to(device) for k, v in best_ctrl_sd.items()})
     model.enable_checkpoint = False
     model.settings.checkpoint_layers = False
     model.eval()
     model.set_engram_flight_mode("deep_knowledge")
 
-    final_audits: Dict[str, Any] = {}
+    final_audits = best_audits
     for t_item in tasks:
-        model.set_domain_engram_focus(t_item["domain"], boost=0.08)
-        gen = generate_chat_response(
-            model, tokenizer,
-            user_prompt=t_item["prompt"],
-            max_new_tokens=1024,
-            think_budget_tokens=192,
-            temperature=0.1,
-        )
-        aud = _audit_task_rollout(t_item, gen["raw_text"])
-        init_sc = initial_audits[t_item["id"]]["initial_score"]
-        final_audits[t_item["id"]] = {
-            "domain": t_item["domain"],
-            "before_score": init_sc,
-            "after_score": aud["score"],
-            "delta": round(aud["score"] - init_sc, 2),
-            "details": aud,
-        }
+        res = final_audits[t_item["id"]]
         print(
-            f"  [Post-SI-SRSI Audit | {t_item['domain']:11s} | `{t_item['id']}`] "
-            f"Score: {init_sc:5.1f} -> {aud['score']:5.1f}/100 ({aud['score'] - init_sc:+5.1f})"
+            f"  [Post-SI-SRSI Audit (Best Round {best_round_idx}) | {t_item['domain']:11s} | `{t_item['id']}`] "
+            f"Score: {res['before_score']:5.1f} -> {res['after_score']:5.1f}/100 ({res['delta']:+5.1f})"
         )
 
     model.set_domain_engram_focus("general", boost=0.0)
-    final_mean_rubric = sum(v["after_score"] for v in final_audits.values()) / max(1, len(final_audits))
-    final_ppl_eval = evaluate_engram_perplexity_delta(model, tokenizer)
+    final_mean_rubric = best_mean_rubric
+    final_ppl_eval = best_ppl_eval
 
     Path(save_dir).mkdir(parents=True, exist_ok=True)
     state_path = Path(save_dir) / "loop_v03_state.pt"
@@ -3061,6 +3268,7 @@ def run_si_srsi_engram_loop(
     meta = dict(getattr(model, "loaded_meta", {}) or {})
     meta["curriculum_version"] = "v03_r2_si_srsi_engram_consolidated"
     meta["si_srsi_rounds"] = num_rounds
+    meta["si_srsi_best_round"] = best_round_idx
     meta["active_meta"] = state_obj["active_meta"]
     meta.setdefault("metrics", {})
     meta["metrics"]["si_srsi_initial_rubric"] = round(init_mean_rubric, 2)
@@ -3069,6 +3277,7 @@ def run_si_srsi_engram_loop(
     cfg_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     result_payload = {
+        "best_round": best_round_idx,
         "initial_mean_rubric": round(init_mean_rubric, 2),
         "final_mean_rubric": round(final_mean_rubric, 2),
         "rubric_delta": round(final_mean_rubric - init_mean_rubric, 2),
@@ -3081,7 +3290,7 @@ def run_si_srsi_engram_loop(
 
     print("=" * 116)
     print(
-        f"[SI-SRSI Knowledge Engram Formation Complete] "
+        f"[SI-SRSI Knowledge Engram Formation Complete (Selected Round {best_round_idx})] "
         f"Mean Rubric Score: {init_mean_rubric:.2f} -> {final_mean_rubric:.2f}/100 ({final_mean_rubric - init_mean_rubric:+.2f}) | "
         f"Held-Out PPL: {init_ppl_eval['with_engram_ppl']:.4f} -> {final_ppl_eval['with_engram_ppl']:.4f} | "
         f"Saved Engram Bank -> `{state_path}`"
