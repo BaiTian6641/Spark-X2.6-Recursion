@@ -151,6 +151,93 @@ def check_math_equivalence(pred: str, gold: str) -> bool:
 
 
 @torch.no_grad()
+def free_vram_and_prune_checkpoints(
+    model: Optional[Any] = None,
+    keep_latest_n: int = 1,
+    prune_intermediate_stage_dirs: bool = True,
+) -> Dict[str, Any]:
+    """Free GPU VRAM, clear lingering parameter gradients, and prune redundant intermediate checkpoints on disk."""
+    import gc
+    import shutil
+
+    if model is not None:
+        try:
+            model.zero_grad(set_to_none=True)
+        except Exception:
+            pass
+        for p in model.parameters():
+            if getattr(p, "grad", None) is not None:
+                p.grad = None
+
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+    removed_paths: List[str] = []
+    freed_bytes = 0
+
+    def _dir_size(p: Path) -> int:
+        total = 0
+        try:
+            for f in p.rglob("*"):
+                if f.is_file():
+                    total += f.stat().st_size
+        except Exception:
+            pass
+        return total
+
+    ckpt_root = Path("/content/checkpoints_v03_r2_3phase")
+    if ckpt_root.exists():
+        step_dirs = sorted(
+            [d for d in ckpt_root.glob("step_*") if d.is_dir()],
+            key=lambda d: int(d.name.split("_")[1]) if len(d.name.split("_")) > 1 and d.name.split("_")[1].isdigit() else -1,
+        )
+        to_delete = step_dirs[:-keep_latest_n] if keep_latest_n > 0 else step_dirs
+        for d in to_delete:
+            sz = _dir_size(d)
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+                freed_bytes += sz
+                removed_paths.append(str(d))
+            except Exception:
+                pass
+
+    if prune_intermediate_stage_dirs:
+        stage_a_dir = Path("/content/sparkx_v03_continued_hub/stageA_phase4")
+        final_cont_state = Path("/content/sparkx_v03_continued_hub/loop_v03_state.pt")
+        if stage_a_dir.exists() and final_cont_state.exists():
+            sz = _dir_size(stage_a_dir)
+            shutil.rmtree(stage_a_dir, ignore_errors=True)
+            freed_bytes += sz
+            removed_paths.append(str(stage_a_dir))
+
+    vram_alloc_gb = torch.cuda.memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else 0.0
+    vram_res_gb = torch.cuda.memory_reserved() / (1024 ** 3) if torch.cuda.is_available() else 0.0
+    disk_free_gb = shutil.disk_usage("/content").free / (1024 ** 3) if Path("/content").exists() else 0.0
+    freed_gb = freed_bytes / (1024 ** 3)
+
+    print(
+        f"[VRAM & Checkpoint GC] GPU Allocated={vram_alloc_gb:.2f}GB (Reserved={vram_res_gb:.2f}GB) | "
+        f"Pruned {len(removed_paths)} old checkpoint dir(s) ({freed_gb:.2f}GB freed) | Disk Free={disk_free_gb:.1f}GB"
+    )
+    return {
+        "vram_allocated_gb": round(vram_alloc_gb, 2),
+        "vram_reserved_gb": round(vram_res_gb, 2),
+        "freed_disk_gb": round(freed_gb, 2),
+        "disk_free_gb": round(disk_free_gb, 2),
+        "removed_paths": removed_paths,
+    }
+
+
+@torch.no_grad()
 def generate_chat_response(
     model: Any,
     tokenizer: Any,
@@ -163,7 +250,9 @@ def generate_chat_response(
     temperature: float = 0.1,
     top_p: float = 0.90,
     repetition_penalty: float = 1.03,
+    think_budget_tokens: Optional[int] = None,
     stream_print: bool = False,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """Run a single chat turn through `model.generate_cached` and return structured timing/token metadata."""
     device = next(model.base.parameters()).device
@@ -184,7 +273,9 @@ def generate_chat_response(
         repetition_penalty=repetition_penalty,
         eos_token_id=tokenizer.eos_token_id,
         tokenizer=tokenizer,
+        think_budget_tokens=think_budget_tokens,
         stream_print=stream_print,
+        **kwargs,
     )
     dt = max(1e-3, time.time() - t0)
     gen_ids = out_ids[0, input_ids.shape[1] :]
@@ -3005,6 +3096,9 @@ def run_si_srsi_engram_loop(
             print(f"  [Hub Upload] Uploaded `loop_v03_state.pt`, `loop_config_v03.json` & `si_srsi_engram_report.json` to `{hub_repo_id}`!")
         except Exception as e:
             print(f"  [Hub Upload Warning] Could not upload to `{hub_repo_id}`: {e}")
+    del optimizer, best_bank_snap, best_ctrl_sd, encoded_domain_items, encoded_general_items
+    gc_stats = free_vram_and_prune_checkpoints(model=model, keep_latest_n=1, prune_intermediate_stage_dirs=True)
+    result_payload["gc_stats"] = gc_stats
     print("=" * 116)
     return result_payload
 
@@ -3036,6 +3130,7 @@ def run_continue_from_hub_engram_expansion(
     print("=" * 116)
     print(f"[CONTINUE FROM HUB PIPELINE] Starting from `{hub_repo_id}` -> Stage A (Phase-4) + Stage B (SI-SRSI) + Stage C (Flight Modes)")
     print("=" * 116)
+    free_vram_and_prune_checkpoints(model=model, keep_latest_n=1, prune_intermediate_stage_dirs=False)
 
     phase4_res = None
     if num_phase4_steps > 0:
@@ -3054,6 +3149,7 @@ def run_continue_from_hub_engram_expansion(
             hub_repo_id=hub_repo_id,
             token=token,
         )
+        free_vram_and_prune_checkpoints(model=model, keep_latest_n=1, prune_intermediate_stage_dirs=False)
 
     si_srsi_res = None
     if num_si_srsi_rounds > 0:
@@ -3077,6 +3173,7 @@ def run_continue_from_hub_engram_expansion(
 
     flight_res = evaluate_dynamic_engram_flight_modes(model, tokenizer)
     active_flight = model.set_engram_flight_mode(default_flight_mode)
+    gc_stats = free_vram_and_prune_checkpoints(model=model, keep_latest_n=1, prune_intermediate_stage_dirs=True)
     print(f"[Continued Hub Checkpoint Ready] Active Engram Flight Mode: {active_flight}")
 
     return {
@@ -3084,6 +3181,7 @@ def run_continue_from_hub_engram_expansion(
         "si_srsi_report": si_srsi_res,
         "flight_ablation": flight_res,
         "active_flight_mode": active_flight,
+        "gc_stats": gc_stats,
         "save_dir": save_dir,
     }
 
