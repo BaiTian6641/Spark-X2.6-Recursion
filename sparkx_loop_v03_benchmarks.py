@@ -1529,15 +1529,15 @@ def run_phase4_engram_consolidation(
 
     # 1. Hot-bind latest methods on model, 24 TwoStreamMHC controllers, and 8 ZipfianTieredMoEEngram anchors
     for _k, _v in SparkXLoopV03.__dict__.items():
-        if callable(_v) or isinstance(_v, property):
+        if not _k.startswith("__") and (callable(_v) or isinstance(_v, property)):
             setattr(type(model), _k, _v)
-    for ctrl in model.controllers:
+    for ctrl in model.controllers.values():
         for _k, _v in TwoStreamMHC.__dict__.items():
-            if callable(_v) or isinstance(_v, property):
+            if not _k.startswith("__") and (callable(_v) or isinstance(_v, property)):
                 setattr(type(ctrl), _k, _v)
     for mod in model.all_engram_modules():
         for _k, _v in ZipfianTieredMoEEngram.__dict__.items():
-            if callable(_v) or isinstance(_v, property):
+            if not _k.startswith("__") and (callable(_v) or isinstance(_v, property)):
                 setattr(type(mod), _k, _v)
         if not hasattr(mod, "pass_gain_logits") or mod.pass_gain_logits is None:
             mod.register_parameter(
@@ -1673,8 +1673,10 @@ def run_phase4_engram_consolidation(
                 best_engram_sd = copy.deepcopy(model.engram.state_dict())
                 best_backbone_engrams_sd = copy.deepcopy(model.backbone_engrams.state_dict())
             p_scales = torch.sigmoid(model.engram.pass_gain_logits.detach().float()[:3]).tolist()
-            p2_mhc_gain = sum(float(torch.tanh(c.extra_gain.detach()).abs().item()) for c in model.controllers) / len(model.controllers)
-            p3_mhc_gain = sum(float(torch.tanh(c.p3_extra_gain.detach()).abs().item()) for c in model.controllers[8:20]) / 12.0
+            ctrl_vals = list(model.controllers.values())
+            p2_mhc_gain = sum(float(torch.tanh(c.extra_gain.detach()).abs().item()) for c in ctrl_vals) / max(1, len(ctrl_vals))
+            p3_slice = ctrl_vals[8:20] or ctrl_vals
+            p3_mhc_gain = sum(float(torch.tanh(c.p3_extra_gain.detach()).abs().item()) for c in p3_slice) / max(1, len(p3_slice))
             z_val = float(z_loss.item()) if hasattr(z_loss, "item") else float(z_loss)
             elapsed = time.time() - t_start
             print(
@@ -2678,13 +2680,21 @@ def run_si_srsi_engram_loop(
     tokenizer: Any,
     num_rounds: int = 2,
     steps_per_round: int = 32,
+    consolidation_steps_per_prompt: Optional[int] = None,
     lr_engram: float = 1.5e-4,
     lr_gates: float = 4.0e-4,
     lr_mhc: float = 2.5e-5,
     ftpo_slop_weight: float = 0.08,
+    unlikelihood_alpha: Optional[float] = None,
     train_mhc: bool = True,
+    opencode_api_url: Optional[str] = None,
     opencode_api_key: Optional[str] = None,
+    opencode_model: str = "opencode/claude-sonnet-4-5",
     save_dir: str = "/content/sparkx_v03_si_srsi_engram",
+    push_to_hub: bool = False,
+    hub_repo_id: str = "TassP0lar/Spark-X2.6-4B-En4B-A1B",
+    token: Optional[str] = None,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """Execute Supervised Instructed Self-Recursive Self-Improvement (`SI-SRSI`) with Dynamic MoE-Engram Knowledge Formation:
       1. Evaluates initial student rollouts across `anti_slop`, `web_ux_sec`, and `stem_reason`.
@@ -2695,17 +2705,22 @@ def run_si_srsi_engram_loop(
            while keeping the 36L Base Backbone 100% frozen.
          - Snapshots and verifies monotonic improvement across both Domain Rubric Scores and Held-Out Perplexity.
     """
+    if consolidation_steps_per_prompt is not None:
+        steps_per_round = max(24, int(consolidation_steps_per_prompt) * 6)
+    if unlikelihood_alpha is not None:
+        ftpo_slop_weight = float(unlikelihood_alpha)
+
     from sparkx_loop_v03_core import SparkXLoopV03, TwoStreamMHC, ZipfianTieredMoEEngram, loop_v03_state_dict
     for _k, _v in SparkXLoopV03.__dict__.items():
-        if callable(_v) or isinstance(_v, property):
+        if not _k.startswith("__") and (callable(_v) or isinstance(_v, property)):
             setattr(type(model), _k, _v)
-    for ctrl in model.controllers:
+    for ctrl in model.controllers.values():
         for _k, _v in TwoStreamMHC.__dict__.items():
-            if callable(_v) or isinstance(_v, property):
+            if not _k.startswith("__") and (callable(_v) or isinstance(_v, property)):
                 setattr(type(ctrl), _k, _v)
     for mod in model.all_engram_modules():
         for _k, _v in ZipfianTieredMoEEngram.__dict__.items():
-            if callable(_v) or isinstance(_v, property):
+            if not _k.startswith("__") and (callable(_v) or isinstance(_v, property)):
                 setattr(type(mod), _k, _v)
 
     device = next(model.base.parameters()).device
@@ -2730,7 +2745,7 @@ def run_si_srsi_engram_loop(
         )
         aud = _audit_task_rollout(t_item, gen["raw_text"])
         sup = query_opencode_teacher_supervision(
-            t_item, gen["raw_text"], aud, opencode_api_key=opencode_api_key
+            t_item, gen["raw_text"], aud, opencode_api_key=opencode_api_key, teacher_model=opencode_model
         )
         initial_audits[t_item["id"]] = {
             "domain": t_item["domain"],
@@ -2862,12 +2877,13 @@ def run_si_srsi_engram_loop(
                 optimizer.param_groups[2]["lr"] = lr_mhc * lr_mult
 
             optimizer.zero_grad(set_to_none=True)
-            out = model(input_ids=input_ids, labels=labels)
+            need_logits = bool(batch["bad_tok_ids"] and ftpo_slop_weight > 0.0)
+            out = model(input_ids=input_ids, labels=labels, return_logits=need_logits)
             loss = out["loss"]
 
             # FTPO Token-Level Anti-Slop / Defect Unlikelihood Penalty on banned slop tokens
             ftpo_val = 0.0
-            if batch["bad_tok_ids"] and ftpo_slop_weight > 0.0 and "logits" in out and out["logits"] is not None:
+            if need_logits and "logits" in out and out["logits"] is not None:
                 logits = out["logits"]
                 probs = torch.softmax(logits[:, -min(64, logits.size(1)):, :].float(), dim=-1)
                 bad_probs = probs[..., batch["bad_tok_ids"]].clamp(max=0.99)
