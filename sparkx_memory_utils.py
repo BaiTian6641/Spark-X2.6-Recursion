@@ -1720,3 +1720,467 @@ class SleepScheduler:
                 self.esm_modules[int(l_idx)].remove(d_ref)
         self.ledger.mark_removed(memory_id)
 
+
+# ==============================================================================
+# Phase 2: D-LSA Ward Bucketization, ColdKVStore Paging & Index Calibration (`G2`)
+# ==============================================================================
+
+def ward_bucketize(
+    k_pool: Any,
+    max_bucket: int = 16,
+    target_buckets: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Bottom-up mutual-nearest-neighbor Ward clustering (`d(a,b) = (s_a s_b)/(s_a + s_b) ||c_a - c_b||_2^2`)
+    for pooled key vectors `k_pool` (`[N, d_idx]`, `01 §C1` & `02 Phase 2`).
+
+    Supports both `torch.Tensor` and pure-Python 2D lists for deterministic unit testing.
+    Returns `{"centroids": ..., "bucket_members": List[List[int]], "bucket_sizes": List[int]}`.
+    """
+    if HAS_TORCH and isinstance(k_pool, torch.Tensor):
+        pts = k_pool.detach().cpu().float().tolist()
+        is_tensor = True
+        dev = k_pool.device
+    else:
+        pts = [list(row) for row in k_pool]
+        is_tensor = False
+        dev = None
+
+    n_pts = len(pts)
+    if n_pts == 0:
+        return {"centroids": k_pool if is_tensor else [], "bucket_members": [], "bucket_sizes": []}
+    d_dim = len(pts[0])
+    n_target = int(target_buckets) if target_buckets is not None else max(1, (n_pts + max_bucket - 1) // max(1, int(max_bucket)))
+
+    clusters: List[Dict[str, Any]] = [
+        {"centroid": list(pts[i]), "members": [i], "size": 1}
+        for i in range(n_pts)
+    ]
+
+    def _ward_dist(ca: Dict[str, Any], cb: Dict[str, Any]) -> float:
+        sa, sb = float(ca["size"]), float(cb["size"])
+        if sa + sb > int(max_bucket):
+            return 1e18
+        sq = sum((ca["centroid"][d] - cb["centroid"][d]) ** 2 for d in range(d_dim))
+        return (sa * sb / (sa + sb)) * sq
+
+    while len(clusters) > n_target:
+        m = len(clusters)
+        best_nn: List[int] = [-1] * m
+        best_dist: List[float] = [1e18] * m
+        for i in range(m):
+            for j in range(m):
+                if i == j:
+                    continue
+                wd = _ward_dist(clusters[i], clusters[j])
+                if wd < best_dist[i]:
+                    best_dist[i] = wd
+                    best_nn[i] = j
+
+        # Find mutual nearest neighbors (or globally closest pair if no MNN < 1e17)
+        merged_any = False
+        used = [False] * m
+        next_clusters: List[Dict[str, Any]] = []
+        pairs: List[Tuple[float, int, int]] = []
+        for i in range(m):
+            j = best_nn[i]
+            if j > i and best_nn[j] == i and best_dist[i] < 1e17:
+                pairs.append((best_dist[i], i, j))
+        if not pairs:
+            # Fallback to single closest valid pair
+            best_pair = None
+            for i in range(m):
+                if best_nn[i] >= 0 and best_dist[i] < 1e17:
+                    cand = (best_dist[i], min(i, best_nn[i]), max(i, best_nn[i]))
+                    if best_pair is None or cand[0] < best_pair[0]:
+                        best_pair = cand
+            if best_pair is not None:
+                pairs.append(best_pair)
+
+        pairs.sort(key=lambda x: x[0])
+        for _, i, j in pairs:
+            if len(clusters) - sum(1 for u in used if u) // 2 <= n_target and merged_any:
+                break
+            if used[i] or used[j]:
+                continue
+            ca, cb = clusters[i], clusters[j]
+            sa, sb = float(ca["size"]), float(cb["size"])
+            if sa + sb > int(max_bucket):
+                continue
+            used[i] = True
+            used[j] = True
+            merged_any = True
+            new_c = [(sa * ca["centroid"][d] + sb * cb["centroid"][d]) / (sa + sb) for d in range(d_dim)]
+            nrm = math.sqrt(sum(v * v for v in new_c)) + 1e-8
+            new_c = [v / nrm for v in new_c]
+            next_clusters.append(
+                {
+                    "centroid": new_c,
+                    "members": ca["members"] + cb["members"],
+                    "size": int(sa + sb),
+                }
+            )
+        for idx_c in range(m):
+            if not used[idx_c]:
+                next_clusters.append(clusters[idx_c])
+        clusters = next_clusters
+        if not merged_any:
+            break
+
+    centroids_list = [c["centroid"] for c in clusters]
+    members_list = [c["members"] for c in clusters]
+    sizes_list = [int(c["size"]) for c in clusters]
+    if is_tensor and HAS_TORCH:
+        c_tensor = torch.tensor(centroids_list, dtype=torch.float32, device=dev)
+        c_tensor = torch.nn.functional.normalize(c_tensor, p=2, dim=-1, eps=1e-6)
+        return {
+            "centroids": c_tensor,
+            "bucket_members": members_list,
+            "bucket_sizes": sizes_list,
+        }
+    return {
+        "centroids": centroids_list,
+        "bucket_members": members_list,
+        "bucket_sizes": sizes_list,
+    }
+
+
+class ColdKVStore:
+    """Host-DRAM Pinned Cold KV Paging Store with GPU-Resident Ward Bucket Centroids (`01 §C1` & `02 Phase 2`).
+
+    Stores evicted long-range KV pages in host DRAM (`pin_memory=True` when CUDA is available) while keeping
+    compact 64-D Ward bucket centroids resident for fast sublinear top-bucket selection and on-demand page fetch.
+    """
+
+    def __init__(self, page_size: int = 4096, d_idx: int = 64, max_bucket: int = 16):
+        self.page_size = max(16, int(page_size))
+        self.d_idx = int(d_idx)
+        self.max_bucket = max(2, int(max_bucket))
+        self.pages: List[Dict[str, Any]] = []
+        self.total_host_to_gpu_bytes: int = 0
+
+    def append_page(self, k_page: Any, v_page: Any, k_idx_vectors: Any) -> int:
+        """Bucketize `k_idx_vectors` (`[T_page, d_idx]`) via Ward clustering and offload `(k_page, v_page)` to host memory."""
+        wb = ward_bucketize(k_idx_vectors, max_bucket=self.max_bucket)
+        page_id = len(self.pages)
+        if HAS_TORCH and isinstance(k_page, torch.Tensor):
+            pin = torch.cuda.is_available()
+            k_cpu = k_page.detach().to(device="cpu", copy=True)
+            v_cpu = v_page.detach().to(device="cpu", copy=True)
+            if pin:
+                k_cpu = k_cpu.pin_memory()
+                v_cpu = v_cpu.pin_memory()
+            self.pages.append(
+                {
+                    "page_id": page_id,
+                    "k_cpu": k_cpu,
+                    "v_cpu": v_cpu,
+                    "centroids": wb["centroids"],
+                    "bucket_members": wb["bucket_members"],
+                    "bucket_sizes": wb["bucket_sizes"],
+                }
+            )
+        else:
+            self.pages.append(
+                {
+                    "page_id": page_id,
+                    "k_cpu": [list(r) for r in k_page],
+                    "v_cpu": [list(r) for r in v_page],
+                    "centroids": wb["centroids"],
+                    "bucket_members": wb["bucket_members"],
+                    "bucket_sizes": wb["bucket_sizes"],
+                }
+            )
+        return page_id
+
+    def fetch_selected_kv(self, q_idx_vec: Any, top_buckets: int = 4) -> Dict[str, Any]:
+        """Select the highest-affinity Ward buckets across all cold pages and fetch only their KV rows."""
+        if not self.pages:
+            return {"k_selected": [], "v_selected": [], "selected_tokens": 0, "bytes_transferred": 0}
+
+        if HAS_TORCH and isinstance(q_idx_vec, torch.Tensor):
+            q_u = torch.nn.functional.normalize(q_idx_vec.detach().float().reshape(-1, self.d_idx), p=2, dim=-1, eps=1e-6)
+            scored_buckets: List[Tuple[float, int, int]] = []
+            for p_idx, pg in enumerate(self.pages):
+                c_t = pg["centroids"].to(device=q_u.device, dtype=torch.float32)
+                sims = torch.matmul(q_u, c_t.t()).max(dim=0).values
+                for b_idx in range(int(sims.numel())):
+                    scored_buckets.append((float(sims[b_idx].item()), p_idx, b_idx))
+            scored_buckets.sort(key=lambda x: x[0], reverse=True)
+            chosen = scored_buckets[: max(1, int(top_buckets))]
+
+            k_chunks, v_chunks = [], []
+            bytes_copied = 0
+            n_tok = 0
+            dev = q_idx_vec.device
+            for _, p_idx, b_idx in chosen:
+                pg = self.pages[p_idx]
+                mem_idx = torch.tensor(pg["bucket_members"][b_idx], dtype=torch.long)
+                k_sel = pg["k_cpu"].index_select(dim=-2, index=mem_idx).to(dev, non_blocking=True)
+                v_sel = pg["v_cpu"].index_select(dim=-2, index=mem_idx).to(dev, non_blocking=True)
+                bytes_copied += int(k_sel.numel() * k_sel.element_size() + v_sel.numel() * v_sel.element_size())
+                n_tok += int(mem_idx.numel())
+                k_chunks.append(k_sel)
+                v_chunks.append(v_sel)
+            self.total_host_to_gpu_bytes += bytes_copied
+            return {
+                "k_selected": torch.cat(k_chunks, dim=-2) if k_chunks else None,
+                "v_selected": torch.cat(v_chunks, dim=-2) if v_chunks else None,
+                "selected_tokens": n_tok,
+                "bytes_transferred": bytes_copied,
+            }
+
+        # Pure-Python path
+        q_row = q_idx_vec[0] if (q_idx_vec and isinstance(q_idx_vec[0], list)) else list(q_idx_vec)
+        q_nrm = math.sqrt(sum(v * v for v in q_row)) + 1e-8
+        q_u = [v / q_nrm for v in q_row]
+        scored: List[Tuple[float, int, int]] = []
+        for p_idx, pg in enumerate(self.pages):
+            for b_idx, c_row in enumerate(pg["centroids"]):
+                sim = sum(q_u[d] * c_row[d] for d in range(self.d_idx))
+                scored.append((sim, p_idx, b_idx))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        chosen = scored[: max(1, int(top_buckets))]
+        k_sel_rows, v_sel_rows = [], []
+        for _, p_idx, b_idx in chosen:
+            pg = self.pages[p_idx]
+            for m_i in pg["bucket_members"][b_idx]:
+                k_sel_rows.append(list(pg["k_cpu"][m_i]))
+                v_sel_rows.append(list(pg["v_cpu"][m_i]))
+        bytes_copied = len(k_sel_rows) * len(k_sel_rows[0]) * 4 * 2 if k_sel_rows else 0
+        self.total_host_to_gpu_bytes += bytes_copied
+        return {
+            "k_selected": k_sel_rows,
+            "v_selected": v_sel_rows,
+            "selected_tokens": len(k_sel_rows),
+            "bytes_transferred": bytes_copied,
+        }
+
+
+def evaluate_dlsa_attention_mass_recall(
+    model: Any,
+    input_ids: Any,
+    layers: Sequence[int] = (3, 7, 11, 15, 19, 23, 27, 31, 35),
+    k_budget: int = 128,
+) -> Dict[str, Any]:
+    """Phase 2 (`Gate G2`): Measure exact attention-mass recall@K of the RoPE-free `[64:256]` D-LSA indexer
+    across the 9 global full-attention layers on the 72L Loop Base.
+    """
+    if not HAS_TORCH:
+        raise RuntimeError("evaluate_dlsa_attention_mass_recall requires PyTorch.")
+    io_map = capture_attention_io(model, input_ids, layers=layers, visit=0)
+    layer_list = model._layers() if hasattr(model, "_layers") else model.base.model.layers
+    per_layer_recall: Dict[str, float] = {}
+
+    for l_idx, io in io_map.items():
+        if "query" not in io or "key" not in io:
+            continue
+        lsa_idx = getattr(layer_list[l_idx].self_attn, "lsa_indexer", None)
+        if lsa_idx is None:
+            continue
+        q_t = io["query"]  # [B, H_q, T, D]
+        k_t = io["key"]    # [B, H_kv, T, D]
+        seq_t = int(q_t.shape[2])
+        eff_k = min(seq_t, max(8, int(k_budget)))
+        sel_idx = lsa_idx.select_key_indices(q_t, k_t, k_budget=eff_k)
+
+        # Compute exact teacher attention mass on the last query token(s)
+        q_tail = q_t[:, :, -min(16, seq_t) :, :].float()
+        k_full = k_t.float()
+        if k_full.shape[1] != q_tail.shape[1]:
+            rep = q_tail.shape[1] // k_full.shape[1]
+            k_full = k_full.repeat_interleave(rep, dim=1)
+        scale = 1.0 / math.sqrt(float(q_tail.shape[-1]))
+        logits = torch.matmul(q_tail, k_full.transpose(-1, -2)) * scale
+        q_positions = torch.arange(seq_t - q_tail.shape[2], seq_t, device=q_t.device).view(1, 1, -1, 1)
+        k_positions = torch.arange(0, seq_t, device=q_t.device).view(1, 1, 1, -1)
+        logits = logits.masked_fill(k_positions > q_positions, float("-inf"))
+        probs = torch.softmax(logits, dim=-1)  # [B, H_q, T_tail, T]
+        captured_mass = probs.index_select(dim=-1, index=sel_idx.to(probs.device)).sum(dim=-1).mean().item()
+        per_layer_recall[f"L{l_idx}"] = round(float(captured_mass), 5)
+
+    mean_rec = sum(per_layer_recall.values()) / max(1, len(per_layer_recall))
+    return {
+        "k_budget": int(k_budget),
+        "mean_attention_mass_recall": round(mean_rec, 5),
+        "per_layer_recall": per_layer_recall,
+        "g2_passed": bool(mean_rec >= 0.90),
+    }
+
+
+def fit_dlsa_index(
+    model: Any,
+    token_batches: Sequence[Any],
+    layers: Sequence[int] = (3, 7, 11, 15, 19, 23, 27, 31, 35),
+    steps: int = 20,
+    lr: float = 1e-3,
+    k_budget: int = 128,
+) -> Dict[str, Any]:
+    """Phase 2 (`02 Phase 2.3`): Calibrate/train ONLY `lsa_indexer` (`w_q_idx`, `w_k_idx`) on the 192-D
+    RoPE-free slice (`[64:256]`) using exact teacher attention mass KL distillation while keeping
+    the 72L Loop Base (`model.base` + `TwoStreamMHC` + `MoE-Engram`) 100% frozen.
+    """
+    if not HAS_TORCH:
+        raise RuntimeError("fit_dlsa_index requires PyTorch.")
+    fp_before = BackboneFingerprint(model, include_controllers=True, store_exact_clone=False)
+    layer_list = model._layers() if hasattr(model, "_layers") else model.base.model.layers
+
+    # Collect Q/K teacher states once (gradient-free through backbone)
+    sample_ids = token_batches[0]
+    pre_recall = evaluate_dlsa_attention_mass_recall(model, sample_ids, layers=layers, k_budget=k_budget)
+    io_map = capture_attention_io(model, sample_ids, layers=layers, visit=0)
+
+    for l_idx, io in io_map.items():
+        lsa_idx = getattr(layer_list[l_idx].self_attn, "lsa_indexer", None)
+        if lsa_idx is None or "query" not in io or "key" not in io:
+            continue
+        q_t = io["query"].detach().float()
+        k_t = io["key"].detach().float()
+        # First initialize with training-free PCA on the RoPE-free slice
+        k_samp = k_t[0].permute(1, 0, 2).contiguous()
+        lsa_idx.fit_training_free_pca(k_samp)
+
+        # Optional lightweight KL alignment on w_q_idx / w_k_idx
+        if int(steps) > 0:
+            lsa_idx.w_q_idx.weight.requires_grad_(True)
+            lsa_idx.w_k_idx.weight.requires_grad_(True)
+            opt = torch.optim.AdamW([lsa_idx.w_q_idx.weight, lsa_idx.w_k_idx.weight], lr=float(lr))
+            seq_t = int(q_t.shape[2])
+            q_tail = q_t[:, :, -min(16, seq_t) :, :]
+            k_full = k_t
+            if k_full.shape[1] != q_tail.shape[1]:
+                rep = q_tail.shape[1] // k_full.shape[1]
+                k_full = k_full.repeat_interleave(rep, dim=1)
+            scale = 1.0 / math.sqrt(float(q_tail.shape[-1]))
+            with torch.no_grad():
+                t_logits = torch.matmul(q_tail, k_full.transpose(-1, -2)) * scale
+                q_pos = torch.arange(seq_t - q_tail.shape[2], seq_t, device=q_t.device).view(1, 1, -1, 1)
+                k_pos = torch.arange(0, seq_t, device=q_t.device).view(1, 1, 1, -1)
+                t_logits = t_logits.masked_fill(k_pos > q_pos, float("-inf"))
+                p_teacher = torch.softmax(t_logits, dim=-1).mean(dim=(0, 1, 2))  # [T]
+                q_free = lsa_idx._prepare_query_input(q_tail).mean(dim=(0, 1))  # [1, in_q]
+                k_free = lsa_idx._prepare_key_input(k_t)[0]  # [T, in_k]
+
+            for _ in range(int(steps)):
+                opt.zero_grad()
+                q_proj = torch.nn.functional.normalize(
+                    torch.nn.functional.linear(q_free, lsa_idx.w_q_idx.weight.float()), p=2, dim=-1, eps=1e-6
+                )
+                k_proj = torch.nn.functional.normalize(
+                    torch.nn.functional.linear(k_free, lsa_idx.w_k_idx.weight.float()), p=2, dim=-1, eps=1e-6
+                )
+                s_logits = torch.matmul(q_proj, k_proj.t()).squeeze(0) / 0.1
+                log_p_student = torch.log_softmax(s_logits, dim=-1)
+                loss = torch.nn.functional.kl_div(log_p_student, p_teacher.clamp(min=1e-8), reduction="sum")
+                loss.backward()
+                opt.step()
+            lsa_idx.w_q_idx.weight.requires_grad_(False)
+            lsa_idx.w_k_idx.weight.requires_grad_(False)
+
+    post_recall = evaluate_dlsa_attention_mass_recall(model, sample_ids, layers=layers, k_budget=k_budget)
+    fp_after = fp_before.verify(model)
+    return {
+        "pre_recall": pre_recall,
+        "post_recall": post_recall,
+        "backbone_sha256_match": bool(fp_after["sha256_match"]),
+    }
+
+
+# ==============================================================================
+# Phase 6: Deep-Sleep Sparse-Memory Finetuning (`SMF`) Consolidation (`G6`)
+# ==============================================================================
+
+@dataclasses.dataclass
+class SMFConsolidationReport:
+    anchors_consolidated: int
+    shards_consolidated: int
+    mean_rel_fit_error: float
+    max_null_space_leakage: float
+    shards_removed: bool
+    backbone_sha256_match: bool
+
+
+def consolidate_shards_smf(
+    model: Any,
+    shard_ids: Sequence[int] = (0,),
+    alpha_ridge: float = 1e-2,
+    remove_consolidated_shards: bool = True,
+) -> SMFConsolidationReport:
+    """Phase 6 (`01 §C7` & `02 Phase 6`): Deep-Sleep Sparse-Memory Finetuning (`SMF`) consolidation
+    from saturated `EpisodicSideMemory` (`ESM`) shards into `ZipfianTieredMoEEngram` routed experts,
+    followed by shard removal to reclaim fast-write `ESM` null-space capacity.
+    """
+    if not HAS_TORCH:
+        raise RuntimeError("consolidate_shards_smf requires PyTorch.")
+    fp_before = BackboneFingerprint(model, include_controllers=True, store_exact_clone=False)
+    dev = model._head_weight().device
+
+    anchors_done = 0
+    shards_done = 0
+    fit_errs: List[float] = []
+    max_leak = 0.0
+
+    for l_eng, eng_mod in model.iter_engram_anchors():
+        esm_key = str(l_eng)
+        if not hasattr(model, "esm") or esm_key not in model.esm:
+            continue
+        esm_mod: EpisodicSideMemory = model.esm[esm_key]
+        syn_clusters: List[Dict[str, Any]] = []
+
+        for s_id in shard_ids:
+            if int(s_id) not in esm_mod._shards:
+                continue
+            sh = esm_mod._shards[int(s_id)]
+            if int(sh.get("num_writes", 0)) <= 0:
+                continue
+            # Extract synthetic representative hidden states from the shard's written key subspace
+            u_past = sh.get("u_past")
+            w_down = sh["w_down"].to(device=dev, dtype=torch.float32)  # [r, width]
+            u_up = sh["u_up"].to(device=dev, dtype=torch.float32)      # [r, width]
+            if u_past is not None and u_past.numel() > 0:
+                k_cols = min(4, int(u_past.shape[1]))
+                for c_i in range(k_cols):
+                    phi_dir = u_past[:, c_i : c_i + 1].to(device=dev, dtype=torch.float32).t()  # [1, r]
+                    h_rep = torch.matmul(phi_dir, u_up).squeeze(0)  # [width]
+                    y_rep = torch.matmul(phi_dir, w_down).squeeze(0)  # [width]
+                    syn_clusters.append(
+                        {
+                            "salience": 1.0,
+                            "token_positions": [0],
+                            "trigger_pos": 0,
+                            "query_hidden": h_rep,
+                            "cluster_hidden": h_rep,
+                            "value_residual": y_rep,
+                        }
+                    )
+            shards_done += 1
+            if remove_consolidated_shards:
+                sh["w_down"].zero_()
+                sh["num_writes"] = 0
+                sh["u_past"] = None
+                sh["centroids"] = torch.empty((0, esm_mod.route_dim), dtype=torch.float32, device=dev)
+
+        if syn_clusters:
+            dummy_ids = torch.zeros((1, 8), dtype=torch.long, device=dev)
+            res = eng_mod.compile_clusters_alphaedit(
+                clusters=syn_clusters,
+                input_ids=dummy_ids,
+                domain="general",
+                alpha_ridge=alpha_ridge,
+                target_scale=1.0,
+                inject_lexical=False,
+                key_mode="query",
+            )
+            anchors_done += 1
+            fit_errs.append(float(res["mean_rel_fit_error"]))
+            max_leak = max(max_leak, float(res["max_null_space_leakage"]))
+
+    fp_after = fp_before.verify(model)
+    return SMFConsolidationReport(
+        anchors_consolidated=anchors_done,
+        shards_consolidated=shards_done,
+        mean_rel_fit_error=sum(fit_errs) / max(1, len(fit_errs)),
+        max_null_space_leakage=float(max_leak),
+        shards_removed=bool(remove_consolidated_shards),
+        backbone_sha256_match=bool(fp_after["sha256_match"]),
+    )
+

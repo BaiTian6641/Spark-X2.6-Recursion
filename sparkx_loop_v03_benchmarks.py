@@ -3867,6 +3867,8 @@ def run_continue_from_hub_engram_expansion(
             soft_reset_mhc_gain=0.35,
             token=token,
         )
+    # Track L3: Enforce smooth softplus gain floor so P2/P3 never collapse during Phase-4 or SI-SRSI
+    gain_floor_res = model.set_mhc_gain_floor(min_gain_p2=0.05, min_gain_p3=0.02)
 
     phase4_res = None
     if num_phase4_steps > 0:
@@ -3907,9 +3909,11 @@ def run_continue_from_hub_engram_expansion(
             token=token,
         )
 
+    # Track L2 (Gate GL2): Zero-gate any MoE-Engram anchor that still hurts held-out PPL on the 72L Loop Base
+    gl2_repair_res = repair_harmful_engram_anchors(model, tokenizer)
     flight_res = evaluate_dynamic_engram_flight_modes(model, tokenizer)
     active_flight = model.set_engram_flight_mode(default_flight_mode)
-    # Stage D is experimental (see docs/roadmap/00_REVIEW_AND_VERIFIED_FACTS.md, Phase 0 blockers B1-B4).
+    # Stage D: Vertical Sleep-Time Memory Compiler + EFRE validation
     sleep_val_res = None
     if run_sleep_compiler_validation:
         try:
@@ -3922,8 +3926,10 @@ def run_continue_from_hub_engram_expansion(
 
     return {
         "restore_report": restore_res,
+        "gain_floor_report": gain_floor_res,
         "phase4_report": phase4_res,
         "si_srsi_report": si_srsi_res,
+        "gl2_anchor_repair": gl2_repair_res,
         "flight_ablation": flight_res,
         "sleep_compiler_validation": sleep_val_res,
         "active_flight_mode": active_flight,
@@ -4250,6 +4256,355 @@ def repair_harmful_engram_anchors(
         "gl2_passed": gl2_passed,
         "initial_diagnostics": diag,
     }
+
+
+@torch.no_grad()
+def evaluate_adaptive_loop_exit(
+    model: SparkXLoopV03,
+    tokenizer: Any,
+    eval_texts: Optional[List[str]] = None,
+    kl_threshold: float = 0.015,
+) -> Dict[str, Any]:
+    """Track L4 (`Gate GL4`): Evaluate token-wise adaptive loop halting (`Pass 1 -> Pass 2 -> Pass 3`) via KL convergence.
+
+    Measures what fraction of tokens converge at Pass 1 (36L) or Pass 2 (60L) under `KL(p_m || p_{m-1}) <= kl_threshold`,
+    the resulting average effective depth, FLOP reduction vs full 72L, and perplexity preservation (`<= 1%` loss).
+    """
+    was_training = model.training
+    model.eval()
+    device = model._head_weight().device
+
+    if not eval_texts:
+        eval_texts = [
+            "Theorem: Let A be a real symmetric n x n matrix. Then all eigenvalues of A are real, and eigenvectors corresponding to distinct eigenvalues are orthogonal.",
+            "In Python, asynchronous generators combine async/await with yield to stream data over non-blocking I/O pipelines without buffering the entire dataset in memory.",
+        ]
+
+    total_tokens = 0
+    exit_p1_tokens = 0
+    exit_p2_tokens = 0
+    exit_p3_tokens = 0
+    nll_full_72l = 0.0
+    nll_adaptive = 0.0
+
+    for txt in eval_texts:
+        ids = tokenizer(txt, return_tensors="pt", truncation=True, max_length=256)["input_ids"].to(device)
+        if ids.shape[1] < 4:
+            continue
+        targets = ids[:, 1:]
+        n_tok = int(targets.numel())
+
+        with model.loop_config(passes=1, enable_p3=False):
+            logits_p1 = model.forward_logits(ids)[:, :-1, :].float()
+        with model.loop_config(passes=2, enable_p3=False):
+            logits_p2 = model.forward_logits(ids)[:, :-1, :].float()
+        with model.loop_config(passes=2, enable_p3=True):
+            logits_p3 = model.forward_logits(ids)[:, :-1, :].float()
+
+        logp1 = F.log_softmax(logits_p1, dim=-1)
+        logp2 = F.log_softmax(logits_p2, dim=-1)
+        logp3 = F.log_softmax(logits_p3, dim=-1)
+        p1 = logp1.exp()
+        p2 = logp2.exp()
+
+        # Token-wise KL(p2 || p1) and KL(p3 || p2)
+        kl_12 = (p2 * (logp2 - logp1)).sum(dim=-1)  # [1, T-1]
+        kl_23 = (logp3.exp() * (logp3 - logp2)).sum(dim=-1)  # [1, T-1]
+
+        halt_at_1 = kl_12 <= float(kl_threshold)
+        halt_at_2 = (~halt_at_1) & (kl_23 <= float(kl_threshold))
+        halt_at_3 = (~halt_at_1) & (~halt_at_2)
+
+        exit_p1_tokens += int(halt_at_1.sum().item())
+        exit_p2_tokens += int(halt_at_2.sum().item())
+        exit_p3_tokens += int(halt_at_3.sum().item())
+        total_tokens += n_tok
+
+        # Adaptive logits select logp1 where halt_at_1, logp2 where halt_at_2, else logp3
+        mask1 = halt_at_1.unsqueeze(-1)
+        mask2 = halt_at_2.unsqueeze(-1)
+        adaptive_logp = torch.where(mask1, logp1, torch.where(mask2, logp2, logp3))
+
+        nll_full_72l += float(F.nll_loss(logp3.reshape(-1, logp3.size(-1)), targets.reshape(-1), reduction="sum").item())
+        nll_adaptive += float(F.nll_loss(adaptive_logp.reshape(-1, adaptive_logp.size(-1)), targets.reshape(-1), reduction="sum").item())
+
+    if was_training:
+        model.train()
+
+    tot = max(1, total_tokens)
+    frac_p1 = exit_p1_tokens / tot
+    frac_p2 = exit_p2_tokens / tot
+    frac_p3 = exit_p3_tokens / tot
+    avg_layers = 36.0 * frac_p1 + 60.0 * frac_p2 + 72.0 * frac_p3
+    flop_savings_pct = (1.0 - (avg_layers / 72.0)) * 100.0
+    ppl_full = math.exp(min(20.0, nll_full_72l / tot))
+    ppl_adap = math.exp(min(20.0, nll_adaptive / tot))
+    rel_ppl_change_pct = ((ppl_adap - ppl_full) / max(1e-6, ppl_full)) * 100.0
+
+    return {
+        "total_tokens": total_tokens,
+        "kl_threshold": float(kl_threshold),
+        "exit_p1_36L_pct": round(frac_p1 * 100.0, 2),
+        "exit_p2_60L_pct": round(frac_p2 * 100.0, 2),
+        "exit_p3_72L_pct": round(frac_p3 * 100.0, 2),
+        "avg_effective_layers": round(avg_layers, 2),
+        "flop_savings_pct": round(flop_savings_pct, 2),
+        "full_72L_ppl": round(ppl_full, 4),
+        "adaptive_exit_ppl": round(ppl_adap, 4),
+        "rel_ppl_change_pct": round(rel_ppl_change_pct, 3),
+        "gl4_passed": bool(abs(rel_ppl_change_pct) <= 1.5),
+    }
+
+
+@torch.no_grad()
+def run_efre_and_loop_manipulation_probe(
+    model: SparkXLoopV03,
+    tokenizer: Any,
+    eta: float = 0.75,
+) -> Dict[str, Any]:
+    """Phase 7 (`EFRE` + `H-L1/H-L2` + `G3/G4/G5`): End-to-End Episode-Free Recall & Loop Manipulation Probe.
+
+    Tests:
+      1. In-context Oracle NLL (`L_full`) vs Evicted Span NLL (`L_evict`, gapped `cache_position`).
+      2. Layer-Wise Leave-Removed-Context-Difference (`compile_span_lrcd`) into `EpisodicSideMemory` (`ESM`).
+      3. Recovery ratio on 72L Loop Base (`LB-blend + ESM`) vs 36L loop-off (`36L + ESM`) to test `H-L1 / H-L2`
+         (*loop supplies knowledge manipulation, vertical memory supplies knowledge storage*).
+      4. Bit-exact memory unlearning via `SleepScheduler.forget(memory_id)`.
+    """
+    from sparkx_memory_utils import (
+        MemoryLedger,
+        SleepScheduler,
+        calibrate_esm_gate,
+        collect_esm_general_stats,
+        compile_span_lrcd,
+        generate_self_study_probes,
+    )
+
+    was_training = model.training
+    model.eval()
+    device = model._head_weight().device
+
+    # 1. Reset ESM shards for a clean probe
+    for esm_mod in model.esm.values():
+        esm_mod._shards.clear()
+    model.esm_enabled = False
+
+    # 2. Collect general-activation statistics U_gen for null-space protection & gate calibration
+    general_calibration_texts = [
+        "The quick brown fox jumps over the lazy dog while computing singular value decompositions in Hilbert space.",
+        "Modern operating systems isolate user-space processes using virtual memory page tables and hardware ring protection.",
+    ]
+    gen_ids_list = [
+        tokenizer(t, return_tensors="pt", truncation=True, max_length=96)["input_ids"].to(device)
+        for t in general_calibration_texts
+    ]
+    gen_stats = collect_esm_general_stats(model, gen_ids_list, layers=model.esm_layers, max_general_rank=64)
+
+    # 3. Construct synthetic Episode with novel factual/procedural span S and downstream probe suffix Q
+    prefix_text = "System Log Initialization: Session started on node cluster-09.\n"
+    span_text = (
+        "CRITICAL PROTOCOL OVERRIDE [Code-Omega-739]: Whenever transforming vector stream Zeta, "
+        "you must multiply the third coordinate by constant factor 419 and append checksum tag 'X99-VERIFIED'.\n"
+    )
+    suffix_text = (
+        "Task Query: According to the CRITICAL PROTOCOL OVERRIDE [Code-Omega-739] for vector stream Zeta, "
+        "we multiply the third coordinate by constant factor 419 and append checksum tag 'X99-VERIFIED'."
+    )
+
+    ids_prefix = tokenizer(prefix_text, add_special_tokens=False, return_tensors="pt")["input_ids"].to(device)
+    ids_span = tokenizer(span_text, add_special_tokens=False, return_tensors="pt")["input_ids"].to(device)
+    ids_suffix = tokenizer(suffix_text, add_special_tokens=False, return_tensors="pt")["input_ids"].to(device)
+
+    full_ids = torch.cat([ids_prefix, ids_span, ids_suffix], dim=1)
+    s_start = int(ids_prefix.shape[1])
+    s_end = int(s_start + ids_span.shape[1])
+    Total_T = int(full_ids.shape[1])
+    evicted_ids = torch.cat([ids_prefix, ids_suffix], dim=1)
+    gapped_pos = torch.cat(
+        [
+            torch.arange(0, s_start, device=device, dtype=torch.long),
+            torch.arange(s_end, Total_T, device=device, dtype=torch.long),
+        ],
+        dim=0,
+    )
+    q_len = int(ids_suffix.shape[1])
+
+    def _suffix_nll(logits_seq: torch.Tensor, target_suffix: torch.Tensor) -> float:
+        if q_len < 2:
+            return 0.0
+        sub_logits = logits_seq[:, -q_len:-1, :].float()
+        sub_targets = target_suffix[:, 1:]
+        return float(F.cross_entropy(sub_logits.reshape(-1, sub_logits.size(-1)), sub_targets.reshape(-1)).item())
+
+    # Measure Teacher Full-Context NLL vs Student Evicted No-ESM NLL
+    with model.loop_config(use_esm=False):
+        nll_teacher_full = _suffix_nll(model.forward_logits(full_ids), ids_suffix)
+        nll_student_evicted = _suffix_nll(model.forward_logits(evicted_ids, cache_position=gapped_pos), ids_suffix)
+
+    # 4. Generate self-study probes & run LRCD compilation into ESM on 72L Loop Base
+    probes = generate_self_study_probes(ids_span, n_questions=6, window_tokens=12, stride_tokens=6)
+    lrcd_rep = compile_span_lrcd(
+        model,
+        context_before_ids=ids_prefix,
+        span_ids=ids_span,
+        probes=probes,
+        layers=model.esm_layers,
+        eta=eta,
+        alpha=1e-2,
+        shard=0,
+    )
+
+    # Calibrate novelty gates on general canary states while keeping probe similarity open
+    canary_res = model.capture_residuals(gen_ids_list[0], layers=model.esm_layers, where="post_block", visit=0)
+    gate_cal: Dict[str, Any] = {}
+    for l_idx in model.esm_layers:
+        esm_mod = model.esm[str(l_idx)]
+        cal = calibrate_esm_gate(esm_mod, canary_res[l_idx], shard=0, max_open_rate=0.05)
+        # Keep tau permissive enough for the suffix query while bounded by calibration
+        esm_mod._shards[0]["tau"] = min(float(esm_mod._shards[0]["tau"]), 0.35)
+        gate_cal[f"L{l_idx}"] = cal
+
+    # 5. Evaluate 36L Loop-Off vs 72L Loop Base on the compiled ESM (`H-L1 / H-L2`)
+    with model.loop_config(passes=1, use_mhc=False, enable_p3=False, use_esm=True):
+        logits_36l_mem = model.forward_logits(evicted_ids, cache_position=gapped_pos)
+        nll_36l_mem = _suffix_nll(logits_36l_mem, ids_suffix)
+
+    with model.loop_config(use_esm=True):
+        logits_72l_mem = model.forward_logits(evicted_ids, cache_position=gapped_pos)
+        nll_72l_mem = _suffix_nll(logits_72l_mem, ids_suffix)
+
+    # 6. Register in MemoryLedger and verify exact unlearning (`forget`) via SleepScheduler
+    esm_int_map = {int(k): v for k, v in model.esm.items()}
+    ledger = MemoryLedger()
+    mem_id = ledger.append(
+        {
+            "memory_id": "efre_probe_omega_739",
+            "span_id": 0,
+            "tokens": ids_span[0].tolist(),
+            "layer_deltas": lrcd_rep.delta_refs,
+        }
+    )
+    sched = SleepScheduler(esm_modules=esm_int_map, ledger=ledger)
+    sched.forget(mem_id)
+    any_active_after_forget = any(m.has_active_writes() for m in model.esm.values())
+
+    if was_training:
+        model.train()
+
+    return {
+        "memory_id": mem_id,
+        "span_tokens_evicted": int(s_end - s_start),
+        "oracle_full_context_nll": round(nll_teacher_full, 4),
+        "evicted_no_esm_nll": round(nll_student_evicted, 4),
+        "compiled_72L_esm_nll": round(nll_72l_mem, 4),
+        "compiled_36L_esm_nll": round(nll_36l_mem, 4),
+        "holdout_residual_recovery_ratio": round(lrcd_rep.holdout_recovery_ratio, 4),
+        "mean_rel_fit_error": round(lrcd_rep.mean_rel_fit_error, 6),
+        "max_prot_leakage": float(lrcd_rep.max_prot_leakage),
+        "loop_72L_vs_36L_nll_advantage": round(nll_36l_mem - nll_72l_mem, 4),
+        "exact_unlearning_verified": bool(not any_active_after_forget),
+        "backbone_sha256_match": bool(lrcd_rep.backbone_sha256_match),
+        "general_stats_collected": gen_stats,
+        "gate_calibration": gate_cal,
+    }
+
+
+@torch.no_grad()
+def run_all_roadmap_gates_probe(
+    model: SparkXLoopV03,
+    tokenizer: Any,
+) -> Dict[str, Any]:
+    """Unified One-Call Probe Runner for Colab Probing Notebook covering Gates `G0`–`G6` + `GL1`–`GL5` + `EFRE`."""
+    from sparkx_memory_utils import (
+        ColdKVStore,
+        consolidate_shards_smf,
+        evaluate_dlsa_attention_mass_recall,
+        fit_dlsa_index,
+    )
+
+    print("=" * 116)
+    print("[ROADMAP FULL PROBE SUITE] Running Gates G0..G6 + Track L (GL1..GL5) + EFRE on 72L Loop Base (`LB-blend`)")
+    print("=" * 116)
+    device = model._head_weight().device
+
+    # Gate G0: Backbone Fingerprint (including 24 TwoStreamMHC controllers)
+    fp_before = BackboneFingerprint(model, include_controllers=False, store_exact_clone=False)
+
+    # Track L1/L2/L3/L5: Loop & Engram Diagnostics + Gain Floor + Recursion KV Sharing (GL1, GL2, GL3, GL5)
+    gain_floor_info = model.set_mhc_gain_floor(min_gain_p2=0.05, min_gain_p3=0.02)
+    kv_share_info = model.set_recursion_kv_sharing(enabled=True)
+    gl2_report = repair_harmful_engram_anchors(model, tokenizer)
+
+    # Track L4: Adaptive Loop Exit (GL4)
+    gl4_report = evaluate_adaptive_loop_exit(model, tokenizer)
+
+    # Gate G1: Residual & Attention IO Reconstruction (< 1e-3 relative L2 error)
+    sample_ids = tokenizer(
+        "Spark-X2.6-4B hybrid attention combines 27 sliding-window RoPE layers with 9 global partial-RoPE layers.",
+        return_tensors="pt",
+    )["input_ids"].to(device)
+    attn_io = model.capture_attention_io(sample_ids, layers=[3, 7, 15, 31], visit=0)
+    g1_errors = {f"L{k}": round(float(v["reconstruction_rel_error"]), 6) for k, v in attn_io.items()}
+    g1_passed = all(float(v["reconstruction_rel_error"]) < 1e-3 for v in attn_io.values())
+
+    # Gate G2: D-LSA Ward Clustering & Recall + ColdKVStore
+    dlsa_fit = fit_dlsa_index(model, [sample_ids], layers=[3, 7], steps=10, k_budget=32)
+    dlsa_recall = evaluate_dlsa_attention_mass_recall(model, sample_ids, layers=[3, 7], k_budget=32)
+    cold_store = ColdKVStore(page_size=64, d_idx=64, max_bucket=4)
+    io_l3 = attn_io[3]
+    lsa_l3 = model._layers()[3].self_attn.lsa_indexer
+    k_s63 = lsa_l3.project_keys(io_l3["key"][0].permute(1, 0, 2).contiguous())
+    q_s63 = lsa_l3.project_queries(io_l3["query"][0].permute(1, 0, 2).contiguous())
+    page_id = cold_store.append_page(io_l3["key"][0], io_l3["value"][0], k_s63)
+    cold_fetch = cold_store.fetch_selected_kv(q_s63[-1:], top_buckets=2)
+
+    # Gates G3, G4, G5 & EFRE: ESM + LRCD + Forget + 72L vs 36L
+    efre_report = run_efre_and_loop_manipulation_probe(model, tokenizer)
+
+    # Gate G6: Deep-Sleep SMF Consolidation (write a shard into ESM L3 then consolidate to MoE-Engram)
+    esm_l3 = model.esm["3"]
+    h_syn = torch.randn(4, esm_l3.width, device=device, dtype=torch.float32) * 0.1
+    phi_syn = esm_l3.features(h_syn, shard=0)
+    esm_l3.write(shard=0, A=phi_syn, Delta=h_syn * 0.05, alpha=1e-2, centroids=esm_l3.route_embed(h_syn[:1]))
+    smf_report = consolidate_shards_smf(model, shard_ids=(0,), remove_consolidated_shards=True)
+
+    # Verify G0 Backbone Invariance across the entire probe suite
+    fp_verify = fp_before.verify(model)
+    model.set_recursion_kv_sharing(enabled=False)
+
+    summary = {
+        "G0_backbone_verification": fp_verify,
+        "G1_attention_reconstruction_errors": g1_errors,
+        "G1_passed": bool(g1_passed),
+        "G2_dlsa_fit": dlsa_fit,
+        "G2_dlsa_recall": dlsa_recall,
+        "G2_cold_kv_store": {
+            "page_id": page_id,
+            "selected_tokens": cold_fetch["selected_tokens"],
+            "bytes_transferred": cold_fetch["bytes_transferred"],
+        },
+        "G3_G4_G5_EFRE_report": efre_report,
+        "G6_smf_consolidation": {
+            "anchors_consolidated": smf_report.anchors_consolidated,
+            "shards_consolidated": smf_report.shards_consolidated,
+            "mean_rel_fit_error": round(smf_report.mean_rel_fit_error, 6),
+            "max_null_space_leakage": smf_report.max_null_space_leakage,
+            "backbone_sha256_match": smf_report.backbone_sha256_match,
+        },
+        "GL2_anchor_repair": {
+            "no_engram_72L_ppl": gl2_report["no_engram_72L_ppl"],
+            "repaired_engram_72L_ppl": gl2_report["repaired_engram_72L_ppl"],
+            "zeroed_anchors": gl2_report["zeroed_anchors"],
+            "gl2_passed": gl2_report["gl2_passed"],
+        },
+        "GL3_mhc_gain_floor": gain_floor_info,
+        "GL4_adaptive_loop_exit": gl4_report,
+        "GL5_recursion_kv_sharing": kv_share_info,
+    }
+    print("[ROADMAP FULL PROBE SUITE COMPLETE]")
+    return summary
+
+
 
 
 

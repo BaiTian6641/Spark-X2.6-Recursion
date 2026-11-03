@@ -18,6 +18,7 @@ from sparkx_memory_utils import (
     HAS_TORCH,
     BackboneFingerprint,
     CapacityExhaustedError,
+    ColdKVStore,
     EpisodicSideMemory,
     MemoryLedger,
     SleepScheduler,
@@ -33,6 +34,7 @@ from sparkx_memory_utils import (
     reconstruct_spark_attention_output,
     solve_null_space_ridge,
     update_orthonormal_basis,
+    ward_bucketize,
 )
 
 if HAS_TORCH:
@@ -338,6 +340,25 @@ class TestMemoryMathPurePython(unittest.TestCase):
             sched.forget(mid)
         self.assertLess(_max_abs(esm_dict[3](h_test, use_gate=False)), 1e-7)
         self.assertLess(_max_abs(esm_dict[7](h_test, use_gate=False)), 1e-7)
+
+    def test_g2_ward_bucketize_and_cold_kv_store(self) -> None:
+        # Phase 2 Gate G2: bottom-up mutual-NN Ward clustering and ColdKVStore selective page fetch
+        k_vecs = _rand_matrix(16, 8, seed=801)
+        wb = ward_bucketize(k_vecs, max_bucket=4)
+        self.assertGreaterEqual(len(wb["centroids"]), 4)
+        all_members = sorted(idx for m in wb["bucket_members"] for idx in m)
+        self.assertEqual(all_members, list(range(16)))
+        self.assertTrue(all(sz <= 4 for sz in wb["bucket_sizes"]))
+
+        store = ColdKVStore(page_size=16, d_idx=8, max_bucket=4)
+        v_vecs = _rand_matrix(16, 8, seed=802)
+        pid = store.append_page(k_vecs, v_vecs, k_vecs)
+        self.assertEqual(pid, 0)
+        fetched = store.fetch_selected_kv(k_vecs[0], top_buckets=2)
+        self.assertGreaterEqual(fetched["selected_tokens"], 2)
+        self.assertLessEqual(fetched["selected_tokens"], 8)
+        self.assertGreater(fetched["bytes_transferred"], 0)
+
 
 
 @unittest.skipUnless(HAS_TORCH, "PyTorch not installed in this environment")

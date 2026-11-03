@@ -24,11 +24,13 @@ from torch.utils.checkpoint import checkpoint
 from sparkx_memory_utils import (
     BackboneFingerprint,
     CapacityExhaustedError,
+    ColdKVStore,
     CompileReport,
     EpisodeBuffer,
     EpisodicSideMemory,
     MemoryLedger,
     ProbeSet,
+    SMFConsolidationReport,
     SleepReport,
     SleepScheduler,
     SpanScore,
@@ -39,7 +41,10 @@ from sparkx_memory_utils import (
     capture_residuals,
     collect_esm_general_stats,
     compile_span_lrcd,
+    consolidate_shards_smf,
+    evaluate_dlsa_attention_mass_recall,
     exact_remove_delta,
+    fit_dlsa_index,
     generate_self_study_probes,
     loop_config,
     precompute_damped_right_inverse,
@@ -48,6 +53,7 @@ from sparkx_memory_utils import (
     score_spans,
     solve_null_space_ridge,
     update_orthonormal_basis,
+    ward_bucketize,
 )
 
 # ---------------------------------------------------------------------------
@@ -270,18 +276,38 @@ class _CacheLayersView:
 
 class _VisitCache:
     """Redirects physical layer_idx KV cache updates to unique per-visit virtual_idx slots (up to 72 visits),
-    and enforces BF16/FP16 KV cache storage so RoPE float32 intermediates never bloat KV memory.
+    enforces BF16/FP16 KV cache storage, and supports Track L5 recursion-wise KV sharing (`read_only=True`).
     """
-    def __init__(self, cache, physical_idx: int, virtual_idx: int, kv_dtype: Optional[torch.dtype] = None):
+    def __init__(
+        self,
+        cache,
+        physical_idx: int,
+        virtual_idx: int,
+        kv_dtype: Optional[torch.dtype] = None,
+        read_only: bool = False,
+    ):
         self.cache = cache
         self.physical_idx = physical_idx
         self.virtual_idx = virtual_idx
         self.kv_dtype = kv_dtype
+        self.read_only = bool(read_only)
         if hasattr(cache, 'layers'):
             self.layers = _CacheLayersView(cache, physical_idx, virtual_idx)
 
     def update(self, key_states, value_states, layer_idx: int, cache_kwargs=None):
         target = self.virtual_idx if layer_idx == self.physical_idx else layer_idx
+        if self.read_only:
+            if hasattr(self.cache, 'layers') and target < len(self.cache.layers):
+                slot = self.cache.layers[target]
+                k_cached = getattr(slot, 'keys', None)
+                v_cached = getattr(slot, 'values', None)
+                if isinstance(k_cached, torch.Tensor) and k_cached.numel() > 0:
+                    return k_cached, v_cached
+            if hasattr(self.cache, 'key_cache') and hasattr(self.cache, 'value_cache') and target < len(self.cache.key_cache):
+                k_cached = self.cache.key_cache[target]
+                v_cached = self.cache.value_cache[target]
+                if isinstance(k_cached, torch.Tensor) and k_cached.numel() > 0:
+                    return k_cached, v_cached
         if self.kv_dtype is not None:
             if isinstance(key_states, torch.Tensor) and key_states.dtype != self.kv_dtype:
                 key_states = key_states.to(self.kv_dtype)
@@ -2495,12 +2521,29 @@ class SparkXLoopV03(nn.Module):
             str(idx): EpisodicSideMemory(width=width) for idx in self.esm_layers
         })
         self._residual_capture_hook = None
+        self.share_global_kv_across_passes = False
 
     def all_engram_modules(self) -> list[ZipfianTieredMoEEngram]:
         return [self.engram] + [mod for mod in self.backbone_engrams.values()]
 
     def iter_engram_anchors(self) -> list[tuple[int, ZipfianTieredMoEEngram]]:
         return [(3, self.engram)] + [(int(k), mod) for k, mod in self.backbone_engrams.items()]
+
+    @torch.no_grad()
+    def set_recursion_kv_sharing(self, enabled: bool = True) -> dict[str, Any]:
+        """Track L5: Share Pass-0 global KV cache across Pass 1 and Pass 2 (`read_only=True`), reducing global KV slots from 17 to 9."""
+        self.share_global_kv_across_passes = bool(enabled)
+        plan = self.execution_plan
+        global_set = set(self.esm_layers)
+        total_global_visits = sum(1 for idx in plan if idx in global_set)
+        unique_global_layers = len(set(idx for idx in plan if idx in global_set))
+        eff_slots = unique_global_layers if self.share_global_kv_across_passes else total_global_visits
+        return {
+            'share_global_kv_across_passes': self.share_global_kv_across_passes,
+            'unshared_global_kv_slots': total_global_visits,
+            'effective_global_kv_slots': eff_slots,
+            'global_kv_reduction_ratio': round(total_global_visits / max(1, eff_slots), 3),
+        }
 
     @torch.no_grad()
     def set_mhc_gain_floor(self, min_gain_p2: float = 0.05, min_gain_p3: float = 0.02) -> dict[str, Any]:
@@ -3146,13 +3189,13 @@ class SparkXLoopV03(nn.Module):
             )
         return (masks, rope), cache_position
 
-    def _apply_layer(self, idx, h, masks, ropes, past_key_values=None, cache_position=None, virtual_idx: Optional[int] = None):
+    def _apply_layer(self, idx, h, masks, ropes, past_key_values=None, cache_position=None, virtual_idx: Optional[int] = None, read_only_kv: bool = False):
         layer = self.base.model.layers[idx]
         kind = layer.layer_type
         rp, mk = ropes[kind], masks[kind]
         kv_dtype = self.base.model.embedding.weight.dtype
         v_cache = (
-            _VisitCache(past_key_values, idx, virtual_idx if virtual_idx is not None else idx, kv_dtype=kv_dtype)
+            _VisitCache(past_key_values, idx, virtual_idx if virtual_idx is not None else idx, kv_dtype=kv_dtype, read_only=read_only_kv)
             if past_key_values is not None else None
         )
         def step(x, _layer=layer, _rp=rp, _mk=mk, _vc=v_cache, _cp=cache_position):
@@ -3190,6 +3233,9 @@ class SparkXLoopV03(nn.Module):
         h = embeds.float()
         virtual_idx = 0
         visit_counts: dict[int, int] = {}
+        first_virtual_idx: dict[int, int] = {}
+        share_global_kv = bool(getattr(self, 'share_global_kv_across_passes', False))
+        global_layer_set = set(getattr(self, 'esm_layers', (3, 7, 11, 15, 19, 23, 27, 31, 35)))
         cap_hook = getattr(self, '_residual_capture_hook', None)
         esm_on = bool(getattr(self, 'esm_enabled', False)) and hasattr(self, 'esm')
         esm_visits_mode = str(getattr(self, 'esm_visits', 'first'))
@@ -3224,6 +3270,8 @@ class SparkXLoopV03(nn.Module):
         for idx in range(self.loop_start):
             v_idx = visit_counts.get(idx, 0)
             visit_counts[idx] = v_idx + 1
+            if v_idx == 0:
+                first_virtual_idx[idx] = virtual_idx
             if cap_hook is not None:
                 cap_hook(idx, v_idx, 0, 'pre_block', h)
             h = self._apply_layer(idx, h, masks, ropes, past_key_values=past_key_values,
@@ -3252,10 +3300,14 @@ class SparkXLoopV03(nn.Module):
                 for idx in range(s_idx, e_idx):
                     v_idx = visit_counts.get(idx, 0)
                     visit_counts[idx] = v_idx + 1
+                    if v_idx == 0:
+                        first_virtual_idx[idx] = virtual_idx
+                    share_ro = bool(v_idx > 0 and share_global_kv and idx in global_layer_set)
+                    eff_v_idx = first_virtual_idx.get(idx, virtual_idx) if share_ro else virtual_idx
                     if cap_hook is not None:
                         cap_hook(idx, v_idx, p, 'pre_block', h)
                     h = self._apply_layer(idx, h, masks, ropes, past_key_values=past_key_values,
-                                          cache_position=cache_position, virtual_idx=virtual_idx)
+                                          cache_position=cache_position, virtual_idx=eff_v_idx, read_only_kv=share_ro)
                     if cap_hook is not None:
                         cap_hook(idx, v_idx, p, 'post_layer', h)
                     if self.engram_enabled and str(idx) in self.backbone_engrams:
@@ -3289,13 +3341,20 @@ class SparkXLoopV03(nn.Module):
                 for idx in range(s_idx, e_idx):
                     v_idx = visit_counts.get(idx, 0)
                     visit_counts[idx] = v_idx + 1
+                    if v_idx == 0:
+                        first_virtual_idx[idx] = virtual_idx
+                    share_ro = bool(v_idx > 0 and share_global_kv and idx in global_layer_set)
+                    eff_v_idx = first_virtual_idx.get(idx, virtual_idx) if share_ro else virtual_idx
                     if cap_hook is not None:
                         cap_hook(idx, v_idx, p, 'pre_block', streams[0])
                     kind = self.base.model.layers[idx].layer_type
                     layer = self.base.model.layers[idx]
                     ctrl = self.controllers[str(idx)]
                     rp, mk = ropes[kind], masks[kind]
-                    v_cache = _VisitCache(past_key_values, idx, virtual_idx, kv_dtype=kv_dtype) if past_key_values is not None else None
+                    v_cache = (
+                        _VisitCache(past_key_values, idx, eff_v_idx, kv_dtype=kv_dtype, read_only=share_ro)
+                        if past_key_values is not None else None
+                    )
                     eng_mod = (
                         self.backbone_engrams[str(idx)]
                         if (self.engram_enabled and str(idx) in self.backbone_engrams)
