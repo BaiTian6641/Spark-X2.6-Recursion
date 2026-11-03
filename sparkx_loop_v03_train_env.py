@@ -1792,16 +1792,24 @@ def run_v03_four_stage_training(
                 print(f"\n[{stage_name}] Executing Coarse-to-Fine Expert Upcycling (8 -> 32 experts, top_k=7)...", flush=True)
                 model.upcycle_all_engrams_8_to_32(noise_std=1e-3)
 
+            eff_passes = int(stage_cfg['passes'])
+            if bool(stage_cfg.get('enable_p3', False)) and eff_passes > 2 and not bool(stage_cfg.get('allow_96l', False)):
+                eff_passes = 2
+
             model.set_loop(
                 start=int(stage_cfg['start']),
                 end=int(stage_cfg['end']),
-                passes=int(stage_cfg['passes']),
+                passes=eff_passes,
                 use_mhc=use_mhc,
                 use_engram=use_engram,
                 enable_p3=bool(stage_cfg.get('enable_p3', False)),
                 p3_start=int(stage_cfg.get('p3_start', 12)),
                 p3_end=int(stage_cfg.get('p3_end', 24)),
             )
+
+            # Guarantee activation gradient checkpointing is ON during 8K/16K training (load_sparkx_loop_v03 sets it False for inference)
+            model.enable_checkpoint = True
+            model.settings.checkpoint_layers = True
 
             # Automatically enable pinned-RAM checkpoint streaming at 16K on <=85GB GPUs to prevent 60L/72L OOM
             if seq_len >= 16384 and 0.0 < vram_total_gb <= 85.0:
