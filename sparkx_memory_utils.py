@@ -122,11 +122,12 @@ class BackboneFingerprint:
         ignore_substrings: Sequence[str] = ("lsa_indexer",),
         sample_size: int = 2048,
         store_full_clone: bool = False,
+        store_exact_clone: Optional[bool] = None,
     ) -> None:
         self.include_controllers = bool(include_controllers)
         self.ignore_substrings = tuple(str(s) for s in ignore_substrings)
         self.sample_size = int(sample_size)
-        self.store_full_clone = bool(store_full_clone)
+        self.store_full_clone = bool(store_exact_clone if store_exact_clone is not None else store_full_clone)
         self.records: Dict[str, TensorRecord] = {}
         self.combined_sha256: str = ""
         self._capture(model)
@@ -810,6 +811,7 @@ class EpisodicSideMemory(torch.nn.Module if HAS_TORCH else object):
         gate_T: float = 0.05,
         default_tau: float = 0.65,
         rmsnorm_eps: float = 1e-6,
+        use_torch: Optional[bool] = None,
     ):
         if HAS_TORCH:
             super().__init__()
@@ -820,6 +822,7 @@ class EpisodicSideMemory(torch.nn.Module if HAS_TORCH else object):
         self.gate_T = float(gate_T)
         self.default_tau = float(default_tau)
         self.rmsnorm_eps = float(rmsnorm_eps)
+        self._use_torch = bool(HAS_TORCH if use_torch is None else (use_torch and HAS_TORCH))
 
         # Shard storage (dynamically allocated on demand so empty ESM uses minimal memory)
         self._shards: Dict[int, Dict[str, Any]] = {}
@@ -829,15 +832,15 @@ class EpisodicSideMemory(torch.nn.Module if HAS_TORCH else object):
             self.route_proj = torch.nn.Linear(self.width, self.route_dim, bias=False, dtype=torch.float32)
             torch.nn.init.orthogonal_(self.route_proj.weight)
             self.route_proj.weight.requires_grad_(False)
-        else:
-            # Pure-Python deterministic orthogonal-like routing projection
-            self._py_route_proj = [
-                [
-                    math.sin((i + 1) * (j + 1) * 0.73) / math.sqrt(self.width)
-                    for j in range(self.width)
-                ]
-                for i in range(self.route_dim)
+        # Always keep deterministic pure-Python routing projection available for list-based unit tests
+        self._py_route_proj = [
+            [
+                math.sin((i + 1) * (j + 1) * 0.73) / math.sqrt(self.width)
+                for j in range(min(self.width, 64))
             ]
+            + [0.0 for _ in range(max(0, self.width - 64))]
+            for i in range(self.route_dim)
+        ]
 
     @property
     def num_active_shards(self) -> int:
@@ -853,7 +856,7 @@ class EpisodicSideMemory(torch.nn.Module if HAS_TORCH else object):
         if len(self._shards) >= self.max_shards:
             raise CapacityExhaustedError(f"Maximum ESM shards ({self.max_shards}) reached.")
         s_id = max(self._shards.keys(), default=-1) + 1
-        if HAS_TORCH:
+        if HAS_TORCH and self._use_torch:
             dev = self.route_proj.weight.device
             u_gate = torch.empty((self.r, self.width), dtype=torch.float32, device=dev)
             u_up = torch.empty((self.r, self.width), dtype=torch.float32, device=dev)
@@ -892,7 +895,11 @@ class EpisodicSideMemory(torch.nn.Module if HAS_TORCH else object):
             }
         return s_id
 
-    def _ensure_shard(self, shard: int) -> Dict[str, Any]:
+    def _ensure_shard(self, shard: int, prefer_torch: Optional[bool] = None) -> Dict[str, Any]:
+        if prefer_torch is False and self._use_torch:
+            self._use_torch = False
+            if shard in self._shards and self._shards[shard].get("num_writes", 0) == 0:
+                del self._shards[shard]
         if shard not in self._shards:
             while shard not in self._shards:
                 self.new_shard()
@@ -903,6 +910,7 @@ class EpisodicSideMemory(torch.nn.Module if HAS_TORCH else object):
         if HAS_TORCH and isinstance(h, torch.Tensor):
             u = torch.nn.functional.linear(h.float(), self.route_proj.weight.float())
             return torch.nn.functional.normalize(u, p=2, dim=-1, eps=1e-6)
+        self._use_torch = False
         # Pure-Python 2D [N, width]
         proj_t = _py_transpose(self._py_route_proj)
         raw = _py_matmul(h, proj_t)
@@ -914,8 +922,9 @@ class EpisodicSideMemory(torch.nn.Module if HAS_TORCH else object):
 
     def features(self, h: Any, shard: int = 0) -> Any:
         """Compute frozen SwiGLU feature vector `phi_s(h) in R^r` in `float32`."""
-        sh = self._ensure_shard(shard)
-        if HAS_TORCH and isinstance(h, torch.Tensor):
+        is_tensor = bool(HAS_TORCH and isinstance(h, torch.Tensor))
+        sh = self._ensure_shard(shard, prefer_torch=is_tensor)
+        if is_tensor:
             h_f = h.float()
             rms = torch.rsqrt(h_f.pow(2).mean(dim=-1, keepdim=True) + self.rmsnorm_eps)
             h_norm = h_f * rms
@@ -1159,6 +1168,13 @@ class EpisodicSideMemory(torch.nn.Module if HAS_TORCH else object):
         total_delta = [[0.0 for _ in range(self.width)] for _ in range(len(h))]
         for s_id, sh in self._shards.items():
             if sh.get("num_writes", 0) <= 0:
+                continue
+            if HAS_TORCH and isinstance(sh["w_down"], torch.Tensor):
+                h_t = torch.tensor(h, dtype=torch.float32, device=sh["w_down"].device)
+                d_t = self.forward(h_t, use_gate=use_gate).detach().cpu().tolist()
+                for i in range(len(h)):
+                    for j in range(self.width):
+                        total_delta[i][j] += d_t[i][j]
                 continue
             phi = self.features(h, shard=s_id)
             raw_out = _py_matmul(phi, sh["w_down"])
@@ -1660,7 +1676,7 @@ class SleepScheduler:
             for l_idx, esm_mod in self.esm_modules.items():
                 # Synthesize deterministic key-value residual representation from span tokens for standalone or model-backed mode
                 w = esm_mod.width
-                if HAS_TORCH and isinstance(getattr(esm_mod, "route_proj", None), torch.nn.Module):
+                if HAS_TORCH and getattr(esm_mod, "_use_torch", False):
                     dev = esm_mod.route_proj.weight.device
                     h_key = torch.tensor(
                         [
