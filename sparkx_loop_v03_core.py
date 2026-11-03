@@ -24,10 +24,28 @@ from torch.utils.checkpoint import checkpoint
 from sparkx_memory_utils import (
     BackboneFingerprint,
     CapacityExhaustedError,
+    CompileReport,
+    EpisodeBuffer,
+    EpisodicSideMemory,
+    MemoryLedger,
+    ProbeSet,
+    SleepReport,
+    SleepScheduler,
+    SpanScore,
+    WriteReport,
+    block_ablation_delta,
+    calibrate_esm_gate,
+    capture_attention_io,
+    capture_residuals,
+    collect_esm_general_stats,
+    compile_span_lrcd,
     exact_remove_delta,
+    generate_self_study_probes,
     loop_config,
     precompute_damped_right_inverse,
     project_into_null_space,
+    reconstruct_spark_attention_output,
+    score_spans,
     solve_null_space_ridge,
     update_orthonormal_basis,
 )
@@ -2225,6 +2243,45 @@ class TwoStreamMHC(nn.Module):
             p_swap = 1.0 - torch.sigmoid(diag_adv)
             return r1, 1.0 - w1, w1, p_swap
 
+    def _effective_gain(self, gain_param: torch.Tensor, pass_idx: int = 0, extra: bool = False) -> torch.Tensor | float:
+        if not extra:
+            return 1.0
+        raw = torch.tanh(gain_param.float())
+        min_g = float(
+            getattr(self, 'min_p3_gain', 0.0) if pass_idx >= 2 else getattr(self, 'min_extra_gain', 0.0)
+        )
+        if min_g <= 0.0:
+            return raw
+        # Smooth softplus floor so Pass-2 / Pass-3 recurrence gains never collapse to zero (Track L3)
+        return min_g + (1.0 - min_g) * torch.sigmoid((raw - min_g) * 6.0) * 0.0 + F.softplus((raw - min_g) * 10.0) / 10.0
+
+    @torch.no_grad()
+    def controller_telemetry(self) -> dict[str, Any]:
+        """Return Track L1 diagnostic summary of P2/P3 gains and static Sinkhorn read/write/swap probabilities."""
+        g_p2_a = float(self._effective_gain(self.extra_gain, pass_idx=1, extra=True))
+        g_p2_f = float(self._effective_gain(self.ffn_extra_gain, pass_idx=1, extra=True))
+        g_p3_a = float(self._effective_gain(self.p3_extra_gain, pass_idx=2, extra=True))
+        g_p3_f = float(self._effective_gain(self.p3_ffn_extra_gain, pass_idx=2, extra=True))
+        r_a = self.read_logits.float().softmax(dim=0)
+        w_a = self.write_logits.float().softmax(dim=0)
+        m_a = self.mixing_matrix(base_logits=self.mix_logits.float())
+        r_f = self.ffn_read_logits.float().softmax(dim=0)
+        w_f = self.ffn_write_logits.float().softmax(dim=0)
+        m_f = self.mixing_matrix(base_logits=self.ffn_mix_logits.float())
+        return {
+            'gain_p2_attn': round(g_p2_a, 5),
+            'gain_p2_ffn': round(g_p2_f, 5),
+            'gain_p3_attn': round(g_p3_a, 5),
+            'gain_p3_ffn': round(g_p3_f, 5),
+            'read_s1_prob_attn': round(float(r_a[1].item()), 5),
+            'write_s0_prob_attn': round(float(w_a[0].item()), 5),
+            'swap_prob_attn': round(float(m_a[0, 1].item()), 5),
+            'read_s1_prob_ffn': round(float(r_f[1].item()), 5),
+            'write_s0_prob_ffn': round(float(w_f[0].item()), 5),
+            'swap_prob_ffn': round(float(m_f[0, 1].item()), 5),
+            'gain_collapsed': (abs(g_p2_a) < 0.03 and abs(g_p2_f) < 0.03),
+        }
+
     def _apply_pass_adapter(self, x: torch.Tensor, pass_idx: int) -> torch.Tensor:
         if self.pass_down is None or self.pass_up is None:
             return torch.zeros_like(x, dtype=torch.float32)
@@ -2263,7 +2320,7 @@ class TwoStreamMHC(nn.Module):
                 cache_position=cache_position,
             )
             gain_a_param = self.p3_extra_gain if pass_idx >= 2 else self.extra_gain
-            gain_a = torch.tanh(gain_a_param.float()) if extra else 1.0
+            gain_a = self._effective_gain(gain_a_param, pass_idx=pass_idx, extra=extra)
             alpha_a = gain_a * p_swap_a
             attn_delta = gain_a * attn_out.float()
             m0 = s0 + alpha_a * diff_a + w0_a * attn_delta
@@ -2276,7 +2333,7 @@ class TwoStreamMHC(nn.Module):
             normed_f = layer.post_attention_layernorm(mixed_f.to(orig_dtype)).to(target_dtype)
             mlp_out = layer.mlp(normed_f).float() + self._apply_pass_adapter(mixed_f, pass_idx)
             gain_f_param = self.p3_ffn_extra_gain if pass_idx >= 2 else self.ffn_extra_gain
-            gain_f = torch.tanh(gain_f_param.float()) if extra else 1.0
+            gain_f = self._effective_gain(gain_f_param, pass_idx=pass_idx, extra=extra)
             alpha_f = gain_f * p_swap_f
             mlp_delta = gain_f * mlp_out
             out0 = m0 + alpha_f * diff_f + w0_f * mlp_delta
@@ -2295,7 +2352,7 @@ class TwoStreamMHC(nn.Module):
         )
         delta = updated.float() - mixed_input.float() + self._apply_pass_adapter(mixed_input, pass_idx)
         gain_param = self.p3_extra_gain if pass_idx >= 2 else self.extra_gain
-        gain = torch.tanh(gain_param.float()) if extra else 1.0
+        gain = self._effective_gain(gain_param, pass_idx=pass_idx, extra=extra)
         alpha = gain * p_swap
         scaled_delta = gain * delta
         out0 = s0 + alpha * diff + w0 * scaled_delta
@@ -2430,11 +2487,95 @@ class SparkXLoopV03(nn.Module):
             str(idx): _make_engram() for idx in anchor_indices
         })
 
+        # Phase 3: Dedicated Episodic Side Memory (ESM) at the 9 global layers (`{3, 7, 11, 15, 19, 23, 27, 31, 35}`)
+        self.esm_layers = [idx for idx in (3, 7, 11, 15, 19, 23, 27, 31, 35) if idx < self.n_layers]
+        self.esm_enabled = False
+        self.esm_visits = 'first'  # 'first' (default, Pass 0 only) | 'all' (ablation)
+        self.esm = nn.ModuleDict({
+            str(idx): EpisodicSideMemory(width=width) for idx in self.esm_layers
+        })
+        self._residual_capture_hook = None
+
     def all_engram_modules(self) -> list[ZipfianTieredMoEEngram]:
         return [self.engram] + [mod for mod in self.backbone_engrams.values()]
 
     def iter_engram_anchors(self) -> list[tuple[int, ZipfianTieredMoEEngram]]:
         return [(3, self.engram)] + [(int(k), mod) for k, mod in self.backbone_engrams.items()]
+
+    @torch.no_grad()
+    def set_mhc_gain_floor(self, min_gain_p2: float = 0.05, min_gain_p3: float = 0.02) -> dict[str, Any]:
+        """Track L3: Set smooth softplus gain floor across all 24 TwoStreamMHC controllers to prevent P2/P3 gain collapse."""
+        for ctrl in self.controllers.values():
+            ctrl.min_extra_gain = float(max(0.0, min_gain_p2))
+            ctrl.min_p3_gain = float(max(0.0, min_gain_p3))
+        return {
+            'controllers_updated': len(self.controllers),
+            'min_gain_p2': float(max(0.0, min_gain_p2)),
+            'min_gain_p3': float(max(0.0, min_gain_p3)),
+        }
+
+    @torch.no_grad()
+    def get_mhc_controller_telemetry(self) -> dict[str, Any]:
+        """Track L1: Aggregate per-layer TwoStreamMHC P2/P3 gains, Sinkhorn read/write/swap probs, and gain-collapse flags."""
+        per_layer = {}
+        p2_a, p2_f, p3_a, p3_f = [], [], [], []
+        collapsed_layers = []
+        for k, ctrl in self.controllers.items():
+            info = ctrl.controller_telemetry()
+            per_layer[f'L{k}'] = info
+            p2_a.append(abs(info['gain_p2_attn']))
+            p2_f.append(abs(info['gain_p2_ffn']))
+            p3_a.append(abs(info['gain_p3_attn']))
+            p3_f.append(abs(info['gain_p3_ffn']))
+            if info['gain_collapsed']:
+                collapsed_layers.append(int(k))
+        return {
+            'num_controllers': len(self.controllers),
+            'mean_abs_gain_p2_attn': round(sum(p2_a) / max(1, len(p2_a)), 5),
+            'mean_abs_gain_p2_ffn': round(sum(p2_f) / max(1, len(p2_f)), 5),
+            'mean_abs_gain_p3_attn': round(sum(p3_a) / max(1, len(p3_a)), 5),
+            'mean_abs_gain_p3_ffn': round(sum(p3_f) / max(1, len(p3_f)), 5),
+            'collapsed_controller_layers': collapsed_layers,
+            'per_layer': per_layer,
+        }
+
+    def capture_residuals(
+        self,
+        input_ids: torch.LongTensor,
+        layers: Sequence[int],
+        positions: Optional[torch.Tensor] = None,
+        where: str = 'post_block',
+        cache_position: Optional[torch.Tensor] = None,
+        return_all_visits: bool = False,
+        visit: int = 0,
+    ) -> dict[Any, torch.Tensor]:
+        """Phase 1: Capture residual stream tensors across requested layers in 36L or 72L Loop Base mode."""
+        return capture_residuals(
+            self,
+            input_ids=input_ids,
+            layers=layers,
+            positions=positions,
+            where=where,
+            cache_position=cache_position,
+            return_all_visits=return_all_visits,
+            visit=visit,
+        )
+
+    def capture_attention_io(
+        self,
+        input_ids: torch.LongTensor,
+        layers: Sequence[int],
+        visit: int = 0,
+        cache_position: Optional[torch.Tensor] = None,
+    ) -> dict[int, dict[str, Any]]:
+        """Phase 1: Capture attention inputs, post-RoPE Q/K/V, gate, and reconstruction error (< 1e-3)."""
+        return capture_attention_io(
+            self,
+            input_ids=input_ids,
+            layers=layers,
+            visit=visit,
+            cache_position=cache_position,
+        )
 
     @torch.no_grad()
     def reset_all_loop_and_engram_to_step0(self, initial_active_experts: int = 8, initial_top_k: int = 2):
@@ -2957,6 +3098,7 @@ class SparkXLoopV03(nn.Module):
         cfg = self.base.config
         device = embeds.device
         bsz, q_len = embeds.shape[:2]
+        custom_cache_pos = cache_position is not None
         if cache_position is None:
             if past_key_values is not None:
                 try:
@@ -2969,16 +3111,20 @@ class SparkXLoopV03(nn.Module):
             else:
                 past_seen = 0
             cache_position = torch.arange(past_seen, past_seen + q_len, device=device)
-        if hasattr(model, 'make_loop_context'):
+        if not custom_cache_pos and hasattr(model, 'make_loop_context'):
             return model.make_loop_context(embeds, attention_mask), cache_position
         if (past_key_values is not None and q_len == 1 and attention_mask is None) or (
-            past_key_values is None and attention_mask is None and q_len > 1024
+            not custom_cache_pos and past_key_values is None and attention_mask is None and q_len > 1024
         ):
             masks = {'full_attention': None, 'sliding_attention': None}
         else:
-            k_len = int(cache_position[-1].item()) + 1 if cache_position.numel() > 0 else q_len
             q_idx = cache_position.view(1, 1, q_len, 1)
-            k_idx = torch.arange(k_len, device=device).view(1, 1, 1, k_len)
+            if past_key_values is None:
+                k_len = q_len
+                k_idx = cache_position.view(1, 1, 1, q_len)
+            else:
+                k_len = int(cache_position[-1].item()) + 1 if cache_position.numel() > 0 else q_len
+                k_idx = torch.arange(k_len, device=device).view(1, 1, 1, k_len)
             causal_ok = (k_idx <= q_idx)
             if attention_mask is not None and isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2:
                 pad_ok = attention_mask[:, :k_len].bool().view(bsz, 1, 1, -1)
@@ -3043,6 +3189,10 @@ class SparkXLoopV03(nn.Module):
         kv_dtype = embeds.dtype
         h = embeds.float()
         virtual_idx = 0
+        visit_counts: dict[int, int] = {}
+        cap_hook = getattr(self, '_residual_capture_hook', None)
+        esm_on = bool(getattr(self, 'esm_enabled', False)) and hasattr(self, 'esm')
+        esm_visits_mode = str(getattr(self, 'esm_visits', 'first'))
 
         def _apply_engram_residual(h_in: torch.Tensor, _eng: ZipfianTieredMoEEngram, _p: int = 0) -> torch.Tensor:
             def _eng_step(x, _m=_eng, _pass=_p):
@@ -3057,15 +3207,37 @@ class SparkXLoopV03(nn.Module):
                 return checkpoint(_eng_step, ckpt_in, use_reentrant=False)
             return _eng_step(h_in)
 
+        def _maybe_apply_esm(h_in: torch.Tensor, layer_idx: int, v_idx: int) -> torch.Tensor:
+            if not esm_on:
+                return h_in
+            if esm_visits_mode != 'all' and v_idx > 0:
+                return h_in
+            k_str = str(layer_idx)
+            if k_str not in self.esm:
+                return h_in
+            esm_mod = self.esm[k_str]
+            if not esm_mod.has_active_writes():
+                return h_in
+            return h_in + esm_mod(h_in).to(h_in.dtype)
+
         # 1. Prelude layers [0..loop_start) (includes Anchor 0 at Layer 3 + any backbone anchors < loop_start)
         for idx in range(self.loop_start):
+            v_idx = visit_counts.get(idx, 0)
+            visit_counts[idx] = v_idx + 1
+            if cap_hook is not None:
+                cap_hook(idx, v_idx, 0, 'pre_block', h)
             h = self._apply_layer(idx, h, masks, ropes, past_key_values=past_key_values,
                                   cache_position=cache_position, virtual_idx=virtual_idx)
+            if cap_hook is not None:
+                cap_hook(idx, v_idx, 0, 'post_layer', h)
             if self.engram_enabled:
                 if idx == 3:
                     h = _apply_engram_residual(h, self.engram, _p=0)
                 elif str(idx) in self.backbone_engrams:
                     h = _apply_engram_residual(h, self.backbone_engrams[str(idx)], _p=0)
+            h = _maybe_apply_esm(h, idx, v_idx)
+            if cap_hook is not None:
+                cap_hook(idx, v_idx, 0, 'post_block', h)
             virtual_idx += 1
         if self.engram_enabled and 0 < self.loop_start <= 3:
             h = _apply_engram_residual(h, self.engram, _p=0)
@@ -3078,8 +3250,14 @@ class SparkXLoopV03(nn.Module):
         if not self.mhc_enabled:
             for p, s_idx, e_idx in pass_spans:
                 for idx in range(s_idx, e_idx):
+                    v_idx = visit_counts.get(idx, 0)
+                    visit_counts[idx] = v_idx + 1
+                    if cap_hook is not None:
+                        cap_hook(idx, v_idx, p, 'pre_block', h)
                     h = self._apply_layer(idx, h, masks, ropes, past_key_values=past_key_values,
                                           cache_position=cache_position, virtual_idx=virtual_idx)
+                    if cap_hook is not None:
+                        cap_hook(idx, v_idx, p, 'post_layer', h)
                     if self.engram_enabled and str(idx) in self.backbone_engrams:
                         eng_delta = self.backbone_engrams[str(idx)](
                             input_ids, h.dtype, prev_ids=prev_ids, hidden_states=h,
@@ -3087,6 +3265,9 @@ class SparkXLoopV03(nn.Module):
                         )
                         if p == 0:
                             h = h + eng_delta
+                    h = _maybe_apply_esm(h, idx, v_idx)
+                    if cap_hook is not None:
+                        cap_hook(idx, v_idx, p, 'post_block', h)
                     virtual_idx += 1
         else:
             # At >=8K training, store between-layer checkpoint boundary streams in BF16 (saves >10GB VRAM at 16K/60L-72L)
@@ -3106,6 +3287,10 @@ class SparkXLoopV03(nn.Module):
                 streams = streams.detach().requires_grad_(True)
             for p, s_idx, e_idx in pass_spans:
                 for idx in range(s_idx, e_idx):
+                    v_idx = visit_counts.get(idx, 0)
+                    visit_counts[idx] = v_idx + 1
+                    if cap_hook is not None:
+                        cap_hook(idx, v_idx, p, 'pre_block', streams[0])
                     kind = self.base.model.layers[idx].layer_type
                     layer = self.base.model.layers[idx]
                     ctrl = self.controllers[str(idx)]
@@ -3117,31 +3302,50 @@ class SparkXLoopV03(nn.Module):
                         else None
                     )
                     virtual_idx += 1
-                    def step(s, _ctrl=ctrl, _layer=layer, _rp=rp, _mk=mk, _extra=(p > 0), _p=p, _vc=v_cache, _cp=cache_position, _eng=eng_mod):
+                    def step(s, _ctrl=ctrl, _layer=layer, _rp=rp, _mk=mk, _extra=(p > 0), _p=p, _vc=v_cache, _cp=cache_position, _eng=eng_mod, _idx=idx, _v_idx=v_idx):
                         s_out = _ctrl(s, _layer, _rp, _mk, extra=_extra, pass_idx=_p,
                                       past_key_values=_vc, cache_position=_cp)
+                        if cap_hook is not None:
+                            cap_hook(_idx, _v_idx, _p, 'post_layer', s_out[0])
                         if _eng is not None:
                             eng_delta = _eng(
                                 input_ids, s_out.dtype, prev_ids=prev_ids, hidden_states=s_out[0],
                                 pass_idx=_p, ngram_indices=ngram_indices,
                             )
                             if _extra:
-                                fgain = _ctrl.p3_ffn_extra_gain if _p >= 2 else _ctrl.ffn_extra_gain
-                                eng_delta = eng_delta * torch.tanh(fgain.float()).to(s_out.dtype)
+                                fgain_param = _ctrl.p3_ffn_extra_gain if _p >= 2 else _ctrl.ffn_extra_gain
+                                fgain = _ctrl._effective_gain(fgain_param, pass_idx=_p, extra=True)
+                                eng_delta = (eng_delta.float() * fgain).to(s_out.dtype)
                             s_out = torch.stack((s_out[0] + eng_delta, s_out[1]), dim=0)
+                        if esm_on and (esm_visits_mode == 'all' or _v_idx == 0) and str(_idx) in self.esm:
+                            esm_m = self.esm[str(_idx)]
+                            if esm_m.has_active_writes():
+                                esm_d = esm_m(s_out[0]).to(s_out.dtype)
+                                s_out = torch.stack((s_out[0] + esm_d, s_out[1]), dim=0)
                         return s_out
                     if v_cache is None and self.training and self.enable_checkpoint:
                         streams = checkpoint(step, streams, use_reentrant=False)
                     else:
                         streams = step(streams)
+                    if cap_hook is not None:
+                        cap_hook(idx, v_idx, p, 'post_block', streams[0])
             h = streams[0].float()
 
-        # 3. Coda layers [loop_end..n_layers) (includes Anchor 7 at Layer 31!)
+        # 3. Coda layers [loop_end..n_layers) (includes Anchor 7 at Layer 31 + Global Layer 35!)
         for idx in range(self.loop_end, self.n_layers):
+            v_idx = visit_counts.get(idx, 0)
+            visit_counts[idx] = v_idx + 1
+            if cap_hook is not None:
+                cap_hook(idx, v_idx, 0, 'pre_block', h)
             h = self._apply_layer(idx, h, masks, ropes, past_key_values=past_key_values,
                                   cache_position=cache_position, virtual_idx=virtual_idx)
+            if cap_hook is not None:
+                cap_hook(idx, v_idx, 0, 'post_layer', h)
             if self.engram_enabled and str(idx) in self.backbone_engrams:
                 h = _apply_engram_residual(h, self.backbone_engrams[str(idx)], _p=0)
+            h = _maybe_apply_esm(h, idx, v_idx)
+            if cap_hook is not None:
+                cap_hook(idx, v_idx, 0, 'post_block', h)
             virtual_idx += 1
         return self.base.model.norm(h).to(kv_dtype)
 

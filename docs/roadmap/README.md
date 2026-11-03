@@ -25,15 +25,15 @@
 | Stage 2 sleep compiler prototype | M | — | — | 🟥 non-runnable (B1–B5) | `47a7cc6` |
 | Review hotfix: Stage D opt-in, citations | M | — | — | 🟩 | `b841a3e` |
 | Roadmap 00–04 + LB-as-base decision | — | — | — | 🟩 | `c1b6d09` |
-| **Phase 0** repair, guardrails, math tests | M | — | G0 | 🟩 | Phase 0 (`sparkx_memory_utils.py` + `tests/test_memory_math.py` + B1–B5/M4–M8/m1–m3 fixes) |
-| **L1** loop / mHC / Engram diagnostics | L | — | report | 🟨 | next |
-| **L2** Engram repair | L | L1 | GL2 | ⬜ | |
-| **L3** gain-collapse fix + healing + recurrence curriculum | L | L1 | stable ckpt (GL3 target) | 🟨 | next |
-| **Phase 1** trace capture (LB + 36L, gapped position ids) | M | P0 | G1 | 🟨 | next |
-| **Phase 2** D-LSA on RoPE-free slice | M | P1 | G2 | 🟨 (192-D `[64:256]` slice landed) | |
-| **Phase 3** ESM module + Σ_gen through LB | M | P1 | G3 | ⬜ | |
-| **Phase 4** self-study probes + LRCD on LB | M | P3, **L3** | G4 | ⬜ | |
-| **Phase 5** sleep scheduler, ledger, eviction, forget | M | P4 | G5 | ⬜ | |
+| **Phase 0** repair, guardrails, math tests | M | — | G0 | 🟩 | `66efc35` |
+| **L1** loop / mHC / Engram diagnostics | L | — | report | 🟩 code ready (`diagnose_loop_and_engram_health`, `get_mhc_controller_telemetry`) | ready for Colab GPU |
+| **L2** Engram repair | L | L1 | GL2 | 🟩 code ready (`repair_harmful_engram_anchors`) | ready for Colab GPU |
+| **L3** gain-collapse fix + healing + recurrence curriculum | L | L1 | stable ckpt (GL3 target) | 🟩 code ready (`_effective_gain`, `set_mhc_gain_floor`) | ready for Colab GPU |
+| **Phase 1** trace capture (LB + 36L, gapped position ids) | M | P0 | G1 | 🟩 (`capture_residuals`, `capture_attention_io`, `block_ablation_delta`, gapped `cache_position`) | unit-tested |
+| **Phase 2** D-LSA on RoPE-free slice | M | P1 | G2 | 🟨 (192-D `[64:256]` slice landed) | `66efc35` |
+| **Phase 3** ESM module + Σ_gen through LB | M | P1 | G3 | 🟩 (`EpisodicSideMemory`, `collect_esm_general_stats`, `calibrate_esm_gate`) | unit-tested |
+| **Phase 4** self-study probes + LRCD on LB | M | P3, **L3** | G4 | 🟩 (`generate_self_study_probes`, `compile_span_lrcd`) | unit-tested |
+| **Phase 5** sleep scheduler, ledger, eviction, forget | M | P4 | G5 | 🟩 (`EpisodeBuffer`, `MemoryLedger`, `SleepScheduler`, `forget`) | unit-tested |
 | **Phase 6** deep-sleep SMF consolidation into Engram | M×L | P5, L2 | G6 | ⬜ | |
 | **L4** adaptive exit | L | L3 | ≥25% FLOP saving | ⬜ | |
 | **L5** recursion-wise KV sharing (required for 1–2M on LB) | L | L3 | ≤1 pt RULER @64K | ⬜ | |

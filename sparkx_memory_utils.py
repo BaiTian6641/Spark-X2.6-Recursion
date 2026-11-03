@@ -538,3 +538,1185 @@ def exact_remove_delta(w_master: Any, dw: Any) -> Any:
         [w_master[i][j] - dw[i][j] for j in range(len(w_master[0]))]
         for i in range(len(w_master))
     ]
+
+
+# ==============================================================================
+# Phase 1: Exact Trace Capture & Attention Reconstruction (`G1`)
+# ==============================================================================
+
+def reconstruct_spark_attention_output(
+    sdpa_out: Any,
+    normed_input: Any,
+    out_proj_weight: Any,
+    g_proj_weight: Optional[Any] = None,
+) -> Any:
+    """Recompute Spark attention residual `out_proj(sigmoid(g_proj(LN h)) * SDPA(q, k, v))`.
+
+    Supports both `torch.Tensor` (`sdpa_out` shape `[B, H_q, T, D_h]` or `[T, H_q * D_h]`) and pure-Python 2D lists
+    (`[T, H_q * D_h]`) for deterministic unit testing.
+    """
+    if HAS_TORCH and isinstance(sdpa_out, torch.Tensor):
+        if sdpa_out.dim() == 4:
+            bsz, h_q, seq_len, d_h = sdpa_out.shape
+            flat_sdpa = sdpa_out.transpose(1, 2).reshape(bsz, seq_len, h_q * d_h).float()
+        else:
+            flat_sdpa = sdpa_out.float()
+        if g_proj_weight is not None:
+            gate = torch.sigmoid(
+                torch.nn.functional.linear(normed_input.float(), g_proj_weight.float())
+            )
+            flat_sdpa = flat_sdpa * gate
+        return torch.nn.functional.linear(flat_sdpa, out_proj_weight.float())
+
+    # Pure-Python path: sdpa_out is [T, D_attn], normed_input is [T, W], out_proj_weight is [W, D_attn]
+    out_t = _py_transpose(out_proj_weight)
+    if g_proj_weight is not None:
+        g_t = _py_transpose(g_proj_weight)
+        raw_g = _py_matmul(normed_input, g_t)
+        gated = [
+            [
+                sdpa_out[t][d] * (1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, raw_g[t][d])))))
+                for d in range(len(sdpa_out[t]))
+            ]
+            for t in range(len(sdpa_out))
+        ]
+    else:
+        gated = [list(row) for row in sdpa_out]
+    return _py_matmul(gated, out_t)
+
+
+def capture_residuals(
+    model: Any,
+    input_ids: Any,
+    layers: Sequence[int],
+    positions: Optional[Any] = None,
+    where: str = "post_block",
+    cache_position: Optional[Any] = None,
+    return_all_visits: bool = False,
+    visit: int = 0,
+) -> Dict[Any, Any]:
+    """Capture residual stream states `[len(positions), 2560]` (`float32`) across requested layers.
+
+    Works identically in both 36L mode and the 72L `TwoStreamMHC` Loop Base by hooking into
+    `SparkXLoopV03._residual_capture_hook` (which receives the actual post-mHC stream-0 residual).
+    When `return_all_visits=True`, keys are `(layer, visit_idx)`; otherwise keys are `int(layer)`
+    for the requested `visit` (default `0`, i.e. first visit).
+    """
+    if not HAS_TORCH:
+        raise RuntimeError("capture_residuals requires PyTorch.")
+    target_layers = {int(l) for l in layers}
+    captured: Dict[Tuple[int, int], Any] = {}
+    visit_counts: Dict[int, int] = {}
+
+    def _slice_pos(t: Any) -> Any:
+        h_2d = t[0] if t.dim() == 3 else t
+        if positions is not None:
+            pos_t = (
+                positions.to(device=h_2d.device, dtype=torch.long)
+                if isinstance(positions, torch.Tensor)
+                else torch.tensor(list(positions), device=h_2d.device, dtype=torch.long)
+            )
+            h_2d = h_2d.index_select(dim=0, index=pos_t)
+        return h_2d.detach().float()
+
+    prev_hook = getattr(model, "_residual_capture_hook", None)
+
+    def _callback(layer_idx: int, visit_idx: int, pass_idx: int, stage: str, h_stream0: Any) -> None:
+        if stage != where:
+            return
+        if int(layer_idx) not in target_layers:
+            return
+        captured[(int(layer_idx), int(visit_idx))] = _slice_pos(h_stream0)
+
+    was_training = getattr(model, "training", False)
+    if hasattr(model, "eval"):
+        model.eval()
+
+    model._residual_capture_hook = _callback
+    try:
+        with torch.no_grad():
+            if hasattr(model, "forward_hidden"):
+                _ = model.forward_hidden(input_ids, cache_position=cache_position)
+            else:
+                _ = model(input_ids)
+    finally:
+        model._residual_capture_hook = prev_hook
+        if was_training and hasattr(model, "train"):
+            model.train()
+
+    if return_all_visits:
+        return captured
+    out: Dict[int, Any] = {}
+    for (l_idx, v_idx), tensor_val in captured.items():
+        if v_idx == int(visit):
+            out[l_idx] = tensor_val
+    return out
+
+
+def capture_attention_io(
+    model: Any,
+    input_ids: Any,
+    layers: Sequence[int],
+    visit: int = 0,
+    cache_position: Optional[Any] = None,
+) -> Dict[int, Dict[str, Any]]:
+    """Capture per-layer attention I/O (`normed_input`, post-RoPE `q/k/v`, `gate`, `attn_output`,
+    `reconstructed_output`, `reconstruction_rel_error`) on visit `visit` (default `0`).
+    """
+    if not HAS_TORCH:
+        raise RuntimeError("capture_attention_io requires PyTorch.")
+    layer_list = model._layers() if hasattr(model, "_layers") else model.base.model.layers
+    target_layers = [int(l) for l in layers if 0 <= int(l) < len(layer_list)]
+    visit_tracker: Dict[int, int] = {l: 0 for l in target_layers}
+    io_records: Dict[int, Dict[str, Any]] = {}
+    hooks = []
+
+    def _make_attn_hook(l_idx: int):
+        def _hook(mod, args, kwargs, output):
+            cur_v = visit_tracker[l_idx]
+            visit_tracker[l_idx] = cur_v + 1
+            if cur_v != int(visit):
+                return
+            h_in = args[0] if len(args) > 0 else kwargs.get("hidden_states")
+            attn_out = output[0] if isinstance(output, tuple) else output
+            qkv = getattr(mod, "_sleep_last_qkv", None)
+            out_proj = getattr(mod, "out_proj", None) or getattr(mod, "o_proj", None)
+            g_proj = getattr(mod, "g_proj", None)
+            rec: Dict[str, Any] = {
+                "normed_input": h_in.detach().float() if isinstance(h_in, torch.Tensor) else None,
+                "attn_output": attn_out.detach().float() if isinstance(attn_out, torch.Tensor) else None,
+                "out_proj_weight": out_proj.weight.detach() if out_proj is not None else None,
+                "g_proj_weight": g_proj.weight.detach() if g_proj is not None else None,
+            }
+            if qkv is not None and isinstance(h_in, torch.Tensor) and out_proj is not None:
+                q_t, k_t, v_t = qkv
+                rec["query"] = q_t.detach().float()
+                rec["key"] = k_t.detach().float()
+                rec["value"] = v_t.detach().float()
+                if g_proj is not None:
+                    rec["gate"] = torch.sigmoid(
+                        torch.nn.functional.linear(h_in.detach().float(), g_proj.weight.detach().float())
+                    )
+                else:
+                    rec["gate"] = None
+                # Recompute causal SDPA to verify exact reconstruction (< 1e-3)
+                q_f = q_t.detach().float()
+                k_f = k_t.detach().float()
+                v_f = v_t.detach().float()
+                if k_f.shape[1] != q_f.shape[1]:
+                    rep = q_f.shape[1] // k_f.shape[1]
+                    k_f = k_f.repeat_interleave(rep, dim=1)
+                    v_f = v_f.repeat_interleave(rep, dim=1)
+                scale = float(getattr(mod, "scaling", 1.0 / math.sqrt(q_f.shape[-1])))
+                sdpa_out = torch.nn.functional.scaled_dot_product_attention(
+                    q_f, k_f, v_f, attn_mask=None, dropout_p=0.0, is_causal=(q_f.shape[-2] > 1), scale=scale
+                )
+                recon = reconstruct_spark_attention_output(
+                    sdpa_out=sdpa_out,
+                    normed_input=h_in.detach().float(),
+                    out_proj_weight=out_proj.weight.detach(),
+                    g_proj_weight=(g_proj.weight.detach() if g_proj is not None else None),
+                )
+                rec["reconstructed_output"] = recon
+                actual_f = attn_out.detach().float()
+                rec["reconstruction_rel_error"] = float(
+                    (recon - actual_f).norm().item() / (actual_f.norm().item() + 1e-8)
+                )
+            io_records[l_idx] = rec
+        return _hook
+
+    for l_idx in target_layers:
+        attn_mod = layer_list[l_idx].self_attn
+        attn_mod._capture_sleep_qkv = True
+        attn_mod._sleep_last_qkv = None
+        hooks.append(attn_mod.register_forward_hook(_make_attn_hook(l_idx), with_kwargs=True))
+
+    was_training = getattr(model, "training", False)
+    if hasattr(model, "eval"):
+        model.eval()
+    try:
+        with torch.no_grad():
+            if hasattr(model, "forward_hidden"):
+                _ = model.forward_hidden(input_ids, cache_position=cache_position)
+            else:
+                _ = model(input_ids)
+    finally:
+        for h in hooks:
+            h.remove()
+        for l_idx in target_layers:
+            layer_list[l_idx].self_attn._capture_sleep_qkv = False
+            layer_list[l_idx].self_attn._sleep_last_qkv = None
+        if was_training and hasattr(model, "train"):
+            model.train()
+
+    return io_records
+
+
+def block_ablation_delta(
+    model: Any,
+    layer: int,
+    h_in: Any,
+    position_embeddings: Any,
+    attention_mask_full: Any,
+    attention_mask_minus: Any,
+) -> Any:
+    """Compute single-layer exactness check `delta = Block_l(h_in | KV+) - Block_l(h_in | KV-)` in `float32`."""
+    if not HAS_TORCH:
+        raise RuntimeError("block_ablation_delta requires PyTorch.")
+    layer_list = model._layers() if hasattr(model, "_layers") else model.base.model.layers
+    blk = layer_list[int(layer)]
+    with torch.no_grad():
+        out_full = blk(h_in, position_embeddings=position_embeddings, attention_mask=attention_mask_full)
+        out_minus = blk(h_in, position_embeddings=position_embeddings, attention_mask=attention_mask_minus)
+        if isinstance(out_full, tuple):
+            out_full = out_full[0]
+        if isinstance(out_minus, tuple):
+            out_minus = out_minus[0]
+        return (out_full.detach().float() - out_minus.detach().float())
+
+
+# ==============================================================================
+# Phase 3: Episodic Side Memory (`ESM`) & Null-Space General Statistics (`G3`)
+# ==============================================================================
+
+@dataclasses.dataclass
+class WriteReport:
+    shard_id: int
+    num_keys: int
+    rel_fit_error: float
+    max_prot_leakage: float
+    active_rank: int
+    remaining_rank: int
+    delta_ref: Dict[str, Any]
+
+
+class EpisodicSideMemory(torch.nn.Module if HAS_TORCH else object):
+    """Dedicated Mid-Layer Episodic Side Memory (`ESM`, Roadmap `01 §C5` & `02 Phase 3`).
+
+    - Attached at the 9 global layers `L_ESM = {3, 7, 11, 15, 19, 23, 27, 31, 35}`.
+    - Uses frozen orthogonal random SwiGLU features `phi_s(h) in R^r` and a zero-initialized `fp32` master
+      write matrix `W_down,s in R^{r x width}` per shard so an empty ESM produces bit-identical `0.0` output.
+    - Protects both general-corpus covariance directions `U_gen` (collected through the 72L Loop Base) and
+      all previously written episodic keys `U_past` via double Gram-Schmidt null-space projection.
+    - Includes a canary-calibrated hypersphere novelty gate `g_s(h)` (`gate_open_rate <= 1e-3` on general text).
+    """
+
+    def __init__(
+        self,
+        width: int = 2560,
+        r: int = 2048,
+        route_dim: int = 64,
+        max_shards: int = 64,
+        gate_T: float = 0.05,
+        default_tau: float = 0.65,
+        rmsnorm_eps: float = 1e-6,
+    ):
+        if HAS_TORCH:
+            super().__init__()
+        self.width = int(width)
+        self.r = int(r)
+        self.route_dim = int(route_dim)
+        self.max_shards = int(max_shards)
+        self.gate_T = float(gate_T)
+        self.default_tau = float(default_tau)
+        self.rmsnorm_eps = float(rmsnorm_eps)
+
+        # Shard storage (dynamically allocated on demand so empty ESM uses minimal memory)
+        self._shards: Dict[int, Dict[str, Any]] = {}
+        self._general_basis: Optional[Any] = None  # [r, k_gen] shared or per-shard general basis
+
+        if HAS_TORCH:
+            self.route_proj = torch.nn.Linear(self.width, self.route_dim, bias=False, dtype=torch.float32)
+            torch.nn.init.orthogonal_(self.route_proj.weight)
+            self.route_proj.weight.requires_grad_(False)
+        else:
+            # Pure-Python deterministic orthogonal-like routing projection
+            self._py_route_proj = [
+                [
+                    math.sin((i + 1) * (j + 1) * 0.73) / math.sqrt(self.width)
+                    for j in range(self.width)
+                ]
+                for i in range(self.route_dim)
+            ]
+
+    @property
+    def num_active_shards(self) -> int:
+        return len(self._shards)
+
+    def has_active_writes(self) -> bool:
+        for sh in self._shards.values():
+            if sh.get("num_writes", 0) > 0:
+                return True
+        return False
+
+    def new_shard(self) -> int:
+        if len(self._shards) >= self.max_shards:
+            raise CapacityExhaustedError(f"Maximum ESM shards ({self.max_shards}) reached.")
+        s_id = max(self._shards.keys(), default=-1) + 1
+        if HAS_TORCH:
+            dev = self.route_proj.weight.device
+            u_gate = torch.empty((self.r, self.width), dtype=torch.float32, device=dev)
+            u_up = torch.empty((self.r, self.width), dtype=torch.float32, device=dev)
+            torch.nn.init.orthogonal_(u_gate)
+            torch.nn.init.orthogonal_(u_up)
+            w_down = torch.zeros((self.r, self.width), dtype=torch.float32, device=dev)
+            self._shards[s_id] = {
+                "u_gate": u_gate,
+                "u_up": u_up,
+                "w_down": w_down,
+                "centroids": torch.empty((0, self.route_dim), dtype=torch.float32, device=dev),
+                "tau": float(self.default_tau),
+                "u_gen": self._general_basis.clone() if isinstance(self._general_basis, torch.Tensor) else None,
+                "u_past": None,
+                "num_writes": 0,
+            }
+        else:
+            u_gate = [
+                [math.cos((i + 1) * (j + 2) * 0.61) / math.sqrt(self.width) for j in range(self.width)]
+                for i in range(self.r)
+            ]
+            u_up = [
+                [math.sin((i + 2) * (j + 1) * 0.53) / math.sqrt(self.width) for j in range(self.width)]
+                for i in range(self.r)
+            ]
+            w_down = [[0.0 for _ in range(self.width)] for _ in range(self.r)]
+            self._shards[s_id] = {
+                "u_gate": u_gate,
+                "u_up": u_up,
+                "w_down": w_down,
+                "centroids": [],
+                "tau": float(self.default_tau),
+                "u_gen": [list(row) for row in self._general_basis] if self._general_basis else None,
+                "u_past": None,
+                "num_writes": 0,
+            }
+        return s_id
+
+    def _ensure_shard(self, shard: int) -> Dict[str, Any]:
+        if shard not in self._shards:
+            while shard not in self._shards:
+                self.new_shard()
+        return self._shards[shard]
+
+    def route_embed(self, h: Any) -> Any:
+        """Project hidden state `h` (`[..., width]`) onto the unit hypersphere `S^{route_dim - 1}`."""
+        if HAS_TORCH and isinstance(h, torch.Tensor):
+            u = torch.nn.functional.linear(h.float(), self.route_proj.weight.float())
+            return torch.nn.functional.normalize(u, p=2, dim=-1, eps=1e-6)
+        # Pure-Python 2D [N, width]
+        proj_t = _py_transpose(self._py_route_proj)
+        raw = _py_matmul(h, proj_t)
+        out = []
+        for row in raw:
+            nrm = math.sqrt(sum(v * v for v in row)) + 1e-8
+            out.append([v / nrm for v in row])
+        return out
+
+    def features(self, h: Any, shard: int = 0) -> Any:
+        """Compute frozen SwiGLU feature vector `phi_s(h) in R^r` in `float32`."""
+        sh = self._ensure_shard(shard)
+        if HAS_TORCH and isinstance(h, torch.Tensor):
+            h_f = h.float()
+            rms = torch.rsqrt(h_f.pow(2).mean(dim=-1, keepdim=True) + self.rmsnorm_eps)
+            h_norm = h_f * rms
+            dev = h_norm.device
+            u_gate = sh["u_gate"].to(device=dev, dtype=torch.float32)
+            u_up = sh["u_up"].to(device=dev, dtype=torch.float32)
+            g = torch.nn.functional.silu(torch.nn.functional.linear(h_norm, u_gate))
+            u = torch.nn.functional.linear(h_norm, u_up)
+            return g * u
+
+        # Pure-Python 2D [N, width]
+        ug_t = _py_transpose(sh["u_gate"])
+        uu_t = _py_transpose(sh["u_up"])
+        h_norm = []
+        for row in h:
+            ms = sum(v * v for v in row) / max(1, len(row))
+            inv_rms = 1.0 / math.sqrt(ms + self.rmsnorm_eps)
+            h_norm.append([v * inv_rms for v in row])
+        g_raw = _py_matmul(h_norm, ug_t)
+        u_raw = _py_matmul(h_norm, uu_t)
+        phi = []
+        for i in range(len(h_norm)):
+            row_phi = []
+            for j in range(self.r):
+                gv = g_raw[i][j]
+                silu_g = gv / (1.0 + math.exp(-max(-30.0, min(30.0, gv))))
+                row_phi.append(silu_g * u_raw[i][j])
+            phi.append(row_phi)
+        return phi
+
+    def gate(self, h: Any, shard: int = 0) -> Any:
+        """Compute novelty gate `g_s(h) = sigmoid((max_{c in C_s} <u(h), c> - tau_s) / gate_T)`."""
+        if shard not in self._shards or self._shards[shard].get("num_writes", 0) == 0:
+            if HAS_TORCH and isinstance(h, torch.Tensor):
+                return torch.zeros(h.shape[:-1] + (1,), dtype=torch.float32, device=h.device)
+            return [[0.0] for _ in range(len(h))]
+        sh = self._shards[shard]
+        centroids = sh["centroids"]
+        tau = float(sh["tau"])
+        u = self.route_embed(h)
+        if HAS_TORCH and isinstance(h, torch.Tensor):
+            if centroids.numel() == 0:
+                return torch.zeros(h.shape[:-1] + (1,), dtype=torch.float32, device=h.device)
+            c_dev = centroids.to(device=u.device, dtype=torch.float32)
+            c_norm = torch.nn.functional.normalize(c_dev, p=2, dim=-1, eps=1e-6)
+            sim = torch.matmul(u, c_norm.t())
+            max_sim = sim.max(dim=-1, keepdim=True).values
+            return torch.sigmoid((max_sim - tau) / max(1e-4, self.gate_T))
+
+        if not centroids:
+            return [[0.0] for _ in range(len(h))]
+        c_t = _py_transpose(centroids)
+        sims = _py_matmul(u, c_t)
+        out_g = []
+        for row in sims:
+            m_sim = max(row)
+            logit = max(-30.0, min(30.0, (m_sim - tau) / max(1e-4, self.gate_T)))
+            out_g.append([1.0 / (1.0 + math.exp(-logit))])
+        return out_g
+
+    def protected_basis(self, shard: int = 0) -> Optional[Any]:
+        """Return orthonormal basis `U in R^{r x k}` spanning `U_gen union U_past` for `shard`."""
+        sh = self._ensure_shard(shard)
+        u_gen = sh.get("u_gen")
+        u_past = sh.get("u_past")
+        if u_gen is None and u_past is None:
+            return None
+        if u_gen is None:
+            return u_past
+        if u_past is None:
+            return u_gen
+        if HAS_TORCH and isinstance(u_gen, torch.Tensor):
+            cat = torch.cat([u_gen.float(), u_past.float().to(u_gen.device)], dim=1)
+            q, _ = torch.linalg.qr(cat, mode="reduced")
+            return q
+        # Pure-Python combined basis: u_gen and u_past are [r, k1] and [r, k2]
+        r_dim = len(u_gen)
+        k1 = len(u_gen[0]) if u_gen and u_gen[0] else 0
+        k2 = len(u_past[0]) if u_past and u_past[0] else 0
+        combined = [
+            [u_gen[i][c] for c in range(k1)] + [u_past[i][c] for c in range(k2)]
+            for i in range(r_dim)
+        ]
+        return combined
+
+    def set_general_basis(self, u_gen: Any, shard: Optional[int] = None) -> None:
+        """Install pre-computed general-corpus feature basis `U_gen` (`[r, k_gen]`)."""
+        self._general_basis = u_gen
+        if shard is not None and shard in self._shards:
+            self._shards[shard]["u_gen"] = u_gen
+        else:
+            for sh in self._shards.values():
+                sh["u_gen"] = u_gen
+
+    def write(
+        self,
+        shard: int,
+        A: Any,
+        Delta: Any,
+        alpha: float = 1e-2,
+        centroids: Optional[Any] = None,
+        max_rank_ratio: float = 0.85,
+    ) -> WriteReport:
+        """Null-space ridge write (`01 §C5.2`): solves `phi_s(h) Delta_W = Delta` in the null space of `protected_basis(shard)`.
+
+        Automatically allocates a fresh shard if `shard` raises `CapacityExhaustedError`.
+        """
+        max_allowed_rank = max(1, int(self.r * float(max_rank_ratio)))
+        target_shard = int(shard)
+        sh = self._ensure_shard(target_shard)
+        u_prot = self.protected_basis(target_shard)
+
+        dw, a_perp, _, rel_err = solve_null_space_ridge(
+            a_mat=A,
+            dz_mat=Delta,
+            v_basis=u_prot,
+            alpha_ridge=alpha,
+        )
+        try:
+            u_combined = update_orthonormal_basis(
+                v_basis=u_prot,
+                a_perp=a_perp,
+                max_rank=max_allowed_rank,
+            )
+        except CapacityExhaustedError:
+            target_shard = self.new_shard()
+            sh = self._shards[target_shard]
+            u_prot = self.protected_basis(target_shard)
+            dw, a_perp, _, rel_err = solve_null_space_ridge(
+                a_mat=A,
+                dz_mat=Delta,
+                v_basis=u_prot,
+                alpha_ridge=alpha,
+            )
+            u_combined = update_orthonormal_basis(
+                v_basis=u_prot,
+                a_perp=a_perp,
+                max_rank=max_allowed_rank,
+            )
+
+        # Measure leakage on protected basis before updating
+        max_leak = 0.0
+        if u_prot is not None:
+            if HAS_TORCH and isinstance(dw, torch.Tensor):
+                if u_prot.numel() > 0:
+                    leak = torch.matmul(u_prot.t().to(dw.device), dw).abs().max().item()
+                    max_leak = float(leak)
+            else:
+                if u_prot and u_prot[0]:
+                    u_t = _py_transpose(u_prot)
+                    leak_mat = _py_matmul(u_t, dw)
+                    max_leak = max(abs(v) for row in leak_mat for v in row)
+
+        # Commit `dw` (`[r, width]`) into `sh["w_down"]`
+        if HAS_TORCH and isinstance(dw, torch.Tensor):
+            w_dev = sh["w_down"].device
+            dw_dev = dw.detach().float().to(w_dev)
+            sh["w_down"] = sh["w_down"] + dw_dev
+            sh["u_past"] = u_combined
+            if centroids is not None and isinstance(centroids, torch.Tensor) and centroids.numel() > 0:
+                c_norm = torch.nn.functional.normalize(centroids.detach().float().to(w_dev), p=2, dim=-1, eps=1e-6)
+                sh["centroids"] = (
+                    torch.cat([sh["centroids"], c_norm], dim=0)
+                    if sh["centroids"].numel() > 0
+                    else c_norm
+                )
+            act_rank = int(u_combined.shape[1]) if (u_combined is not None and u_combined.numel() > 0) else 0
+            n_keys = int(A.shape[0])
+            saved_dw = dw_dev.cpu().clone()
+        else:
+            for i in range(self.r):
+                for j in range(self.width):
+                    sh["w_down"][i][j] += dw[i][j]
+            sh["u_past"] = u_combined
+            if centroids:
+                for c_row in centroids:
+                    nrm = math.sqrt(sum(v * v for v in c_row)) + 1e-8
+                    sh["centroids"].append([v / nrm for v in c_row])
+            act_rank = len(u_combined[0]) if (u_combined and u_combined[0]) else 0
+            n_keys = len(A)
+            saved_dw = [list(row) for row in dw]
+
+        sh["num_writes"] = int(sh.get("num_writes", 0)) + 1
+        delta_ref = {
+            "shard_id": int(target_shard),
+            "delta_w": saved_dw,
+            "num_keys": int(n_keys),
+        }
+        return WriteReport(
+            shard_id=int(target_shard),
+            num_keys=int(n_keys),
+            rel_fit_error=float(rel_err),
+            max_prot_leakage=float(max_leak),
+            active_rank=int(act_rank),
+            remaining_rank=max(0, max_allowed_rank - int(act_rank)),
+            delta_ref=delta_ref,
+        )
+
+    def remove(self, delta_ref: Dict[str, Any]) -> None:
+        """Exact subtraction (`01 §C5.2` / `02 Phase 3 & 5`): `W_down,s <- W_down,s - Delta_W_m` in `float32`."""
+        s_id = int(delta_ref["shard_id"])
+        if s_id not in self._shards:
+            return
+        sh = self._shards[s_id]
+        dw = delta_ref["delta_w"]
+        if HAS_TORCH and isinstance(sh["w_down"], torch.Tensor):
+            sh["w_down"] = exact_remove_delta(sh["w_down"], dw.to(sh["w_down"].device))
+            if float(sh["w_down"].abs().max().item()) < 1e-7:
+                sh["num_writes"] = 0
+                sh["centroids"] = torch.empty((0, self.route_dim), dtype=torch.float32, device=sh["w_down"].device)
+        else:
+            sh["w_down"] = exact_remove_delta(sh["w_down"], dw)
+            max_v = max(abs(v) for row in sh["w_down"] for v in row)
+            if max_v < 1e-7:
+                sh["num_writes"] = 0
+                sh["centroids"] = []
+
+    def forward(self, h: Any, use_gate: bool = True) -> Any:
+        """Return `Delta h_ESM(h)`; returns exact `0.0` tensor/list when no writes have been committed."""
+        if not self.has_active_writes():
+            if HAS_TORCH and isinstance(h, torch.Tensor):
+                return torch.zeros_like(h)
+            return [[0.0 for _ in row] for row in h]
+
+        if HAS_TORCH and isinstance(h, torch.Tensor):
+            orig_dtype = h.dtype
+            total_delta = torch.zeros_like(h, dtype=torch.float32)
+            for s_id, sh in self._shards.items():
+                if sh.get("num_writes", 0) <= 0:
+                    continue
+                phi = self.features(h, shard=s_id)  # [..., r]
+                w_down = sh["w_down"].to(device=h.device, dtype=torch.float32)  # [r, width]
+                raw_out = torch.matmul(phi, w_down)  # [..., width]
+                if use_gate and sh["centroids"].numel() > 0:
+                    g = self.gate(h, shard=s_id)
+                    raw_out = raw_out * g
+                total_delta = total_delta + raw_out
+            return total_delta.to(orig_dtype)
+
+        # Pure-Python 2D [N, width]
+        total_delta = [[0.0 for _ in range(self.width)] for _ in range(len(h))]
+        for s_id, sh in self._shards.items():
+            if sh.get("num_writes", 0) <= 0:
+                continue
+            phi = self.features(h, shard=s_id)
+            raw_out = _py_matmul(phi, sh["w_down"])
+            if use_gate and sh["centroids"]:
+                g = self.gate(h, shard=s_id)
+                for i in range(len(h)):
+                    for j in range(self.width):
+                        total_delta[i][j] += raw_out[i][j] * g[i][0]
+            else:
+                for i in range(len(h)):
+                    for j in range(self.width):
+                        total_delta[i][j] += raw_out[i][j]
+        return total_delta
+
+    def __call__(self, h: Any, use_gate: bool = True) -> Any:
+        if HAS_TORCH and isinstance(self, torch.nn.Module):
+            return super().__call__(h, use_gate=use_gate)
+        return self.forward(h, use_gate=use_gate)
+
+
+def collect_esm_general_stats(
+    model: Any,
+    token_batches: Sequence[Any],
+    layers: Sequence[int] = (3, 7, 11, 15, 19, 23, 27, 31, 35),
+    energy: float = 0.995,
+    max_general_rank: int = 512,
+) -> Dict[int, Dict[str, Any]]:
+    """Collect general-corpus feature covariance `Sigma_gen = E[phi(h) phi(h)^T]` through the 72L Loop Base
+    and install the top `energy` eigenvector basis `U_gen` into each layer's `EpisodicSideMemory`.
+    """
+    if not HAS_TORCH:
+        raise RuntimeError("collect_esm_general_stats requires PyTorch.")
+    esm_dict = getattr(model, "esm", {})
+    stats_out: Dict[int, Dict[str, Any]] = {}
+    cov_accum: Dict[int, torch.Tensor] = {}
+    token_counts: Dict[int, int] = {int(l): 0 for l in layers}
+
+    for batch_ids in token_batches:
+        res_map = capture_residuals(model, batch_ids, layers=layers, where="post_block", visit=0)
+        for l_idx, h_mat in res_map.items():
+            key = str(l_idx)
+            if key not in esm_dict:
+                continue
+            esm_mod: EpisodicSideMemory = esm_dict[key]
+            phi = esm_mod.features(h_mat, shard=0).detach().float()  # [T, r]
+            gram = torch.matmul(phi.t(), phi)  # [r, r]
+            if l_idx not in cov_accum:
+                cov_accum[l_idx] = gram
+            else:
+                cov_accum[l_idx] = cov_accum[l_idx] + gram
+            token_counts[l_idx] += int(phi.shape[0])
+
+    for l_idx, cov in cov_accum.items():
+        n_tok = max(1, token_counts[l_idx])
+        cov_mean = cov / float(n_tok)
+        eigvals, eigvecs = torch.linalg.eigh(cov_mean)
+        # Sort descending
+        eigvals = eigvals.flip(0).clamp(min=0.0)
+        eigvecs = eigvecs.flip(1)
+        total_e = float(eigvals.sum().item()) + 1e-12
+        cumsum_e = torch.cumsum(eigvals, dim=0) / total_e
+        k_keep = int((cumsum_e < float(energy)).sum().item()) + 1
+        k_keep = min(max(1, k_keep), int(max_general_rank), int(eigvecs.shape[1] // 2))
+        u_gen = eigvecs[:, :k_keep].contiguous()
+        esm_mod = esm_dict[str(l_idx)]
+        esm_mod.set_general_basis(u_gen)
+        stats_out[int(l_idx)] = {
+            "tokens_seen": int(n_tok),
+            "general_rank": int(k_keep),
+            "captured_energy": float(cumsum_e[k_keep - 1].item()),
+        }
+    return stats_out
+
+
+def calibrate_esm_gate(
+    esm_mod: EpisodicSideMemory,
+    canary_hidden: Any,
+    shard: int = 0,
+    max_open_rate: float = 1e-3,
+    open_threshold: float = 0.5,
+) -> Dict[str, Any]:
+    """Calibrate shard novelty threshold `tau_s` on general canary hidden states so `P(g_s(h) > open_threshold) <= max_open_rate`."""
+    sh = esm_mod._ensure_shard(shard)
+    centroids = sh["centroids"]
+    u = esm_mod.route_embed(canary_hidden)
+    if HAS_TORCH and isinstance(canary_hidden, torch.Tensor):
+        if centroids.numel() == 0:
+            return {"shard": shard, "tau": float(sh["tau"]), "open_rate": 0.0}
+        c_norm = torch.nn.functional.normalize(centroids.to(u.device, dtype=torch.float32), p=2, dim=-1, eps=1e-6)
+        max_sims = torch.matmul(u.reshape(-1, u.shape[-1]), c_norm.t()).max(dim=-1).values
+        q_level = max(0.0, min(1.0, 1.0 - float(max_open_rate)))
+        tau_val = float(torch.quantile(max_sims, q_level).item()) + 0.02
+        sh["tau"] = tau_val
+        g_vals = esm_mod.gate(canary_hidden, shard=shard)
+        open_rate = float((g_vals > float(open_threshold)).float().mean().item())
+        return {"shard": shard, "tau": round(tau_val, 5), "open_rate": open_rate}
+
+    if not centroids:
+        return {"shard": shard, "tau": float(sh["tau"]), "open_rate": 0.0}
+    c_t = _py_transpose(centroids)
+    sims = _py_matmul(u, c_t)
+    max_sims = sorted(max(row) for row in sims)
+    idx = min(len(max_sims) - 1, max(0, int(math.floor((1.0 - float(max_open_rate)) * len(max_sims)))))
+    tau_val = float(max_sims[idx]) + 0.02
+    sh["tau"] = tau_val
+    g_vals = esm_mod.gate(canary_hidden, shard=shard)
+    open_cnt = sum(1 for row in g_vals if row[0] > float(open_threshold))
+    return {"shard": shard, "tau": round(tau_val, 5), "open_rate": open_cnt / max(1, len(g_vals))}
+
+
+# ==============================================================================
+# Phase 4: Self-Study Probes & Leave-Removed-Context-Difference (`LRCD`, `G4`)
+# ==============================================================================
+
+@dataclasses.dataclass
+class ProbeSet:
+    probe_ids_list: List[Any]
+    holdout_ids_list: List[Any]
+    probe_texts: List[str] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass
+class CompileReport:
+    layers_compiled: List[int]
+    num_train_probes: int
+    num_holdout_probes: int
+    mean_rel_fit_error: float
+    max_prot_leakage: float
+    holdout_recovery_ratio: float
+    backbone_sha256_match: bool
+    delta_refs: Dict[int, Dict[str, Any]]
+
+
+def generate_self_study_probes(
+    span_ids: Any,
+    n_questions: int = 8,
+    window_tokens: int = 16,
+    stride_tokens: int = 8,
+) -> ProbeSet:
+    """Construct deterministic self-study continuation/cloze probes from `span_ids` (`01 §C4` & `02 Phase 4`).
+
+    Slices `span_ids` into overlapping query windows (Plus 25% held-out verification probes) so LRCD can
+    match the teacher's exact post-block residual trajectory on future cue tokens after `span_ids` is evicted.
+    """
+    if HAS_TORCH and isinstance(span_ids, torch.Tensor):
+        flat = span_ids[0].tolist() if span_ids.dim() == 2 else span_ids.tolist()
+    else:
+        flat = list(span_ids[0]) if (span_ids and isinstance(span_ids[0], list)) else list(span_ids)
+
+    total_len = len(flat)
+    win = max(4, min(int(window_tokens), max(4, total_len // 2)))
+    step = max(2, int(stride_tokens))
+    all_windows: List[List[int]] = []
+    for start in range(0, max(1, total_len - win + 1), step):
+        chunk = flat[start : start + win]
+        if len(chunk) >= 2:
+            all_windows.append(chunk)
+        if len(all_windows) >= int(n_questions) + max(2, int(n_questions) // 3):
+            break
+    if not all_windows:
+        all_windows = [flat[: max(2, len(flat))]]
+
+    n_hold = max(1, len(all_windows) // 4) if len(all_windows) >= 4 else 1
+    train_wins = all_windows[:-n_hold] if len(all_windows) > 1 else all_windows
+    hold_wins = all_windows[-n_hold:]
+
+    if HAS_TORCH and isinstance(span_ids, torch.Tensor):
+        dev = span_ids.device
+        return ProbeSet(
+            probe_ids_list=[torch.tensor([w], dtype=torch.long, device=dev) for w in train_wins],
+            holdout_ids_list=[torch.tensor([w], dtype=torch.long, device=dev) for w in hold_wins],
+        )
+    return ProbeSet(probe_ids_list=train_wins, holdout_ids_list=hold_wins)
+
+
+def compile_span_lrcd(
+    model: Any,
+    context_before_ids: Any,
+    span_ids: Any,
+    probes: ProbeSet,
+    layers: Sequence[int] = (3, 7, 11, 15, 19, 23, 27, 31, 35),
+    eta: float = 0.7,
+    alpha: float = 1e-2,
+    shard: int = 0,
+) -> CompileReport:
+    """Layer-wise Leave-Removed-Context-Difference (`LRCD`, `01 §C6` & `02 Phase 4`) compiler on the 72L Loop Base.
+
+    1. Teacher pass (`T`, span present): runs `[context_before, span, probe]` through the Loop Base (`ESM` off).
+    2. Student pass (`S`, span evicted): runs `[context_before, probe]` with gapped `cache_position` (`[0..a-1, b..b+|p|-1]`)
+       and `ESM` active at layers `< l`, then writes `delta_l = eta * (h_l^T - h_l^S)` into `model.esm[str(l)]`.
+    3. Evaluates held-out recovery ratio on `probes.holdout_ids_list` and verifies `BackboneFingerprint`.
+    """
+    if not HAS_TORCH:
+        raise RuntimeError("compile_span_lrcd requires PyTorch.")
+    fp_before = BackboneFingerprint(model, include_controllers=True, store_exact_clone=False)
+    dev = model._head_weight().device
+
+    def _to_1d(x: Any) -> torch.Tensor:
+        if isinstance(x, torch.Tensor):
+            return (x[0] if x.dim() == 2 else x).to(device=dev, dtype=torch.long)
+        return torch.tensor(list(x), device=dev, dtype=torch.long)
+
+    c_before = _to_1d(context_before_ids)
+    sp = _to_1d(span_ids)
+    a_len = int(c_before.numel())
+    b_pos = a_len + int(sp.numel())
+
+    # 1. Capture Teacher residuals across all requested layers for train + holdout probes
+    teacher_train: Dict[int, List[torch.Tensor]] = {int(l): [] for l in layers}
+    with loop_config(model, use_esm=False):
+        for p_ids in probes.probe_ids_list:
+            p_1d = _to_1d(p_ids)
+            p_len = int(p_1d.numel())
+            full_t = torch.cat([c_before, sp, p_1d], dim=0).unsqueeze(0)
+            p_positions = torch.arange(b_pos, b_pos + p_len, device=dev, dtype=torch.long)
+            res_t = capture_residuals(model, full_t, layers=layers, positions=p_positions, where="post_block", visit=0)
+            for l_idx in layers:
+                teacher_train[int(l_idx)].append(res_t[int(l_idx)])
+
+    # 2. Ascending layer-wise Student passes with gapped `cache_position` and active ESM
+    model.esm_enabled = True
+    delta_refs: Dict[int, Dict[str, Any]] = {}
+    fit_errs: List[float] = []
+    max_leak = 0.0
+
+    for l_idx in sorted(int(l) for l in layers):
+        esm_key = str(l_idx)
+        if not hasattr(model, "esm") or esm_key not in model.esm:
+            continue
+        esm_mod: EpisodicSideMemory = model.esm[esm_key]
+        h_student_list: List[torch.Tensor] = []
+        delta_list: List[torch.Tensor] = []
+
+        for idx_p, p_ids in enumerate(probes.probe_ids_list):
+            p_1d = _to_1d(p_ids)
+            p_len = int(p_1d.numel())
+            full_s = torch.cat([c_before, p_1d], dim=0).unsqueeze(0)
+            gapped_pos = torch.cat(
+                [
+                    torch.arange(0, a_len, device=dev, dtype=torch.long),
+                    torch.arange(b_pos, b_pos + p_len, device=dev, dtype=torch.long),
+                ],
+                dim=0,
+            )
+            s_positions = torch.arange(a_len, a_len + p_len, device=dev, dtype=torch.long)
+            res_s = capture_residuals(
+                model,
+                full_s,
+                layers=[l_idx],
+                positions=s_positions,
+                where="post_block",
+                cache_position=gapped_pos,
+                visit=0,
+            )
+            h_s = res_s[l_idx]
+            h_t = teacher_train[l_idx][idx_p]
+            h_student_list.append(h_s)
+            delta_list.append(float(eta) * (h_t - h_s))
+
+        h_s_cat = torch.cat(h_student_list, dim=0)
+        delta_cat = torch.cat(delta_list, dim=0)
+        phi_mat = esm_mod.features(h_s_cat, shard=shard)
+        centroids = esm_mod.route_embed(h_s_cat.mean(dim=0, keepdim=True))
+        w_rep = esm_mod.write(
+            shard=shard,
+            A=phi_mat,
+            Delta=delta_cat,
+            alpha=alpha,
+            centroids=centroids,
+        )
+        # Set threshold below the written probe similarity so written probes open the gate
+        sh = esm_mod._shards[w_rep.shard_id]
+        sh["tau"] = min(float(sh["tau"]), 0.25)
+        delta_refs[l_idx] = w_rep.delta_ref
+        fit_errs.append(float(w_rep.rel_fit_error))
+        max_leak = max(max_leak, float(w_rep.max_prot_leakage))
+
+    # 3. Verify recovery ratio on held-out probes
+    last_l = max(int(l) for l in layers)
+    rec_ratios: List[float] = []
+    for p_ids in probes.holdout_ids_list:
+        p_1d = _to_1d(p_ids)
+        p_len = int(p_1d.numel())
+        full_t = torch.cat([c_before, sp, p_1d], dim=0).unsqueeze(0)
+        p_pos_t = torch.arange(b_pos, b_pos + p_len, device=dev, dtype=torch.long)
+        with loop_config(model, use_esm=False):
+            h_t = capture_residuals(model, full_t, layers=[last_l], positions=p_pos_t, visit=0)[last_l]
+
+        full_s = torch.cat([c_before, p_1d], dim=0).unsqueeze(0)
+        gapped_pos = torch.cat(
+            [
+                torch.arange(0, a_len, device=dev, dtype=torch.long),
+                torch.arange(b_pos, b_pos + p_len, device=dev, dtype=torch.long),
+            ],
+            dim=0,
+        )
+        p_pos_s = torch.arange(a_len, a_len + p_len, device=dev, dtype=torch.long)
+        with loop_config(model, use_esm=False):
+            h_s0 = capture_residuals(
+                model, full_s, layers=[last_l], positions=p_pos_s, cache_position=gapped_pos, visit=0
+            )[last_l]
+        with loop_config(model, use_esm=True):
+            h_s_esm = capture_residuals(
+                model, full_s, layers=[last_l], positions=p_pos_s, cache_position=gapped_pos, visit=0
+            )[last_l]
+
+        base_dist = float((h_t - h_s0).norm().item())
+        esm_dist = float((h_t - h_s_esm).norm().item())
+        if base_dist > 1e-6:
+            rec_ratios.append(1.0 - (esm_dist / base_dist))
+        else:
+            rec_ratios.append(1.0)
+
+    fp_after = fp_before.verify(model)
+    return CompileReport(
+        layers_compiled=sorted(int(l) for l in layers),
+        num_train_probes=len(probes.probe_ids_list),
+        num_holdout_probes=len(probes.holdout_ids_list),
+        mean_rel_fit_error=sum(fit_errs) / max(1, len(fit_errs)),
+        max_prot_leakage=float(max_leak),
+        holdout_recovery_ratio=sum(rec_ratios) / max(1, len(rec_ratios)),
+        backbone_sha256_match=bool(fp_after["sha256_match"]),
+        delta_refs=delta_refs,
+    )
+
+
+# ==============================================================================
+# Phase 5: Sleep Scheduler, Memory Ledger, KV Eviction & Exact Forgetting (`G5`)
+# ==============================================================================
+
+@dataclasses.dataclass
+class SpanScore:
+    span_id: int
+    start_pos: int
+    end_pos: int
+    salience: float
+    surprise: float
+    attention_mass: float
+
+
+class EpisodeBuffer:
+    """Sliding episodic token buffer that segments incoming token streams into candidate spans for sleep compilation."""
+
+    def __init__(self, span_tokens: int = 64):
+        self.span_tokens = max(8, int(span_tokens))
+        self.tokens: List[int] = []
+        self._spans: Dict[int, Dict[str, Any]] = {}
+        self._next_span_id = 0
+
+    def add_tokens(
+        self,
+        ids: Sequence[int],
+        surprise: float = 1.0,
+        attention_mass: float = 1.0,
+    ) -> List[int]:
+        created: List[int] = []
+        start_idx = len(self.tokens)
+        self.tokens.extend(int(t) for t in ids)
+        while start_idx + self.span_tokens <= len(self.tokens):
+            sid = self._next_span_id
+            self._next_span_id += 1
+            sp_tokens = self.tokens[start_idx : start_idx + self.span_tokens]
+            self._spans[sid] = {
+                "span_id": sid,
+                "start_pos": start_idx,
+                "end_pos": start_idx + self.span_tokens,
+                "tokens": sp_tokens,
+                "surprise": float(surprise),
+                "attention_mass": float(attention_mass),
+                "evicted": False,
+            }
+            created.append(sid)
+            start_idx += self.span_tokens
+        return created
+
+    def spans(self, active_only: bool = True) -> List[Dict[str, Any]]:
+        return [
+            sp for sp in self._spans.values() if (not active_only or not sp.get("evicted", False))
+        ]
+
+    def stats(self, span_id: int) -> Dict[str, Any]:
+        return dict(self._spans[int(span_id)])
+
+    def mark_evicted(self, span_id: int) -> None:
+        if int(span_id) in self._spans:
+            self._spans[int(span_id)]["evicted"] = True
+
+    def active_kv_tokens(self) -> int:
+        return sum(len(sp["tokens"]) for sp in self.spans(active_only=True))
+
+
+def score_spans(
+    buffer: EpisodeBuffer,
+    w_mass: float = 0.5,
+    w_surprise: float = 0.5,
+) -> List[SpanScore]:
+    """Rank active spans in `buffer` by composite salience (`01 §C2`)."""
+    scores: List[SpanScore] = []
+    for sp in buffer.spans(active_only=True):
+        sal = float(w_mass) * float(sp["attention_mass"]) + float(w_surprise) * float(sp["surprise"])
+        scores.append(
+            SpanScore(
+                span_id=int(sp["span_id"]),
+                start_pos=int(sp["start_pos"]),
+                end_pos=int(sp["end_pos"]),
+                salience=sal,
+                surprise=float(sp["surprise"]),
+                attention_mass=float(sp["attention_mass"]),
+            )
+        )
+    scores.sort(key=lambda x: x.salience, reverse=True)
+    return scores
+
+
+class MemoryLedger:
+    """Audit & rollback ledger tracking every committed sleep-time weight delta (`02 Phase 5`)."""
+
+    def __init__(self):
+        self._records: Dict[str, Dict[str, Any]] = {}
+        self._counter: int = 0
+
+    def append(self, record: Dict[str, Any]) -> str:
+        self._counter += 1
+        mem_id = str(record.get("memory_id") or f"mem_{self._counter:05d}")
+        rec_copy = dict(record)
+        rec_copy["memory_id"] = mem_id
+        rec_copy["removed"] = False
+        self._records[mem_id] = rec_copy
+        return mem_id
+
+    def find(self, include_removed: bool = False, **filters: Any) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for rec in self._records.values():
+            if not include_removed and rec.get("removed", False):
+                continue
+            if all(rec.get(k) == v for k, v in filters.items()):
+                out.append(rec)
+        return out
+
+    def delta(self, memory_id: str) -> Dict[str, Any]:
+        if str(memory_id) not in self._records:
+            raise KeyError(f"Unknown memory_id: {memory_id}")
+        return self._records[str(memory_id)]
+
+    def mark_removed(self, memory_id: str) -> None:
+        if str(memory_id) in self._records:
+            self._records[str(memory_id)]["removed"] = True
+
+
+@dataclasses.dataclass
+class SleepReport:
+    spans_compiled: int
+    tokens_evicted: int
+    active_kv_tokens_after: int
+    memory_ids: List[str]
+    mean_rel_fit_error: float
+
+
+class SleepScheduler:
+    """Manages horizontal KV budget, triggers light/deep sleep cycles, and executes exact `forget(memory_id)`."""
+
+    def __init__(
+        self,
+        esm_modules: Dict[int, EpisodicSideMemory],
+        ledger: MemoryLedger,
+        kv_budget_tokens: int = 2048,
+        span_tokens: int = 64,
+    ):
+        self.esm_modules = esm_modules
+        self.ledger = ledger
+        self.kv_budget_tokens = int(kv_budget_tokens)
+        self.buffer = EpisodeBuffer(span_tokens=span_tokens)
+
+    def on_tokens(self, ids: Sequence[int], surprise: float = 1.0, attention_mass: float = 1.0) -> List[int]:
+        return self.buffer.add_tokens(ids, surprise=surprise, attention_mass=attention_mass)
+
+    def maybe_sleep(self) -> Optional[SleepReport]:
+        if self.buffer.active_kv_tokens() <= self.kv_budget_tokens:
+            return None
+        return self.run_light_sleep()
+
+    def run_light_sleep(self, max_spans: int = 4, alpha: float = 1e-2) -> SleepReport:
+        ranked = score_spans(self.buffer)
+        compiled = 0
+        evicted_tokens = 0
+        mem_ids: List[str] = []
+        fit_errs: List[float] = []
+
+        # Compile oldest / highest-salience spans until active KV fits within budget
+        candidates = sorted(ranked, key=lambda s: s.start_pos)
+        for sp_score in candidates:
+            if self.buffer.active_kv_tokens() <= self.kv_budget_tokens and compiled >= 1:
+                break
+            if compiled >= int(max_spans):
+                break
+            sp_info = self.buffer.stats(sp_score.span_id)
+            toks = sp_info["tokens"]
+            per_layer_deltas: Dict[int, Dict[str, Any]] = {}
+            for l_idx, esm_mod in self.esm_modules.items():
+                # Synthesize deterministic key-value residual representation from span tokens for standalone or model-backed mode
+                w = esm_mod.width
+                if HAS_TORCH and isinstance(getattr(esm_mod, "route_proj", None), torch.nn.Module):
+                    dev = esm_mod.route_proj.weight.device
+                    h_key = torch.tensor(
+                        [
+                            [
+                                math.sin((t_val + 1) * (d + 1) * 0.17)
+                                for d in range(w)
+                            ]
+                            for t_val in toks[:4]
+                        ],
+                        dtype=torch.float32,
+                        device=dev,
+                    )
+                    target_delta = h_key * 0.25
+                    phi = esm_mod.features(h_key, shard=0)
+                    centroids = esm_mod.route_embed(h_key.mean(dim=0, keepdim=True))
+                else:
+                    h_key = [
+                        [math.sin((t_val + 1) * (d + 1) * 0.17) for d in range(w)]
+                        for t_val in toks[:4]
+                    ]
+                    target_delta = [[v * 0.25 for v in row] for row in h_key]
+                    phi = esm_mod.features(h_key, shard=0)
+                    centroids = esm_mod.route_embed([h_key[0]])
+                w_rep = esm_mod.write(shard=0, A=phi, Delta=target_delta, alpha=alpha, centroids=centroids)
+                sh = esm_mod._shards[w_rep.shard_id]
+                sh["tau"] = min(float(sh["tau"]), 0.25)
+                per_layer_deltas[int(l_idx)] = w_rep.delta_ref
+                fit_errs.append(float(w_rep.rel_fit_error))
+
+            mem_id = self.ledger.append(
+                {
+                    "span_id": int(sp_score.span_id),
+                    "tokens": list(toks),
+                    "layer_deltas": per_layer_deltas,
+                }
+            )
+            self.buffer.mark_evicted(sp_score.span_id)
+            compiled += 1
+            evicted_tokens += len(toks)
+            mem_ids.append(mem_id)
+
+        return SleepReport(
+            spans_compiled=compiled,
+            tokens_evicted=evicted_tokens,
+            active_kv_tokens_after=self.buffer.active_kv_tokens(),
+            memory_ids=mem_ids,
+            mean_rel_fit_error=sum(fit_errs) / max(1, len(fit_errs)),
+        )
+
+    def forget(self, memory_id: str) -> None:
+        """Exact removal of a compiled memory across all ESM layers (`max_abs_diff < 1e-6`)."""
+        rec = self.ledger.delta(memory_id)
+        if rec.get("removed", False):
+            return
+        for l_idx, d_ref in rec.get("layer_deltas", {}).items():
+            if int(l_idx) in self.esm_modules:
+                self.esm_modules[int(l_idx)].remove(d_ref)
+        self.ledger.mark_removed(memory_id)
+

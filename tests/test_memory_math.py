@@ -18,13 +18,19 @@ from sparkx_memory_utils import (
     HAS_TORCH,
     BackboneFingerprint,
     CapacityExhaustedError,
+    EpisodicSideMemory,
+    MemoryLedger,
+    SleepScheduler,
     _py_matmul,
     _py_solve_spd,
     _py_transpose,
+    calibrate_esm_gate,
     damped_pseudoinverse_pullback,
     exact_remove_delta,
+    generate_self_study_probes,
     loop_config,
     project_into_null_space,
+    reconstruct_spark_attention_output,
     solve_null_space_ridge,
     update_orthonormal_basis,
 )
@@ -234,6 +240,104 @@ class TestMemoryMathPurePython(unittest.TestCase):
         self.assertTrue(dummy.engram_enabled)
         self.assertTrue(dummy.enable_p3)
         self.assertFalse(dummy.esm_enabled)
+
+    def test_g1_spark_attention_output_reconstruction(self) -> None:
+        # Phase 1 Gate G1: verify exact reconstruction out_proj(sigmoid(g_proj(LN h)) * SDPA(q, k, v))
+        seq_t, d_attn, w_dim = 6, 16, 12
+        sdpa_out = _rand_matrix(seq_t, d_attn, seed=501)
+        normed_h = _rand_matrix(seq_t, w_dim, seed=502)
+        out_proj_w = _rand_matrix(w_dim, d_attn, seed=503)
+        g_proj_w = _rand_matrix(d_attn, w_dim, seed=504)
+
+        recon = reconstruct_spark_attention_output(
+            sdpa_out=sdpa_out,
+            normed_input=normed_h,
+            out_proj_weight=out_proj_w,
+            g_proj_weight=g_proj_w,
+        )
+        # Independently compute step-by-step reference
+        g_logits = _py_matmul(normed_h, _py_transpose(g_proj_w))
+        gated = [
+            [
+                sdpa_out[t][d] / (1.0 + math.exp(-g_logits[t][d]))
+                for d in range(d_attn)
+            ]
+            for t in range(seq_t)
+        ]
+        ref_out = _py_matmul(gated, _py_transpose(out_proj_w))
+        max_diff = max(
+            abs(recon[t][j] - ref_out[t][j])
+            for t in range(seq_t)
+            for j in range(w_dim)
+        )
+        self.assertLess(max_diff, 1e-12)
+
+    def test_g3_episodic_side_memory_write_gate_and_remove(self) -> None:
+        # Phase 3 Gate G3: empty bit-identity, protected general+past basis, canary gate calibration, exact removal
+        esm = EpisodicSideMemory(width=16, r=24, route_dim=8, max_shards=4, gate_T=0.02)
+        h_probe = _rand_matrix(3, 16, seed=601)
+        # 1. Empty ESM -> exact 0.0
+        zero_out = esm(h_probe)
+        self.assertEqual(_max_abs(zero_out), 0.0)
+
+        # 2. Install general-corpus basis U_gen of rank 4
+        h_gen = _rand_matrix(4, 16, seed=602)
+        phi_gen = esm.features(h_gen, shard=0)
+        u_gen = update_orthonormal_basis(None, phi_gen, max_rank=20)
+        esm.set_general_basis(u_gen)
+
+        # 3. Write episodic memory 1 into shard 0
+        phi_1 = esm.features(h_probe, shard=0)
+        delta_1 = _rand_matrix(3, 16, seed=603)
+        c_1 = esm.route_embed([h_probe[0]])
+        rep1 = esm.write(shard=0, A=phi_1, Delta=delta_1, alpha=1e-5, centroids=c_1)
+        self.assertEqual(rep1.shard_id, 0)
+        self.assertLess(rep1.rel_fit_error, 1e-2)
+        self.assertLess(rep1.max_prot_leakage, 1e-6)
+
+        # Verify general-corpus states experience zero perturbation even if gate is bypassed (use_gate=False)
+        gen_pert = esm(h_gen, use_gate=False)
+        self.assertLess(_max_abs(gen_pert), 1e-6)
+
+        # 4. Calibrate gate on 50 random canary states -> open_rate <= 0.05
+        canary_h = _rand_matrix(50, 16, seed=604)
+        cal = calibrate_esm_gate(esm, canary_h, shard=0, max_open_rate=0.02)
+        self.assertLessEqual(cal["open_rate"], 0.02)
+
+        # 5. Exact removal restores exact 0.0 output
+        esm.remove(rep1.delta_ref)
+        self.assertEqual(_max_abs(esm(h_probe, use_gate=False)), 0.0)
+
+    def test_g4_self_study_probes(self) -> None:
+        span = list(range(100, 148))
+        pset = generate_self_study_probes(span, n_questions=6, window_tokens=8, stride_tokens=4)
+        self.assertGreaterEqual(len(pset.probe_ids_list), 3)
+        self.assertGreaterEqual(len(pset.holdout_ids_list), 1)
+
+    def test_g5_sleep_scheduler_ledger_and_forget(self) -> None:
+        # Phase 5 Gate G5: streaming tokens trigger sleep when exceeding kv_budget_tokens, and forget() restores exact state
+        esm_dict = {3: EpisodicSideMemory(width=12, r=20, route_dim=8), 7: EpisodicSideMemory(width=12, r=20, route_dim=8)}
+        ledger = MemoryLedger()
+        sched = SleepScheduler(esm_modules=esm_dict, ledger=ledger, kv_budget_tokens=32, span_tokens=16)
+
+        # Feed 48 tokens (3 spans of 16 tokens > budget of 32)
+        sched.on_tokens(list(range(10, 58)), surprise=1.5, attention_mass=1.2)
+        self.assertEqual(sched.buffer.active_kv_tokens(), 48)
+
+        rep = sched.maybe_sleep()
+        self.assertIsNotNone(rep)
+        assert rep is not None
+        self.assertLessEqual(rep.active_kv_tokens_after, 32)
+        self.assertGreaterEqual(rep.spans_compiled, 1)
+        self.assertEqual(len(rep.memory_ids), rep.spans_compiled)
+
+        # Forget all compiled memories -> ESM returns to exact 0.0
+        h_test = _rand_matrix(2, 12, seed=701)
+        self.assertGreater(_max_abs(esm_dict[3](h_test, use_gate=False)), 1e-3)
+        for mid in rep.memory_ids:
+            sched.forget(mid)
+        self.assertLess(_max_abs(esm_dict[3](h_test, use_gate=False)), 1e-7)
+        self.assertLess(_max_abs(esm_dict[7](h_test, use_gate=False)), 1e-7)
 
 
 @unittest.skipUnless(HAS_TORCH, "PyTorch not installed in this environment")

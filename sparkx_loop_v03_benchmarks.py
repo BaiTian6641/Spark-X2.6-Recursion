@@ -4086,4 +4086,170 @@ def validate_vertical_sleep_memory_compiler(
     return summary
 
 
+# ==============================================================================
+# Track L1 & L2: 72L Loop Base Diagnostics & Harmful Engram Anchor Repair
+# ==============================================================================
+
+@torch.no_grad()
+def diagnose_loop_and_engram_health(
+    model: SparkXLoopV03,
+    tokenizer: Any,
+    eval_texts: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Track L1 (`docs/roadmap/02_IMPLEMENTATION_PLAN.md`): Comprehensive Loop Base & Engram Health Audit.
+
+    Computes:
+      1. `TwoStreamMHC` Controller Gain & Sinkhorn Routing Telemetry across `L4..L27` (flags gain collapse `< 0.03`).
+      2. Per-Pass Logit-Lens Cross-Entropy & Inter-Pass KL Divergence (`Pass 1 -> Pass 2 -> Pass 3 -> Coda`).
+      3. Per-Anchor Leave-One-Out `MoE-Engram` PPL Ablation across `L3, 7, 11, 15, 19, 23, 27, 31`.
+    """
+    print("=" * 116)
+    print("[TRACK L1: 72L LOOP BASE, TwoStreamMHC GAIN & PER-ANCHOR MoE-ENGRAM DIAGNOSTIC AUDIT]")
+    print("=" * 116)
+    model.eval()
+    device = model._head_weight().device
+
+    # 1. Controller telemetry
+    mhc_tel = model.get_mhc_controller_telemetry() if hasattr(model, "get_mhc_controller_telemetry") else {}
+    print(
+        f"  [TwoStreamMHC Telemetry] Mean |g_P2|=(attn={mhc_tel.get('mean_abs_gain_p2_attn', 0):.4f}, "
+        f"ffn={mhc_tel.get('mean_abs_gain_p2_ffn', 0):.4f}) | "
+        f"Mean |g_P3|=(attn={mhc_tel.get('mean_abs_gain_p3_attn', 0):.4f}, "
+        f"ffn={mhc_tel.get('mean_abs_gain_p3_ffn', 0):.4f}) | "
+        f"Collapsed={mhc_tel.get('collapsed_controller_layers', [])}"
+    )
+
+    # 2. Per-pass logit-lens CE & inter-pass KL at exit of loop core (L27 / L23) and Coda (L35)
+    sample_pair = encode_spark_chat_pair(
+        tokenizer,
+        user_prompt="Prove that the eigenvalues of a real symmetric matrix are real and its eigenvectors for distinct eigenvalues are orthogonal.",
+        answer_text="Let A = A^T and Av = lambda v. Taking the conjugate transpose and inner product yields (lambda - conj(lambda)) ||v||^2 = 0, so lambda is real.",
+        think_text="Use the Hermitian inner product v^* A v and symmetry A^T = A.",
+        max_length=256,
+    )
+    probe_ids = torch.tensor([sample_pair["full_ids"]], dtype=torch.long, device=device)
+    all_visits = model.capture_residuals(probe_ids, layers=[23, 27, 35], return_all_visits=True)
+    norm_fn = model.base.model.norm
+    head_w = model._head_weight()
+    target_y = probe_ids[0, 1:]
+
+    pass_lens: Dict[str, Any] = {}
+    prev_probs: Optional[torch.Tensor] = None
+    for label, key in (("pass1_L27", (27, 0)), ("pass2_L27", (27, 1)), ("pass3_L23", (23, 2)), ("coda_L35", (35, 0))):
+        if key not in all_visits:
+            continue
+        h_v = all_visits[key][:-1]
+        normed = norm_fn(h_v.unsqueeze(0).to(head_w.dtype))[0]
+        logits = F.linear(normed, head_w).float()
+        ce = float(F.cross_entropy(logits, target_y).item())
+        probs = F.softmax(logits, dim=-1)
+        kl_from_prev = 0.0
+        if prev_probs is not None:
+            kl_from_prev = float(
+                F.kl_div(probs.clamp(min=1e-8).log(), prev_probs.clamp(min=1e-8), reduction="batchmean").item()
+            )
+        prev_probs = probs
+        pass_lens[label] = {
+            "ce": round(ce, 4),
+            "ppl": round(math.exp(min(20.0, ce)), 4),
+            "kl_from_prev": round(kl_from_prev, 5),
+        }
+
+    # 3. Per-anchor Engram ablation
+    base_eval = evaluate_engram_perplexity_delta(model, tokenizer, eval_texts=eval_texts)
+    no_eng_ppl = float(base_eval["no_engram_ppl"])
+    full_eng_ppl = float(base_eval["with_engram_ppl"])
+
+    anchor_ablations: Dict[str, Any] = {}
+    harmful_anchors: List[int] = []
+    for l_idx, mod in model.iter_engram_anchors():
+        saved_scale = getattr(mod, "decode_engram_scale", 0.25)
+        saved_gain = float(mod.engram_gain.detach().item())
+        try:
+            mod.decode_engram_scale = 0.0
+            mod.engram_gain.fill_(-30.0)
+            without_l = evaluate_engram_perplexity_delta(model, tokenizer, eval_texts=eval_texts)
+            ppl_without_l = float(without_l["with_engram_ppl"])
+        finally:
+            mod.decode_engram_scale = saved_scale
+            mod.engram_gain.fill_(saved_gain)
+        # Positive delta means including anchor l_idx WORSENED (increased) PPL relative to dropping it
+        anchor_contrib_delta = full_eng_ppl - ppl_without_l
+        anchor_ablations[f"L{l_idx}"] = {
+            "ppl_without_anchor": round(ppl_without_l, 4),
+            "anchor_ppl_impact": round(anchor_contrib_delta, 4),
+            "harmful": bool(anchor_contrib_delta > 0.005),
+        }
+        if anchor_contrib_delta > 0.005:
+            harmful_anchors.append(int(l_idx))
+        print(
+            f"  [Anchor L{l_idx:02d} Ablation] Full Engram PPL={full_eng_ppl:.4f} | "
+            f"Without L{l_idx:02d} PPL={ppl_without_l:.4f} | Impact={anchor_contrib_delta:+.4f}"
+        )
+
+    print("=" * 116)
+    return {
+        "no_engram_72L_ppl": round(no_eng_ppl, 4),
+        "full_engram_72L_ppl": round(full_eng_ppl, 4),
+        "engram_delta_ppl": round(full_eng_ppl - no_eng_ppl, 4),
+        "mhc_telemetry": mhc_tel,
+        "logit_lens_by_pass": pass_lens,
+        "per_anchor_ablation": anchor_ablations,
+        "harmful_anchors": harmful_anchors,
+    }
+
+
+@torch.no_grad()
+def repair_harmful_engram_anchors(
+    model: SparkXLoopV03,
+    tokenizer: Any,
+    eval_texts: Optional[List[str]] = None,
+    ppl_tolerance: float = 0.0,
+) -> Dict[str, Any]:
+    """Track L2 (`Gate GL2`): Zero-gate any MoE-Engram anchor that degrades held-out PPL on the 72L Loop Base
+    so `LB + Engram PPL <= LB No-Engram PPL + ppl_tolerance`.
+    """
+    diag = diagnose_loop_and_engram_health(model, tokenizer, eval_texts=eval_texts)
+    no_eng_ppl = float(diag["no_engram_72L_ppl"])
+    cur_ppl = float(diag["full_engram_72L_ppl"])
+    zeroed_anchors: List[int] = []
+
+    # Sort anchors from most harmful (largest positive anchor_ppl_impact) to least
+    ranked_anchors = sorted(
+        model.iter_engram_anchors(),
+        key=lambda item: float(diag["per_anchor_ablation"].get(f"L{item[0]}", {}).get("anchor_ppl_impact", 0.0)),
+        reverse=True,
+    )
+    for l_idx, mod in ranked_anchors:
+        impact = float(diag["per_anchor_ablation"].get(f"L{l_idx}", {}).get("anchor_ppl_impact", 0.0))
+        if cur_ppl <= no_eng_ppl + float(ppl_tolerance) and impact <= 0.0:
+            break
+        if impact > 0.0 or cur_ppl > no_eng_ppl + float(ppl_tolerance):
+            saved_scale = getattr(mod, "decode_engram_scale", 0.25)
+            saved_gain = float(mod.engram_gain.detach().item())
+            mod.decode_engram_scale = 0.0
+            mod.engram_gain.fill_(-30.0)
+            chk = evaluate_engram_perplexity_delta(model, tokenizer, eval_texts=eval_texts)
+            cand_ppl = float(chk["with_engram_ppl"])
+            if cand_ppl <= cur_ppl:
+                cur_ppl = cand_ppl
+                zeroed_anchors.append(int(l_idx))
+            else:
+                mod.decode_engram_scale = saved_scale
+                mod.engram_gain.fill_(saved_gain)
+
+    gl2_passed = bool(cur_ppl <= no_eng_ppl + float(ppl_tolerance) + 1e-4)
+    print(
+        f"[Track L2 Gate GL2] No-Engram PPL={no_eng_ppl:.4f} | Repaired Engram PPL={cur_ppl:.4f} | "
+        f"Zero-Gated Anchors={zeroed_anchors} | GL2 Passed={gl2_passed}"
+    )
+    return {
+        "no_engram_72L_ppl": round(no_eng_ppl, 4),
+        "repaired_engram_72L_ppl": round(cur_ppl, 4),
+        "zeroed_anchors": zeroed_anchors,
+        "gl2_passed": gl2_passed,
+        "initial_diagnostics": diag,
+    }
+
+
 
