@@ -115,13 +115,21 @@ The training curriculum in [`sparkx_loop_v03_train_env.py`](file:///storage/emul
 
 ## 6. Usage Guide & Quick-Start Commands
 
-### 6.1 Option A: End-to-End Training & Post-Training in Google Colab
+### 6.1 Option A: End-to-End Full-Sequence Training (`XHToken/Spark-X2.6-4B` -> `72L + 4.11B MoE-Engram` -> `SI-SRSI`)
 1. Open **[`SparkX_Loop_v03_Full_Pipeline_All_In_One_Colab.ipynb`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/SparkX_Loop_v03_Full_Pipeline_All_In_One_Colab.ipynb)** in Google Colab (A100 80GB, H100 80GB, or RTX PRO 6000 Blackwell G4 96GB recommended; L4 24GB also supported via automatic activation offloading).
 2. Add your `HF_TOKEN` (and optional `OPENCODE_API_KEY`) to Colab Secrets.
-3. Adjust any desired `MoE-Engram` or `mHC` parameters in **Cell 2** (`CFG['ENG_EXPERTS']`, `CFG['ENG_TOP_K']`, `CFG['PILLAR_RATIOS']`, `CFG['ENABLE_STAGE0_PROGRESSIVE_DEPTH_WARMUP']`, `CFG['ENABLE_PHASE4_POST_TRAIN']`).
-4. Run **Cells 1–8** sequentially to execute Step-0 verification, 6-pillar 16K sequence packing, 4-stage progressive training, Phase-4 consolidation, standalone Hub export, 3D WebGL synthesis, and the 8-benchmark Frontier Scorecard.
+3. Adjust any desired `MoE-Engram`, `mHC`, or `SI-SRSI` parameters in **Cell 2** (`CFG['ENG_EXPERTS']`, `CFG['ENG_TOP_K']`, `CFG['PILLAR_RATIOS']`, `CFG['ENABLE_PHASE4_POST_TRAIN']`, `CFG['ENABLE_SI_SRSI_ENGRAM_LOOP']`).
+4. Run **Cells 1–8** sequentially to execute Step-0 verification, 7-pillar 16K sequence packing, 4-stage progressive training, Phase-4 + `SI-SRSI` OpenCode-supervised Knowledge Engram formation, standalone Hub export, 3D WebGL synthesis, and the 11-benchmark Frontier Scorecard.
 
-### 6.2 Option B: One-Call Python Inference & Phase-4 Consolidation
+### 6.2 Option B: Continue Training Directly from [`TassP0lar/Spark-X2.6-4B-En4B-A1B`](https://huggingface.co/TassP0lar/Spark-X2.6-4B-En4B-A1B) (`SI-SRSI` + Dynamic `MoE-Engram` Expansion)
+1. Open **[`SparkX_Loop_v03_Continue_From_Hub_SI_SRSI_Colab.ipynb`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/SparkX_Loop_v03_Continue_From_Hub_SI_SRSI_Colab.ipynb)** in Google Colab.
+2. **Cell 2** loads the trained `72L + 32-Expert Top-7 MoE-Engram` checkpoint directly from `TassP0lar/Spark-X2.6-4B-En4B-A1B` without resetting or re-initializing any weights.
+3. **Cell 3** lets you choose between:
+   - `CONTINUATION_MODE = 'SI_SRSI_AND_PHASE4'` (Fast & targeted, ~15–25 mins): Runs Phase-4 Multi-Domain Consolidation + OpenCode Teacher-Supervised `SI-SRSI` Knowledge Engram Formation across **1. Anti-Slop Human Composition**, **2. Full-Stack Web UX/WCAG 2.2/Defensive AppSec**, and **3. STEM First-Principles Reasoning**.
+   - `CONTINUATION_MODE = 'FULL_STREAMING_CORPUS_PLUS_SI_SRSI'` (Deep expansion, ~1.5–3 hrs): Streams fresh 7-Pillar 2025–2026 Frontier datasets (`SuperGPQA`, `OpenThoughts3-1.2M`, `NaturalReasoning`, `SWE-smith`, `UIGEN-T1.5`) and runs continued `8K`/`16K` `MoE-Engram-32` training on top of `TassP0lar/Spark-X2.6-4B-En4B-A1B` before `SI-SRSI`.
+4. **Cells 5–7** automatically verify the Monotonic Non-Degradation Gate (`MGD`), push the updated `loop_v03_state.pt` & `si_srsi_engram_report.json` back to `TassP0lar/Spark-X2.6-4B-En4B-A1B`, test all 5 On-the-Fly Flight Modes (`Top-4..32`), and run the 11-benchmark Frontier Scorecard.
+
+### 6.3 Option C: One-Call Python Inference, `SI-SRSI` & Phase-4 Consolidation
 ```python
 import torch
 from load_inference_v03 import load_sparkx_loop_v03

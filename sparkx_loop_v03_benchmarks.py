@@ -2937,17 +2937,23 @@ def run_si_srsi_engram_loop(
 
     Path(save_dir).mkdir(parents=True, exist_ok=True)
     state_path = Path(save_dir) / "loop_v03_state.pt"
-    torch.save(loop_v03_state_dict(model, include_tier1b=True), state_path)
+    cfg_path = Path(save_dir) / "loop_config_v03.json"
+    report_path = Path(save_dir) / "si_srsi_engram_report.json"
 
-    print("=" * 116)
-    print(
-        f"[SI-SRSI Knowledge Engram Formation Complete] "
-        f"Mean Rubric Score: {init_mean_rubric:.2f} -> {final_mean_rubric:.2f}/100 ({final_mean_rubric - init_mean_rubric:+.2f}) | "
-        f"Held-Out PPL: {init_ppl_eval['with_engram_ppl']:.4f} -> {final_ppl_eval['with_engram_ppl']:.4f} | "
-        f"Saved Engram Bank -> `{state_path}`"
-    )
-    print("=" * 116)
-    return {
+    state_obj = loop_v03_state_dict(model, include_tier1b=True)
+    torch.save(state_obj, state_path)
+
+    meta = dict(getattr(model, "loaded_meta", {}) or {})
+    meta["curriculum_version"] = "v03_r2_si_srsi_engram_consolidated"
+    meta["si_srsi_rounds"] = num_rounds
+    meta["active_meta"] = state_obj["active_meta"]
+    meta.setdefault("metrics", {})
+    meta["metrics"]["si_srsi_initial_rubric"] = round(init_mean_rubric, 2)
+    meta["metrics"]["si_srsi_final_rubric"] = round(final_mean_rubric, 2)
+    meta["metrics"]["held_out_ppl_with_engram"] = round(final_ppl_eval["with_engram_ppl"], 4)
+    cfg_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    result_payload = {
         "initial_mean_rubric": round(init_mean_rubric, 2),
         "final_mean_rubric": round(final_mean_rubric, 2),
         "rubric_delta": round(final_mean_rubric - init_mean_rubric, 2),
@@ -2956,3 +2962,104 @@ def run_si_srsi_engram_loop(
         "domain_results": final_audits,
         "saved_engram_state": str(state_path),
     }
+    report_path.write_text(json.dumps(result_payload, indent=2), encoding="utf-8")
+
+    print("=" * 116)
+    print(
+        f"[SI-SRSI Knowledge Engram Formation Complete] "
+        f"Mean Rubric Score: {init_mean_rubric:.2f} -> {final_mean_rubric:.2f}/100 ({final_mean_rubric - init_mean_rubric:+.2f}) | "
+        f"Held-Out PPL: {init_ppl_eval['with_engram_ppl']:.4f} -> {final_ppl_eval['with_engram_ppl']:.4f} | "
+        f"Saved Engram Bank -> `{state_path}`"
+    )
+    if push_to_hub and token:
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi(token=token)
+            api.upload_file(path_or_fileobj=str(state_path), path_in_repo="loop_v03_state.pt", repo_id=hub_repo_id, token=token)
+            api.upload_file(path_or_fileobj=str(cfg_path), path_in_repo="loop_config_v03.json", repo_id=hub_repo_id, token=token)
+            api.upload_file(path_or_fileobj=str(report_path), path_in_repo="si_srsi_engram_report.json", repo_id=hub_repo_id, token=token)
+            print(f"  [Hub Upload] Uploaded `loop_v03_state.pt`, `loop_config_v03.json` & `si_srsi_engram_report.json` to `{hub_repo_id}`!")
+        except Exception as e:
+            print(f"  [Hub Upload Warning] Could not upload to `{hub_repo_id}`: {e}")
+    print("=" * 116)
+    return result_payload
+
+
+def run_continue_from_hub_engram_expansion(
+    model: SparkXLoopV03,
+    tokenizer: Any,
+    num_phase4_steps: int = 120,
+    num_si_srsi_rounds: int = 2,
+    consolidation_steps_per_prompt: int = 6,
+    lr_engram: float = 1.5e-4,
+    lr_gates: float = 5.0e-4,
+    lr_mhc: float = 3.0e-5,
+    unlikelihood_alpha: float = 0.25,
+    default_flight_mode: str = "deep_knowledge",
+    opencode_api_url: Optional[str] = None,
+    opencode_api_key: Optional[str] = None,
+    opencode_model: str = "opencode/claude-sonnet-4-5",
+    save_dir: str = "/content/sparkx_v03_continued_hub",
+    push_to_hub: bool = False,
+    hub_repo_id: str = "TassP0lar/Spark-X2.6-4B-En4B-A1B",
+    token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Continue training directly from an already-trained `TassP0lar/Spark-X2.6-4B-En4B-A1B` checkpoint:
+    1. Stage A: Joint `mHC` + `MoE-Engram` Multi-Domain Consolidation (`run_phase4_engram_consolidation`).
+    2. Stage B: Supervised Instructed Self-Recursive Self-Improvement (`run_si_srsi_engram_loop`) with OpenCode Teacher Supervision across `anti_slop`, `web_ux_sec`, and `stem_reason`.
+    3. Stage C: On-the-Fly Dynamic Engram Flight Mode Ablation (`evaluate_dynamic_engram_flight_modes`) & activation of `default_flight_mode`.
+    """
+    print("=" * 116)
+    print(f"[CONTINUE FROM HUB PIPELINE] Starting from `{hub_repo_id}` -> Stage A (Phase-4) + Stage B (SI-SRSI) + Stage C (Flight Modes)")
+    print("=" * 116)
+
+    phase4_res = None
+    if num_phase4_steps > 0:
+        phase4_res = run_phase4_engram_consolidation(
+            model=model,
+            tokenizer=tokenizer,
+            num_steps=num_phase4_steps,
+            lr_engram=lr_engram,
+            lr_gates=lr_gates,
+            lr_mhc=lr_mhc,
+            train_mhc=True,
+            max_seq_len=768,
+            eval_every=max(10, num_phase4_steps // 5),
+            save_dir=str(Path(save_dir) / "stageA_phase4"),
+            push_to_hub=False,
+            hub_repo_id=hub_repo_id,
+            token=token,
+        )
+
+    si_srsi_res = None
+    if num_si_srsi_rounds > 0:
+        si_srsi_res = run_si_srsi_engram_loop(
+            model=model,
+            tokenizer=tokenizer,
+            num_rounds=num_si_srsi_rounds,
+            consolidation_steps_per_prompt=consolidation_steps_per_prompt,
+            lr_engram=lr_engram,
+            lr_gates=lr_gates,
+            lr_mhc=lr_mhc * 0.85,
+            unlikelihood_alpha=unlikelihood_alpha,
+            opencode_api_url=opencode_api_url,
+            opencode_api_key=opencode_api_key,
+            opencode_model=opencode_model,
+            save_dir=save_dir,
+            push_to_hub=push_to_hub,
+            hub_repo_id=hub_repo_id,
+            token=token,
+        )
+
+    flight_res = evaluate_dynamic_engram_flight_modes(model, tokenizer)
+    active_flight = model.set_engram_flight_mode(default_flight_mode)
+    print(f"[Continued Hub Checkpoint Ready] Active Engram Flight Mode: {active_flight}")
+
+    return {
+        "phase4_report": phase4_res,
+        "si_srsi_report": si_srsi_res,
+        "flight_ablation": flight_res,
+        "active_flight_mode": active_flight,
+        "save_dir": save_dir,
+    }
+

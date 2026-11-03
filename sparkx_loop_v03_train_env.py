@@ -543,6 +543,14 @@ _SLOP_PHRASES = (
     '// rest of the code',
     '/* rest of code here */',
     '# todo: implement',
+    'rich tapestry',
+    'testament to the',
+    'delve into the intricacies',
+    'delving into the',
+    'symphony of',
+    'beacon of hope',
+    'it is important to remember that',
+    'certainly! i would be happy to',
 )
 
 
@@ -1719,7 +1727,15 @@ def run_v03_four_stage_training(
             print(f"[Auto-Resume Info] Hub checkpoint check skipped: {exc}", flush=True)
 
     resume_stage_idx = 0
-    if best_state_path is not None and best_ckpt_step > 0:
+    if bool(cfg.get('CONTINUE_FROM_LOADED_HUB_MODEL', False)):
+        loaded_meta = getattr(model, 'loaded_meta', {}) or {}
+        global_step = max(best_ckpt_step, int(loaded_meta.get('global_step', 208)))
+        print(
+            f"\n[Continue-From-Hub Mode] Preserving loaded `{cfg.get('HF_REPO_ID', 'TassP0lar/Spark-X2.6-4B-En4B-A1B')}` "
+            f"weights (starting at global_step={global_step}, active_experts={model.engram.active_experts}, top_k={model.engram.active_top_k})...",
+            flush=True,
+        )
+    elif best_state_path is not None and best_ckpt_step > 0:
         print(
             f"\n[Auto-Resume] Restoring `{req_curriculum_ver}` checkpoint {best_ckpt_label} (global_step={best_ckpt_step})...",
             flush=True,
@@ -1772,7 +1788,7 @@ def run_v03_four_stage_training(
                 )
                 continue
 
-            if stage_cfg.get('upcycle_8_to_32', False):
+            if stage_cfg.get('upcycle_8_to_32', False) and model.engram.active_experts < int(cfg.get('ENG_EXPERTS', 32)):
                 print(f"\n[{stage_name}] Executing Coarse-to-Fine Expert Upcycling (8 -> 32 experts, top_k=7)...", flush=True)
                 model.upcycle_all_engrams_8_to_32(noise_std=1e-3)
 
