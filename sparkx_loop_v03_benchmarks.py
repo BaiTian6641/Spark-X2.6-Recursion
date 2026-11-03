@@ -29,6 +29,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from sparkx_memory_utils import BackboneFingerprint
+
 
 # ==============================================================================
 # 1. Shared Utilities: <think> Stripping, Boxed Extraction & Chat Generation
@@ -1715,7 +1717,14 @@ def restore_pristine_base_backbone(
                 lyr_idx = int(m_lyr.group(1)) if m_lyr else -1
                 if lyr_idx >= 4:
                     is_interface = any(
-                        sub in k for sub in ("input_layernorm", "post_attention_layernorm", "self_attn.o_proj", "mlp.down_proj")
+                        sub in k for sub in (
+                            "input_layernorm",
+                            "post_attention_layernorm",
+                            "self_attn.out_proj",
+                            "self_attn.g_proj",
+                            "self_attn.o_proj",
+                            "mlp.down_proj",
+                        )
                     )
                     beta = float(coop_interface_beta if is_interface else coop_body_beta)
                     if beta > 0.0:
@@ -1757,7 +1766,14 @@ def restore_pristine_base_backbone(
                 dst_gpu.copy_(ref_gpu)
             else:
                 is_interface = any(
-                    sub in k for sub in ("input_layernorm", "post_attention_layernorm", "self_attn.o_proj", "mlp.down_proj")
+                    sub in k for sub in (
+                        "input_layernorm",
+                        "post_attention_layernorm",
+                        "self_attn.out_proj",
+                        "self_attn.g_proj",
+                        "self_attn.o_proj",
+                        "mlp.down_proj",
+                    )
                 )
                 beta = float(coop_interface_beta if is_interface else coop_body_beta)
                 if beta <= 0.0:
@@ -3923,14 +3939,15 @@ def validate_vertical_sleep_memory_compiler(
     top_m_clusters: int = 6,
     alpha_ridge: float = 1e-2,
     target_scale: float = 0.08,
+    calibrate_lsa_pca: bool = False,
 ) -> Dict[str, Any]:
     """Empirical Validation Suite for the Vertical Sleep-Time LSA-to-Engram Memory Compiler
     (`D-LSA Horizontal Working Attention -> AlphaEdit Null-Space Vertical MoE-Engram Consolidation`).
 
-    Validates 4 paper-grade architectural claims:
-      1. Exact `0.0` Backbone Parameter Drift (`Spark-X2.6-4B` 100% frozen; zero backbone backprop).
+    Validates 4 paper-grade architectural claims on the 72L Loop Base:
+      1. Exact `0.0` Loop-Base Parameter Drift (`Spark-X2.6-4B` + `TwoStreamMHC` 100% frozen; SHA-256 verified).
       2. Multi-Round `AlphaEdit` Null-Space Orthogonality (`||A_hist @ Delta W_down||_inf ~ 1e-6`, zero catastrophic forgetting).
-      3. Horizontal KV Compression Ratio & Sub-Second Closed-Form Compilation Latency across all 8 `MoE-Engram` anchors.
+      3. Horizontal KV Compression Ratio & Split Trace/Extract/Solve Latency across all 8 `MoE-Engram` anchors.
       4. Pareto-Safe Vertical Knowledge Retention (`72L + MoE-Engram` Held-Out PPL with `0` extra prompt tokens).
     """
     print("=" * 116)
@@ -3941,53 +3958,52 @@ def validate_vertical_sleep_memory_compiler(
 
     # Snapshot initial Engram bank so we can Pareto-verify or blend post-sleep weights safely
     pre_sleep_bank = model.snapshot_engram_bank()
-    pre_eval = evaluate_multi_domain_ppl(model, tokenizer, passes=2, use_mhc=True, use_engram=True)
-    pre_ppl = float(pre_eval["ppl"])
+    pre_eval = evaluate_engram_perplexity_delta(model, tokenizer)
+    pre_ppl = float(pre_eval["with_engram_ppl"])
 
-    # Record backbone parameter norms to prove 0.000000 backbone drift
-    base_norms_before: Dict[str, float] = {}
-    for p_name, p_t in model.base.named_parameters():
-        if "lsa_indexer" not in p_name:
-            base_norms_before[p_name] = float(p_t.detach().float().norm().item())
+    # Record cryptographic SHA-256 + strided element fingerprint across `model.base` + `model.controllers`
+    fp_before = BackboneFingerprint(model, include_controllers=True, store_exact_clone=False)
 
     model.reset_sleep_time_memory_compiler()
 
     sleep_episodes = [
         (
             "stem_reason",
-            format_spark_chat(
+            encode_spark_chat_pair(
                 tokenizer,
-                "Derive the closed-form Woodbury matrix identity and explain how orthogonal null-space projection prevents catastrophic interference during continual weight updates.",
-                "By projecting new post-SwiGLU activations A_1 onto the orthogonal complement P_null = I - V_active V_active^T of historical activations A_0, the ridge solution Delta W = A_{1,perp}^T (A_{1,perp} A_{1,perp}^T + alpha I)^{-1} dZ satisfies A_0 Delta W = 0 identically.",
+                user_prompt="Derive the closed-form Woodbury matrix identity and explain how orthogonal null-space projection prevents catastrophic interference during continual weight updates.",
+                answer_text="By projecting new post-SwiGLU activations A_1 onto the orthogonal complement P_null = I - V_active V_active^T of historical activations A_0, the ridge solution Delta W = A_{1,perp}^T (A_{1,perp} A_{1,perp}^T + alpha I)^{-1} dZ satisfies A_0 Delta W = 0 identically.",
                 think_text="Let A_0 be the matrix of prior activations and V_active be its orthonormal row-space basis. Then A_0 P_null = 0.",
-            ),
+                max_length=512,
+            )["full_ids"],
         ),
         (
             "web_ux_sec",
-            format_spark_chat(
+            encode_spark_chat_pair(
                 tokenizer,
-                "State the Content-Security-Policy and ARIA live-region invariants for an accessible zero-trust financial telemetry dashboard.",
-                "Use strict nonce-based `script-src 'nonce-...' 'strict-dynamic'`, `frame-ancestors 'none'`, and polite `aria-live=\"polite\"` status regions with deterministic focus restoration.",
+                user_prompt="State the Content-Security-Policy and ARIA live-region invariants for an accessible zero-trust financial telemetry dashboard.",
+                answer_text="Use strict nonce-based `script-src 'nonce-...' 'strict-dynamic'`, `frame-ancestors 'none'`, and polite `aria-live=\"polite\"` status regions with deterministic focus restoration.",
                 think_text="Verify CSP directives block inline script injection and WCAG 2.2 AA focus indicators remain visible.",
-            ),
+                max_length=512,
+            )["full_ids"],
         ),
         (
             "anti_slop",
-            format_spark_chat(
+            encode_spark_chat_pair(
                 tokenizer,
-                "Write a direct, concrete technical paragraph explaining why vertical mid-layer memory injection avoids Layer-0 re-embedding overhead.",
-                "External RAG harnesses serialize retrieved text back into tokens and pass them through Layer 0, consuming quadratic attention bandwidth. Vertical memory compilation writes value residuals straight into mid-layer routed experts.",
+                user_prompt="Write a direct, concrete technical paragraph explaining why vertical mid-layer memory injection avoids Layer-0 re-embedding overhead.",
+                answer_text="External RAG harnesses serialize retrieved text back into tokens and pass them through Layer 0, consuming quadratic attention bandwidth. Vertical memory compilation writes value residuals straight into mid-layer routed experts.",
                 think_text="Keep every clause concrete and technical; avoid filler transitions.",
-            ),
+                max_length=512,
+            )["full_ids"],
         ),
     ]
 
     round_reports: List[Dict[str, Any]] = []
     max_leakage_across_rounds = 0.0
 
-    for round_idx, (dom_name, ep_text) in enumerate(sleep_episodes, start=1):
-        enc = tokenizer(ep_text, return_tensors="pt", truncation=True, max_length=512)
-        ep_ids = enc["input_ids"].to(device)
+    for round_idx, (dom_name, ep_ids_list) in enumerate(sleep_episodes, start=1):
+        ep_ids = torch.tensor([ep_ids_list], dtype=torch.long, device=device)
         rep = model.run_sleep_time_memory_compiler(
             episodic_input_ids=ep_ids,
             domain=dom_name,
@@ -3996,7 +4012,7 @@ def validate_vertical_sleep_memory_compiler(
             target_scale=target_scale,
             outcome_valence=1.0,
             inject_lexical=False,
-            calibrate_lsa_pca=(round_idx == 1),
+            calibrate_lsa_pca=(calibrate_lsa_pca and round_idx == 1),
         )
         round_reports.append(rep)
         max_leakage_across_rounds = max(max_leakage_across_rounds, float(rep["max_null_space_leakage"]))
@@ -4007,20 +4023,16 @@ def validate_vertical_sleep_memory_compiler(
             f"Clusters={rep['total_clusters_compiled']:2d} | "
             f"FitErr={rep['mean_rel_fit_error']:.5f} | "
             f"NullLeak={rep['max_null_space_leakage']:.2e} | "
-            f"Time={rep['compile_latency_ms']:.1f}ms"
+            f"Trace={rep.get('trace_latency_ms', 0.0):.1f}ms Solve={rep.get('solve_latency_ms', 0.0):.1f}ms"
         )
 
-    # Verify exact 0.0 backbone drift
-    max_backbone_drift = 0.0
-    for p_name, p_t in model.base.named_parameters():
-        if "lsa_indexer" not in p_name and p_name in base_norms_before:
-            diff = abs(float(p_t.detach().float().norm().item()) - base_norms_before[p_name])
-            if diff > max_backbone_drift:
-                max_backbone_drift = diff
+    # Verify exact 0.0 Loop-Base parameter drift via SHA-256 & max_abs_diff
+    fp_report = fp_before.verify(model)
+    max_backbone_drift = float(fp_report["max_abs_diff"])
 
     # Evaluate post-sleep held-out PPL and select Pareto-optimal interpolation factor
-    post_eval = evaluate_multi_domain_ppl(model, tokenizer, passes=2, use_mhc=True, use_engram=True)
-    post_ppl = float(post_eval["ppl"])
+    post_eval = evaluate_engram_perplexity_delta(model, tokenizer)
+    post_ppl = float(post_eval["with_engram_ppl"])
     accepted_alpha = 1.0
 
     if post_ppl > pre_ppl:
@@ -4030,8 +4042,8 @@ def validate_vertical_sleep_memory_compiler(
         for cand_alpha in (0.50, 0.25, 0.10):
             model.hot_swap_engram_bank(pre_sleep_bank, blend_alpha=1.0)
             model.hot_swap_engram_bank(compiled_bank, blend_alpha=cand_alpha)
-            cand_eval = evaluate_multi_domain_ppl(model, tokenizer, passes=2, use_mhc=True, use_engram=True)
-            cand_ppl = float(cand_eval["ppl"])
+            cand_eval = evaluate_engram_perplexity_delta(model, tokenizer)
+            cand_ppl = float(cand_eval["with_engram_ppl"])
             if cand_ppl <= best_ppl + 1e-4:
                 best_ppl = cand_ppl
                 best_alpha = cand_alpha
@@ -4056,6 +4068,8 @@ def validate_vertical_sleep_memory_compiler(
         "post_sleep_72L_ppl": round(post_ppl, 4),
         "accepted_pareto_alpha": round(accepted_alpha, 3),
         "max_backbone_param_drift": float(max_backbone_drift),
+        "backbone_sha256_match": bool(fp_report["sha256_match"]),
+        "fingerprint_report": fp_report,
         "max_null_space_leakage": float(max_leakage_across_rounds),
         "active_null_space_rank": int(total_null_rank),
         "total_null_space_capacity": int(max_null_capacity),
@@ -4063,12 +4077,13 @@ def validate_vertical_sleep_memory_compiler(
         "rounds": round_reports,
     }
     print(
-        f"  [Sleep Compiler Summary] Backbone Drift={max_backbone_drift:.2e} (100% Frozen) | "
+        f"  [Sleep Compiler Summary] Loop-Base Drift={max_backbone_drift:.2e} (SHA256={fp_report['sha256_match']}) | "
         f"Max Historical Null-Space Leakage={max_leakage_across_rounds:.2e} | "
         f"Active Orthogonal Basis={total_null_rank}/{max_null_capacity} ({summary['null_capacity_utilization_pct']:.4f}%) | "
         f"72L PPL: {pre_ppl:.4f} -> {post_ppl:.4f}"
     )
     print("=" * 116)
     return summary
+
 
 

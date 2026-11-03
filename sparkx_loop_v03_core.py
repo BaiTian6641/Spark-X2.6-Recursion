@@ -21,6 +21,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from sparkx_memory_utils import (
+    BackboneFingerprint,
+    CapacityExhaustedError,
+    exact_remove_delta,
+    loop_config,
+    precompute_damped_right_inverse,
+    project_into_null_space,
+    solve_null_space_ridge,
+    update_orthonormal_basis,
+)
+
 # ---------------------------------------------------------------------------
 # Optional Triton / Unsloth / Liger / Cut-Cross-Entropy High-Speed Kernels
 # ---------------------------------------------------------------------------
@@ -780,6 +791,8 @@ class LatentSparseAttentionIndexer(nn.Module):
         n_sink: int = 4,
         k_long_range: int = 2048,
         search_mode: str = "flat",
+        rope_dim: int = 64,
+        use_rope_free_slice: bool = True,
     ) -> None:
         super().__init__()
         self.num_kv_heads = int(num_kv_heads)
@@ -792,6 +805,8 @@ class LatentSparseAttentionIndexer(nn.Module):
         self.n_sink = int(n_sink)
         self.k_long_range = int(k_long_range)
         self.search_mode = str(search_mode)
+        self.rope_dim = int(max(0, min(int(rope_dim), self.head_dim - 1)))
+        self.use_rope_free_slice = bool(use_rope_free_slice)
 
         self.w_k_idx = nn.Linear(self.num_kv_heads * self.head_dim, self.d_idx, bias=False)
         self.w_q_idx = nn.Linear(self.head_dim, self.d_idx, bias=False)
@@ -800,7 +815,12 @@ class LatentSparseAttentionIndexer(nn.Module):
 
     @torch.no_grad()
     def _init_orthogonal_pca_fallback(self) -> None:
-        nn.init.orthogonal_(self.w_q_idx.weight)
+        self.w_q_idx.weight.zero_()
+        r0 = self.rope_dim if self.use_rope_free_slice else 0
+        free_dim = self.head_dim - r0
+        ortho_sub = torch.empty((self.d_idx, free_dim), dtype=torch.float32, device=self.w_q_idx.weight.device)
+        nn.init.orthogonal_(ortho_sub)
+        self.w_q_idx.weight.data[:, r0:].copy_(ortho_sub.to(self.w_q_idx.weight.dtype))
         # Tile the same orthogonal basis across the 4 KV heads so inner products align at initialization
         q_basis = self.w_q_idx.weight.data  # [d_idx, head_dim]
         tiled_k = q_basis.repeat(1, self.num_kv_heads) / math.sqrt(float(self.num_kv_heads))
@@ -808,37 +828,55 @@ class LatentSparseAttentionIndexer(nn.Module):
 
     @torch.no_grad()
     def fit_training_free_pca(self, k_samples: torch.Tensor) -> None:
-        """Initialize `W_K_idx` and `W_Q_idx` with the top `d_idx` principal directions of layer keys (`D-LSA Training-Free`).
+        """Initialize `W_K_idx` and `W_Q_idx` with the top `d_idx` principal directions of layer keys (`D-LSA Training-Free`),
+        operating strictly on the 192-D RoPE-free pass-through slice (`dims [rope_dim:head_dim]`) when `use_rope_free_slice=True`.
         `k_samples`: `[N, num_kv_heads, head_dim]` or `[N, head_dim]`.
         """
         x = k_samples.detach().float()
-        if x.dim() == 3:
-            x_head = x.mean(dim=1)  # [N, head_dim]
-            x_flat = x.reshape(x.shape[0], -1)  # [N, num_kv_heads * head_dim]
-        else:
-            x_head = x
-            x_flat = x.repeat(1, self.num_kv_heads)
+        if x.dim() == 2:
+            x = x.unsqueeze(1).repeat(1, self.num_kv_heads, 1)
+        if self.use_rope_free_slice and self.rope_dim > 0:
+            x = x.clone()
+            x[:, :, : self.rope_dim] = 0.0
+        x_head = x.mean(dim=1)  # [N, head_dim]
+        x_flat = x.reshape(x.shape[0], -1)  # [N, num_kv_heads * head_dim]
+
         x_head = x_head - x_head.mean(dim=0, keepdim=True)
         _, _, vh_q = torch.linalg.svd(x_head, full_matrices=False)
         top_q = vh_q[: self.d_idx, :]  # [d_idx, head_dim]
+        if self.use_rope_free_slice and self.rope_dim > 0:
+            top_q[:, : self.rope_dim] = 0.0
         self.w_q_idx.weight.data.copy_(top_q.to(self.w_q_idx.weight.dtype))
 
         x_flat = x_flat - x_flat.mean(dim=0, keepdim=True)
         _, _, vh_k = torch.linalg.svd(x_flat, full_matrices=False)
         top_k = vh_k[: self.d_idx, :]  # [d_idx, num_kv_heads * head_dim]
+        if self.use_rope_free_slice and self.rope_dim > 0:
+            top_k_3d = top_k.view(self.d_idx, self.num_kv_heads, self.head_dim)
+            top_k_3d[:, :, : self.rope_dim] = 0.0
+            top_k = top_k_3d.reshape(self.d_idx, -1)
         self.w_k_idx.weight.data.copy_(top_k.to(self.w_k_idx.weight.dtype))
 
     def project_queries_and_keys(
         self, query: torch.Tensor, key: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Project multi-head `query` `[B, H_q, T_q, D]` and `key` `[B, H_kv, T_k, D]` to unit-norm `d_idx` vectors."""
+        """Project multi-head `query` `[B, H_q, T_q, D]` and `key` `[B, H_kv, T_k, D]` to unit-norm `d_idx` vectors
+        using the RoPE-free pass-through slice (`dims [rope_dim:head_dim]`) without mutating module dtype (fixes M8, m1).
+        """
         bsz, _, seq_q, _ = query.shape
         seq_k = key.shape[2]
+        q_f = query.float()
+        k_f = key.float()
+        if self.use_rope_free_slice and self.rope_dim > 0:
+            q_f = q_f.clone()
+            k_f = k_f.clone()
+            q_f[..., : self.rope_dim] = 0.0
+            k_f[..., : self.rope_dim] = 0.0
         # Sum query heads so one index query serves all heads (Section 3.3 of arXiv:2610.42147)
-        q_sum = query.float().sum(dim=1)  # [B, T_q, D]
-        k_cat = key.float().transpose(1, 2).reshape(bsz, seq_k, self.num_kv_heads * self.head_dim)
-        q_idx = F.normalize(self.w_q_idx.float()(q_sum), p=2.0, dim=-1)  # [B, T_q, d_idx]
-        k_idx = F.normalize(self.w_k_idx.float()(k_cat), p=2.0, dim=-1)  # [B, T_k, d_idx]
+        q_sum = q_f.sum(dim=1)  # [B, T_q, D]
+        k_cat = k_f.transpose(1, 2).reshape(bsz, seq_k, self.num_kv_heads * self.head_dim)
+        q_idx = F.normalize(F.linear(q_sum, self.w_q_idx.weight.float()), p=2.0, dim=-1)  # [B, T_q, d_idx]
+        k_idx = F.normalize(F.linear(k_cat, self.w_k_idx.weight.float()), p=2.0, dim=-1)  # [B, T_k, d_idx]
         return q_idx, k_idx
 
     @torch.no_grad()
@@ -930,24 +968,24 @@ class LatentSparseAttentionIndexer(nn.Module):
         key: torch.Tensor,
         value: torch.Tensor,
         hidden_states: torch.Tensor,
-        o_proj_weight: torch.Tensor,
+        o_proj_weight: Optional[torch.Tensor] = None,
+        out_proj_weight: Optional[torch.Tensor] = None,
+        g_proj_weight: Optional[torch.Tensor] = None,
         top_m_clusters: int = 8,
         outcome_valence: float = 1.0,
     ) -> list[dict[str, Any]]:
-        """Extract the top-M highest-salience semantic KV clusters (`B_b`) from a Global NoPE layer
-        for Vertical Sleep-Time Compilation (`LSA -> MoE-Engram`, AlphaEdit Null-Space Consolidation).
+        """Extract the top-M highest-salience semantic KV clusters (`B_b`) from a Global Full-Attention layer
+        for Vertical Sleep-Time Compilation (`LSA -> MoE-Engram / ESM`, AlphaEdit Null-Space Consolidation).
 
-        Returns a list of dicts containing:
-          - `bucket_id`: semantic bucket index
-          - `centroid_64d`: unit-norm 64-D latent index centroid `c_b in S^63`
-          - `cluster_hidden`: representative pre-attention hidden state `h_b in R^2560`
-          - `target_residual`: exact projected attention value residual `y_b = W_O @ sum(alpha_j V_j) in R^2560`
-          - `token_positions`: list of horizontal token indices covered by `B_b` (evictable after compilation)
-          - `trigger_pos`: peak-salience token position `j* in B_b` for N-gram lexical indexing
-          - `salience`: composite salience score (`attn_mass * key_surprise * |valence|`)
+        Fixes B3 & M2 interim:
+          - Uses `out_proj_weight` (with `o_proj_weight` alias for backward compatibility).
+          - Applies Spark's head-wise sigmoid gate `sigma(g_proj(LN h))` per head before `out_proj`.
+          - Records both `cluster_hidden` (`h_b`) and `query_hidden` (`h_q_tail`, the querying tokens' post-LN state).
         """
+        proj_w = out_proj_weight if out_proj_weight is not None else o_proj_weight
+        if proj_w is None:
+            return []
         seq_k = int(key.shape[2])
-        device = key.device
         if seq_k <= self.n_sink + 4:
             return []
 
@@ -968,8 +1006,9 @@ class LatentSparseAttentionIndexer(nn.Module):
         bucket_logits = torch.mv(bucket_centroids, q_tail_vec) * tau
         bucket_attn_mass = F.softmax(bucket_logits, dim=0)  # [n_buckets]
 
-        # Titans-inspired key-norm surprise metric across KV heads
-        k_raw_span = key[0, :, start_pos:usable_end, :].float().permute(1, 0, 2).reshape(n_buckets, span_tokens, -1)
+        # Titans-inspired key-norm surprise metric across KV heads (on RoPE-free slice when enabled)
+        r0 = self.rope_dim if self.use_rope_free_slice else 0
+        k_raw_span = key[0, :, start_pos:usable_end, r0:].float().permute(1, 0, 2).reshape(n_buckets, span_tokens, -1)
         key_norms = k_raw_span.norm(p=2.0, dim=-1).mean(dim=1)  # [n_buckets]
         key_surprise = key_norms / (key_norms.mean() + 1e-6)
 
@@ -981,11 +1020,22 @@ class LatentSparseAttentionIndexer(nn.Module):
         top_vals, top_b = torch.topk(salience_scores, k=m_keep, largest=True, sorted=True)
 
         # Prepare GQA group expansion factor (`num_heads // num_kv_heads = 16 // 4 = 4`)
-        out_dim, in_dim = o_proj_weight.shape
-        kv_total_dim = int(value.shape[1] * value.shape[3])
+        out_dim, in_dim = proj_w.shape
+        num_kv_h = int(value.shape[1])
+        head_d = int(value.shape[3])
+        kv_total_dim = num_kv_h * head_d
         gqa_groups = max(1, in_dim // max(1, kv_total_dim))
-        w_o_f32 = o_proj_weight.detach().float()
+        num_q_heads = num_kv_h * gqa_groups
+        w_o_f32 = proj_w.detach().float()
         h_seq_f32 = hidden_states[0].detach().float()
+        h_q_tail = h_seq_f32[-tail_len:, :].mean(dim=0)  # [W]
+
+        # Compute Spark's head-wise sigmoid output gate `sigma(g_proj(LN h))` (shape [num_q_heads]) if g_proj is present
+        head_gate: Optional[torch.Tensor] = None
+        if g_proj_weight is not None:
+            w_g_f32 = g_proj_weight.detach().float()
+            gate_logits = F.linear(h_seq_f32[-tail_len:, :], w_g_f32)  # [tail_len, num_q_heads]
+            head_gate = torch.sigmoid(gate_logits).mean(dim=0)  # [num_q_heads]
 
         clusters: list[dict[str, Any]] = []
         for rank_i in range(m_keep):
@@ -1001,14 +1051,18 @@ class LatentSparseAttentionIndexer(nn.Module):
             j_star_local = int(torch.argmax(alpha_j).item())
             j_star = t0 + j_star_local
 
-            # Exact multi-head value aggregation (sum_{j in B_b} alpha_j V_j)
+            # Multi-head value aggregation (sum_{j in B_b} alpha_j V_j) + head-wise sigmoid gate + bucket mass
             v_b = value[0, :, t0:t1, :].float()  # [H_kv, span_tokens, D]
             v_agg = torch.einsum("s,hsd->hd", alpha_j, v_b)  # [H_kv, D]
             if gqa_groups > 1:
-                v_agg = v_agg.unsqueeze(1).expand(-1, gqa_groups, -1).reshape(-1)  # [H_q * D]
+                v_agg = v_agg.unsqueeze(1).expand(-1, gqa_groups, -1).reshape(num_q_heads, head_d)
             else:
-                v_agg = v_agg.reshape(-1)
-            y_b = val_sign * torch.mv(w_o_f32, v_agg[:in_dim])  # [W]
+                v_agg = v_agg.reshape(num_q_heads, head_d)
+            if head_gate is not None and head_gate.numel() == num_q_heads:
+                v_agg = v_agg * head_gate.view(num_q_heads, 1)
+            v_flat = v_agg.reshape(-1)[:in_dim]
+            mass_scale = float(bucket_attn_mass[b_id].item())
+            y_b = val_sign * mass_scale * torch.mv(w_o_f32, v_flat)  # [W]
 
             h_b = torch.einsum("s,sw->w", alpha_j, h_seq_f32[t0:t1, :])  # [W]
             clusters.append(
@@ -1016,10 +1070,12 @@ class LatentSparseAttentionIndexer(nn.Module):
                     "bucket_id": b_id,
                     "centroid_64d": bucket_centroids[b_id].detach().clone(),
                     "cluster_hidden": h_b.detach().clone(),
+                    "query_hidden": h_q_tail.detach().clone(),
                     "target_residual": y_b.detach().clone(),
                     "token_positions": pos_list,
                     "trigger_pos": j_star,
                     "salience": round(sal, 6),
+                    "attn_mass": round(mass_scale, 6),
                 }
             )
         return clusters
@@ -1034,8 +1090,8 @@ def patch_spark_attention_for_lsa(
     d_idx: int = 64,
     search_mode: str = "flat",
 ) -> int:
-    """Retrofit `Spark-X2.6-4B`'s 9 Global NoPE Attention layers (`L3, 7, 11, 15, 19, 23, 27, 31, 35`)
-    with `D-LSA` (`LatentSparseAttentionIndexer`, arXiv:2610.42147).
+    """Retrofit `Spark-X2.6-4B`'s 9 Global Full-Attention layers (`L3, 7, 11, 15, 19, 23, 27, 31, 35`)
+    with `D-LSA` (`LatentSparseAttentionIndexer`, arXiv:2610.42147) operating on the 192-D RoPE-free slice.
     Preserves 100% exact `V` vectors (never averages values across tokens) and leaves the 27 SWA layers untouched.
     """
     if not hasattr(base_model, "model") or not hasattr(base_model.model, "layers"):
@@ -1098,7 +1154,8 @@ def patch_spark_attention_for_lsa(
         if value.dtype != target_dtype:
             value = value.to(target_dtype)
 
-        if getattr(module, "_capture_sleep_qkv", False):
+        # Capture first-visit Q/K/V during sleep trace so Pass 2 / P3 does not overwrite Pass 1
+        if getattr(module, "_capture_sleep_qkv", False) and getattr(module, "_sleep_last_qkv", None) is None:
             module._sleep_last_qkv = (query.detach(), key.detach(), value.detach())
 
         sw = getattr(module, "_sparkx_sliding_window", None) or getattr(module, "sliding_window", None)
@@ -1775,18 +1832,21 @@ class ZipfianTieredMoEEngram(nn.Module):
         target_scale: float = 0.35,
         inject_lexical: bool = False,
         lexical_strength: float = 0.08,
+        key_mode: str = "query",
     ) -> dict[str, Any]:
         """Compile salient LSA semantic clusters (`B_b`) vertically into this `ZipfianTieredMoEEngram` anchor
         via Null-Space Constrained Closed-Form Ridge Compilation (`AlphaEdit`, Fang et al., ICLR 2025).
 
-        Guarantees:
-          1. Zero backbone gradient / zero backbone drift (`Spark-X2.6-4B` remains 100% frozen).
-          2. Double Gram-Schmidt projection `A_{1, perp} = A_1 P_{null}^{(e*)}` ensures every new expert update
-             `Delta W_{down, e*}` lies strictly in the null space of all previously compiled cluster activations
-             `A_0`, achieving `||A_0 Delta W_{down, e*}||_inf ~ 1e-7` (zero catastrophic forgetting across rounds).
+        Phase 0 fixes:
+          - M5: Uses exact damped right-inverse `W^T (W W^T + lam I)^{-1}` (`precompute_damped_right_inverse`).
+          - M6: Never overwrites `self.project.weight` with `0.25 * I` (skips cleanly if `project` is zero-gated).
+          - M4: Raises `CapacityExhaustedError` via `update_orthonormal_basis` instead of silently truncating old basis columns.
+          - m1: Uses `F.linear(..., self.router_proj.weight.float())` without mutating module parameters in place.
+          - M1: Supports `key_mode="query"` (default: keys on querying hidden state) or `"cluster"` (ablation).
         """
         if not clusters:
             return {
+                "status": "empty",
                 "compiled_clusters": 0,
                 "experts_updated": [],
                 "mean_rel_fit_error": 0.0,
@@ -1804,18 +1864,20 @@ class ZipfianTieredMoEEngram(nn.Module):
         device = self.expert_down.device
         param_dtype = self.project.weight.dtype
 
-        # Ensure `self.project.weight` is full-rank before the very first compilation if still near zero-init
+        # Fix M6: never overwrite `self.project.weight` (which also carries lexical and shared paths)
         proj_w_f32 = self.project.weight.detach().float()
-        if proj_w_f32.norm().item() < 1e-4 and len(self._alphaedit_basis) == 0:
-            eye_init = 0.25 * torch.eye(self.width, device=device, dtype=param_dtype)
-            self.project.weight.data.copy_(eye_init)
-            proj_w_f32 = self.project.weight.detach().float()
+        if proj_w_f32.norm().item() < 1e-6:
+            return {
+                "status": "skipped_zero_project",
+                "compiled_clusters": 0,
+                "experts_updated": [],
+                "mean_rel_fit_error": 0.0,
+                "max_null_space_leakage": 0.0,
+                "total_active_null_rank": sum(int(v.shape[1]) for v in self._alphaedit_basis.values()),
+            }
 
-        # Precompute damped right-inverse of `W_project^T` to pull residual targets into `combined` space
-        # Since `projected = combined @ W_project^T`, we solve `combined_delta @ W_project^T = r_b`
-        w_p_t = proj_w_f32.t()  # [width, width]
-        gram_p = torch.matmul(w_p_t, proj_w_f32) + 1e-2 * torch.eye(self.width, device=device, dtype=torch.float32)
-        pinv_w_p_t = torch.linalg.solve(gram_p, w_p_t.t())  # [width, width]
+        # Fix M5: exact damped right-inverse `W_proj^T (W_proj W_proj^T + lam I)^{-1}` for `W_proj @ delta_c = r`
+        pinv_w_p = precompute_damped_right_inverse(proj_w_f32, lam=1e-2)  # [width, width]
 
         dom = str(domain).lower().strip()
         zones = {
@@ -1851,9 +1913,11 @@ class ZipfianTieredMoEEngram(nn.Module):
                 ids_dev = ids_dev.unsqueeze(0)
             ngram_all = self.compute_ngram_indices(ids_dev, self.total_buckets)
 
+        use_query_key = str(key_mode).lower().strip() != "cluster"
         expert_buckets: dict[int, list[tuple[torch.Tensor, torch.Tensor]]] = {}
         for cl in clusters:
-            h_b = cl["cluster_hidden"].to(device=device, dtype=param_dtype).view(1, 1, self.width)
+            raw_key_h = cl.get("query_hidden") if (use_query_key and "query_hidden" in cl) else cl["cluster_hidden"]
+            h_b = raw_key_h.to(device=device, dtype=param_dtype).view(1, 1, self.width)
             y_b = cl["target_residual"].to(device=device, dtype=torch.float32).view(self.width)
             trig_pos = int(cl.get("trigger_pos", 0))
 
@@ -1880,8 +1944,8 @@ class ZipfianTieredMoEEngram(nn.Module):
             else:
                 e_lex = torch.zeros((1, 1, self.eng_dim), device=device, dtype=param_dtype)
 
-            # Route `h_norm_f` through the exact X-MoE hypersphere router
-            u = F.normalize(self.router_proj.float()(h_norm_f), p=2.0, dim=-1, eps=1e-6)  # [1, 64]
+            # Fix m1: route `h_norm_f` through X-MoE hypersphere router without calling `.float()` on the module
+            u = F.normalize(F.linear(h_norm_f, self.router_proj.weight.float()), p=2.0, dim=-1, eps=1e-6)  # [1, 64]
             r_logits = (torch.matmul(u, c_norm.t()) / temp) + p_bias  # [1, e_act]
             scores = torch.sigmoid(r_logits)[0]  # [e_act]
             sel_scores = scores + e_bias
@@ -1914,10 +1978,10 @@ class ZipfianTieredMoEEngram(nn.Module):
             w_u = self.expert_up[e_star].detach()
             act_b = triton_swiglu(torch.matmul(q_vec, w_g), torch.matmul(q_vec, w_u))[0].float()  # [3072]
 
-            # Pull target residual `target_scale * y_b` back to expert output delta `dz_b in R^2560`
+            # Pull target residual `target_scale * y_b` back to expert output delta `dz_b in R^2560` (M5 fix)
             ctx_b = (2.0 * torch.sigmoid(self.ctx_gate(h_norm).float())).view(self.width).clamp(min=0.1)
             r_target = float(target_scale) * y_b
-            comb_delta = torch.mv(pinv_w_p_t.t(), r_target / mod_gate)
+            comb_delta = torch.mv(pinv_w_p, r_target / mod_gate)
             dz_b = comb_delta / (ctx_b * g_star)
 
             expert_buckets.setdefault(e_star, []).append((act_b, dz_b))
@@ -1925,27 +1989,23 @@ class ZipfianTieredMoEEngram(nn.Module):
         fit_errors: list[float] = []
         max_null_leakage = 0.0
         updated_experts: list[int] = []
+        max_allowed_rank = max(1, int(self.expert_rank) - 16)
 
         for e_id, pairs in expert_buckets.items():
             a_mat = torch.stack([p[0] for p in pairs], dim=0)  # [M_e, 3072]
             dz_mat = torch.stack([p[1] for p in pairs], dim=0)  # [M_e, 2560]
-            m_e = int(a_mat.shape[0])
 
             v_act = self._alphaedit_basis.get(e_id)
-            if v_act is not None and v_act.shape[1] > 0:
-                # Double Classical Gram-Schmidt projection into the orthogonal complement of `v_act`
-                a_perp = a_mat - torch.matmul(torch.matmul(a_mat, v_act), v_act.t())
-                a_perp = a_perp - torch.matmul(torch.matmul(a_perp, v_act), v_act.t())
-            else:
-                a_perp = a_mat.clone()
-
-            # Dual Woodbury / Gram ridge solve in `float32`:
-            # dW = A_perp^T (A_perp A_perp^T + alpha I)^{-1} dZ
-            gram_m = torch.matmul(a_perp, a_perp.t()) + float(alpha_ridge) * torch.eye(
-                m_e, device=device, dtype=torch.float32
+            dw_down, a_perp, _, rel_err = solve_null_space_ridge(
+                a_mat, dz_mat, v_basis=v_act, alpha_ridge=float(alpha_ridge)
             )
-            dual_weights = torch.linalg.solve(gram_m, dz_mat)  # [M_e, 2560]
-            dw_down = torch.matmul(a_perp.t(), dual_weights)  # [3072, 2560]
+            fit_errors.append(rel_err)
+
+            # Update orthonormal active basis `V_active[e_id]` first so capacity exhaustion raises before mutating weights (M4 fix)
+            new_basis = update_orthonormal_basis(
+                v_act, a_perp, max_rank=max_allowed_rank, null_threshold=float(null_threshold)
+            )
+            self._alphaedit_basis[e_id] = new_basis
 
             # Audit exact historical null-space leakage `||A_hist @ dW_down||_inf`
             a_hist = self._alphaedit_history_acts.get(e_id)
@@ -1954,31 +2014,11 @@ class ZipfianTieredMoEEngram(nn.Module):
                 if leak > max_null_leakage:
                     max_null_leakage = leak
 
-            # Audit relative fit error on the new cluster batch
-            pred_dz = torch.matmul(a_perp, dw_down)
-            rel_err = float((pred_dz - dz_mat).norm().item() / (dz_mat.norm().item() + 1e-6))
-            fit_errors.append(rel_err)
-
             # Accumulate in fp32 master weight so bfloat16 rounding never compounds across sleep rounds
             if e_id not in self._alphaedit_fp32_down:
                 self._alphaedit_fp32_down[e_id] = self.expert_down.data[e_id].detach().float().clone()
             self._alphaedit_fp32_down[e_id].add_(dw_down)
             self.expert_down.data[e_id].copy_(self._alphaedit_fp32_down[e_id].to(self.expert_down.dtype))
-
-            # Update orthonormal active basis `V_active[e_id]` via SVD + QR re-orthonormalization
-            _, s_vals, vh_new = torch.linalg.svd(a_perp, full_matrices=False)
-            keep_mask = s_vals > float(null_threshold)
-            if int(keep_mask.sum().item()) > 0:
-                new_dirs = vh_new[keep_mask].t()  # [3072, r_new]
-                if v_act is None or v_act.shape[1] == 0:
-                    q_ortho, _ = torch.linalg.qr(new_dirs, mode="reduced")
-                    self._alphaedit_basis[e_id] = q_ortho
-                else:
-                    cat_dirs = torch.cat([v_act, new_dirs], dim=1)
-                    if cat_dirs.shape[1] > self.expert_rank - 16:
-                        cat_dirs = cat_dirs[:, -(self.expert_rank - 16) :]
-                    q_ortho, _ = torch.linalg.qr(cat_dirs, mode="reduced")
-                    self._alphaedit_basis[e_id] = q_ortho
 
             if a_hist is None:
                 self._alphaedit_history_acts[e_id] = a_mat.detach().clone()
@@ -1987,8 +2027,9 @@ class ZipfianTieredMoEEngram(nn.Module):
             updated_experts.append(e_id)
 
         self._eval_lex_cache = None
-        total_rank = sum(int(v.shape[1]) for v in self._alphaedit_basis.values())
+        total_rank = sum(int(v.shape[1]) for v in self._alphaedit_basis.values() if v is not None)
         return {
+            "status": "ok",
             "compiled_clusters": len(clusters),
             "experts_updated": sorted(updated_experts),
             "mean_rel_fit_error": round(sum(fit_errors) / max(1, len(fit_errors)), 6),
@@ -2618,6 +2659,37 @@ class SparkXLoopV03(nn.Module):
             dom = 'general'
         return self.set_domain_engram_focus(domain=dom, boost=boost)
 
+    def _layers(self) -> nn.ModuleList:
+        """Return the underlying 36-layer Spark decoder layer list."""
+        return self.base.model.layers
+
+    def loop_config(
+        self,
+        *,
+        start: Optional[int] = None,
+        end: Optional[int] = None,
+        passes: Optional[int] = None,
+        use_mhc: Optional[bool] = None,
+        use_engram: Optional[bool] = None,
+        enable_p3: Optional[bool] = None,
+        p3_start: Optional[int] = None,
+        p3_end: Optional[int] = None,
+        use_esm: Optional[bool] = None,
+    ):
+        """Temporarily override loop/Engram/ESM execution settings and restore on exit."""
+        return loop_config(
+            self,
+            start=start,
+            end=end,
+            passes=passes,
+            use_mhc=use_mhc,
+            use_engram=use_engram,
+            enable_p3=enable_p3,
+            p3_start=p3_start,
+            p3_end=p3_end,
+            use_esm=use_esm,
+        )
+
     @torch.no_grad()
     def reset_sleep_time_memory_compiler(self) -> None:
         """Reset all per-anchor AlphaEdit null-space bases and history trackers."""
@@ -2635,18 +2707,22 @@ class SparkXLoopV03(nn.Module):
         outcome_valence: float = 1.0,
         inject_lexical: bool = False,
         calibrate_lsa_pca: bool = False,
+        key_mode: str = "query",
+        trace_in_loop_base: bool = True,
     ) -> dict[str, Any]:
         """Execute a Vertical Sleep-Time Memory Compilation cycle (`D-LSA Horizontal Working Attention -> Vertical MoE-Engram`).
 
         Pipeline:
-          1. Captures Q/K/V and pre-attention hidden states across `Spark-X2.6-4B`'s Global NoPE layers
+          1. Captures Q/K/V and pre-attention hidden states across `Spark-X2.6-4B`'s 9 full-attention layers
              (`L3, 7, 11, 15, 19, 23, 27, 31, 35`) in a single gradient-free forward trace (`0` backbone backprop).
-          2. Extracts the top-M highest-salience LSA semantic clusters (`B_b`) and their exact value residuals
-             `y_b^(l) = W_O^(l) sum_{j in B_b} alpha_j V_j^(l)`.
-          3. Compiles those residuals vertically straight down into the paired `ZipfianTieredMoEEngram` anchors
-             (`L3, 6, 11, 15, 16, 19, 23, 27, 31`) via `AlphaEdit` Null-Space Constrained Closed-Form Ridge Compilation,
-             guaranteeing `||A_hist @ Delta W_down||_inf ~ 1e-7` (zero catastrophic forgetting across sleep cycles)
-             so the horizontal KV clusters can be evicted from the working context window.
+             On the 72L Loop Base (`trace_in_loop_base=True`), captures the first-visit (Pass 0) states while keeping
+             `use_engram=False` so pre-existing Engram outputs do not double-count in the target.
+          2. Extracts the top-M highest-salience LSA semantic clusters (`B_b`) using the 192-D RoPE-free pass-through
+             slice (`[64:256]`) and computes their exact gated value residuals
+             `y_b^(l) = out_proj(sigmoid(g_proj(LN h)) * sum_{j in B_b} alpha_j V_j^(l))`.
+          3. Compiles those residuals vertically into the 8 paired `ZipfianTieredMoEEngram` anchors
+             (`L3, 7, 11, 15, 19, 23, 27, 31`) via `AlphaEdit` Null-Space Constrained Closed-Form Ridge Compilation,
+             guaranteeing `||A_hist @ Delta W_down||_inf ~ 1e-6` across sequential sleep cycles.
         """
         t0 = time.perf_counter()
         was_training = self.training
@@ -2659,30 +2735,33 @@ class SparkXLoopV03(nn.Module):
         seq_len = int(ids.shape[1])
 
         layers = self._layers()
-        # Ensure Global NoPE layers have `lsa_indexer` attached
+        # Ensure full-attention layers have `lsa_indexer` attached
         has_any_lsa = any(getattr(lyr.self_attn, "lsa_indexer", None) is not None for lyr in layers)
         if not has_any_lsa:
             patch_spark_attention_for_lsa(self.base)
 
-        # Pair each MoE-Engram anchor to its exact or nearest Global NoPE layer (`L3, 7, 11, 15, 19, 23, 27, 31, 35`)
-        nope_indices = [
+        # Pair each MoE-Engram anchor (`{3, 7, 11, 15, 19, 23, 27, 31}`) to its exact or nearest full-attention layer
+        full_attn_indices = [
             i for i, lyr in enumerate(layers) if getattr(lyr.self_attn, "lsa_indexer", None) is not None
         ]
-        if not nope_indices:
-            nope_indices = [3, 7, 11, 15, 19, 23, 27, 31, 35]
+        if not full_attn_indices:
+            full_attn_indices = [3, 7, 11, 15, 19, 23, 27, 31, 35]
 
         anchor_to_nope: dict[int, int] = {}
         needed_nope: set[int] = set()
         for l_eng, _ in self.iter_engram_anchors():
-            nearest_nope = min(nope_indices, key=lambda n_idx: abs(int(n_idx) - int(l_eng)))
+            nearest_nope = min(full_attn_indices, key=lambda n_idx: abs(int(n_idx) - int(l_eng)))
             anchor_to_nope[int(l_eng)] = int(nearest_nope)
             needed_nope.add(int(nearest_nope))
 
         captured_hidden: dict[int, torch.Tensor] = {}
         hooks = []
 
-        def _make_pre_hook(layer_idx: int):
+        def _make_attn_pre_hook(layer_idx: int):
             def _hook(_mod, args, kwargs):
+                # Record only the first visit (Pass 0) so multi-pass loop execution stays paired with first-visit Q/K/V
+                if layer_idx in captured_hidden:
+                    return
                 h_in = args[0] if len(args) > 0 else kwargs.get("hidden_states")
                 if isinstance(h_in, torch.Tensor):
                     captured_hidden[layer_idx] = h_in.detach()
@@ -2693,18 +2772,28 @@ class SparkXLoopV03(nn.Module):
                 lyr = layers[n_idx]
                 lyr.self_attn._capture_sleep_qkv = True
                 lyr.self_attn._sleep_last_qkv = None
-                hooks.append(lyr.register_forward_pre_hook(_make_pre_hook(n_idx), with_kwargs=True))
+                hooks.append(
+                    lyr.self_attn.register_forward_pre_hook(_make_attn_pre_hook(n_idx), with_kwargs=True)
+                )
 
+        t_trace_start = time.perf_counter()
         try:
-            _ = self.forward(ids, passes=1, use_mhc=False, use_engram=False)
+            if trace_in_loop_base:
+                with self.loop_config(use_engram=False, use_esm=False):
+                    _ = self.forward_hidden(ids)
+            else:
+                with self.loop_config(passes=1, use_mhc=False, use_engram=False, enable_p3=False, use_esm=False):
+                    _ = self.forward_hidden(ids)
         finally:
             for h in hooks:
                 h.remove()
             for n_idx in needed_nope:
                 if 0 <= n_idx < len(layers):
                     layers[n_idx].self_attn._capture_sleep_qkv = False
+        trace_latency_ms = (time.perf_counter() - t_trace_start) * 1000.0
 
-        # Extract LSA clusters per needed Global NoPE layer
+        # Extract LSA clusters per needed full-attention layer
+        t_extract_start = time.perf_counter()
         nope_clusters: dict[int, list[dict[str, Any]]] = {}
         evictable_positions: set[int] = set()
         for n_idx in sorted(needed_nope):
@@ -2714,8 +2803,9 @@ class SparkXLoopV03(nn.Module):
             qkv = getattr(lyr.self_attn, "_sleep_last_qkv", None)
             h_in = captured_hidden.get(n_idx)
             lsa_idx = getattr(lyr.self_attn, "lsa_indexer", None)
-            o_proj = getattr(lyr.self_attn, "o_proj", None)
-            if qkv is None or h_in is None or lsa_idx is None or o_proj is None:
+            out_proj = getattr(lyr.self_attn, "out_proj", None) or getattr(lyr.self_attn, "o_proj", None)
+            g_proj = getattr(lyr.self_attn, "g_proj", None)
+            if qkv is None or h_in is None or lsa_idx is None or out_proj is None:
                 continue
             q_t, k_t, v_t = qkv
             if calibrate_lsa_pca and k_t.shape[2] >= lsa_idx.d_idx:
@@ -2726,7 +2816,8 @@ class SparkXLoopV03(nn.Module):
                 key=k_t,
                 value=v_t,
                 hidden_states=h_in,
-                o_proj_weight=o_proj.weight,
+                out_proj_weight=out_proj.weight,
+                g_proj_weight=(g_proj.weight if g_proj is not None else None),
                 top_m_clusters=top_m_clusters,
                 outcome_valence=outcome_valence,
             )
@@ -2734,7 +2825,9 @@ class SparkXLoopV03(nn.Module):
             for cl in cl_list:
                 evictable_positions.update(cl["token_positions"])
             lyr.self_attn._sleep_last_qkv = None
+        extract_latency_ms = (time.perf_counter() - t_extract_start) * 1000.0
 
+        t_solve_start = time.perf_counter()
         per_anchor_stats: dict[str, Any] = {}
         total_compiled = 0
         fit_errs: list[float] = []
@@ -2750,6 +2843,7 @@ class SparkXLoopV03(nn.Module):
                 alpha_ridge=alpha_ridge,
                 target_scale=target_scale,
                 inject_lexical=inject_lexical,
+                key_mode=key_mode,
             )
             res["source_nope_layer"] = int(n_idx)
             per_anchor_stats[f"L{l_eng}"] = res
@@ -2757,6 +2851,7 @@ class SparkXLoopV03(nn.Module):
             fit_errs.append(float(res["mean_rel_fit_error"]))
             if float(res["max_null_space_leakage"]) > max_leak:
                 max_leak = float(res["max_null_space_leakage"])
+        solve_latency_ms = (time.perf_counter() - t_solve_start) * 1000.0
 
         if was_training:
             self.train()
@@ -2773,6 +2868,9 @@ class SparkXLoopV03(nn.Module):
             "horizontal_compression_ratio": round(evict_cnt / max(1, seq_len), 4),
             "mean_rel_fit_error": round(sum(fit_errs) / max(1, len(fit_errs)), 6),
             "max_null_space_leakage": float(max_leak),
+            "trace_latency_ms": round(trace_latency_ms, 2),
+            "extract_latency_ms": round(extract_latency_ms, 2),
+            "solve_latency_ms": round(solve_latency_ms, 2),
             "compile_latency_ms": round(elapsed_ms, 2),
             "per_anchor_stats": per_anchor_stats,
         }

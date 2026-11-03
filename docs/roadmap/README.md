@@ -25,12 +25,12 @@
 | Stage 2 sleep compiler prototype | M | — | — | 🟥 non-runnable (B1–B5) | `47a7cc6` |
 | Review hotfix: Stage D opt-in, citations | M | — | — | 🟩 | `b841a3e` |
 | Roadmap 00–04 + LB-as-base decision | — | — | — | 🟩 | `c1b6d09` |
-| **Phase 0** repair, guardrails, math tests | M | — | G0 | 🟨 (0.3 guard landed via opt-in) | `b841a3e` |
-| **L1** loop / mHC / Engram diagnostics | L | — | report | ⬜ | |
+| **Phase 0** repair, guardrails, math tests | M | — | G0 | 🟩 | Phase 0 (`sparkx_memory_utils.py` + `tests/test_memory_math.py` + B1–B5/M4–M8/m1–m3 fixes) |
+| **L1** loop / mHC / Engram diagnostics | L | — | report | 🟨 | next |
 | **L2** Engram repair | L | L1 | GL2 | ⬜ | |
-| **L3** gain-collapse fix + healing + recurrence curriculum | L | L1 | stable ckpt (GL3 target) | ⬜ | |
-| **Phase 1** trace capture (LB + 36L, gapped position ids) | M | P0 | G1 | ⬜ | |
-| **Phase 2** D-LSA on RoPE-free slice | M | P1 | G2 | ⬜ | |
+| **L3** gain-collapse fix + healing + recurrence curriculum | L | L1 | stable ckpt (GL3 target) | 🟨 | next |
+| **Phase 1** trace capture (LB + 36L, gapped position ids) | M | P0 | G1 | 🟨 | next |
+| **Phase 2** D-LSA on RoPE-free slice | M | P1 | G2 | 🟨 (192-D `[64:256]` slice landed) | |
 | **Phase 3** ESM module + Σ_gen through LB | M | P1 | G3 | ⬜ | |
 | **Phase 4** self-study probes + LRCD on LB | M | P3, **L3** | G4 | ⬜ | |
 | **Phase 5** sleep scheduler, ledger, eviction, forget | M | P4 | G5 | ⬜ | |
@@ -56,9 +56,9 @@ flowchart LR
 - The 36L configuration exists only to attribute effects to the loop (`03 §1`).
 
 ## Immediate Next Actions
-1. **Phase 0** (`02`): fix B1–B5 / M5 / M6, add `BackboneFingerprint` (covers backbone + mHC), add CPU math tests (`tests/test_memory_math.py`).
-2. **L1** in parallel (Colab): per-pass logit lens, gain/grad trajectories, per-anchor Engram ablation on the hub checkpoint. Use **IFEval-541**, not n=50.
-3. Decide **LB-blend vs LB-pristine** (`01 C0`). The default is LB-blend plus an A-pristine ablation.
+1. **Phase 0** (`02`): fix B1–B5 / M5 / M6, add `BackboneFingerprint` (covers blended `model.base` + `TwoStreamMHC`), add math unit tests (`tests/test_memory_math.py`).
+2. **L1** in parallel (Colab): per-pass logit lens, gain/grad trajectories, per-anchor Engram ablation on the `LB-blend` hub checkpoint. Use **IFEval-541**, not n=50.
+3. **Decision locked (2026-11-03):** Keep the cooperative blend (**`LB-blend`**) as the Loop Base (`01 C0`), with `A-pristine` as an ablation row.
 
 ## Working Rules
 - Update this tracker whenever a milestone changes state (`AGENTS.md` rule 5). Every row gets a commit hash or run id.

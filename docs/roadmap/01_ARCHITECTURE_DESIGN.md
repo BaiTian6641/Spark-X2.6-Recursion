@@ -80,9 +80,9 @@ This maps directly to Nested Learning's multi-frequency levels (Behrouz et al., 
 - Keep [`restore_pristine_base_backbone`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_loop_v03_benchmarks.py#L1660) for the ablation rows (B0 / A-pristine in `03 §1`).
 - **LB fingerprint** = SHA-256 over `model.base` **and** all `TwoStreamMHC` / pass-adapter tensors. It is checked before and after every sleep cycle. The memory system may only write ESM / Engram-expert deltas.
 
-**Refinement — which backbone weights LB uses (open decision, see README).** The hub checkpoint blends task vectors into the backbone (β = 0.30 / 0.12), and the mHC controllers were co-trained with those weights. Switching to pristine weights would discard that co-adaptation. Both options are defensible if stated precisely:
-- **LB-blend (default):** keep the hub checkpoint as is. The paper claim becomes "*the base network is frozen during all memory operations*", not "*upstream weights untouched*". Add an **A-pristine** ablation row (pristine backbone + same controllers) to show the memory results don't depend on the blend.
-- **LB-pristine:** retrain controllers on pristine weights (Track L run T3). This is cleaner for the paper but costs a re-train.
+**Refinement — Loop Base backbone weights (decision locked 2026-11-03: `LB-blend`).** The hub checkpoint (`TassP0lar/Spark-X2.6-4B-En4B-A1B`) blends co-adapted task vectors into the backbone ($\beta_{\text{interface}} = 0.30$ on `input_layernorm`, `post_attention_layernorm`, `self_attn.out_proj`, `mlp.down_proj`; $\beta_{\text{body}} = 0.12$ on `q_k_v_proj`, `gate_proj`, `up_proj`; $0.0$ on `embedding`, `lm_head`, and `L0–L3`), and the 24 `TwoStreamMHC` controllers were co-trained with those weights. Per user decision:
+- **`LB-blend` (chosen base):** We keep the blended backbone + co-adapted `TwoStreamMHC` controllers as the Loop Base (`LB`). The paper's invariance guarantee is stated precisely as: *"the Loop Base (`model.base` + `TwoStreamMHC`) is 100% frozen during all wake/sleep memory operations"* (verified by SHA-256 + max-abs-diff `BackboneFingerprint`).
+- **`A-pristine` (ablation row):** We include an ablation row with pristine `XHToken/Spark-X2.6-4B` weights + the same controllers (`03 §1`) to demonstrate that vertical memory recall gains do not depend on the task-vector blend.
 
 ---
 
