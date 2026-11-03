@@ -3829,6 +3829,7 @@ def run_continue_from_hub_engram_expansion(
     push_to_hub: bool = False,
     hub_repo_id: str = "TassP0lar/Spark-X2.6-4B-En4B-A1B",
     token: Optional[str] = None,
+    run_sleep_compiler_validation: bool = False,
 ) -> Dict[str, Any]:
     """Continue training directly from an already-trained `TassP0lar/Spark-X2.6-4B-En4B-A1B` checkpoint:
     0. Optional Stage 0 (`restore_pristine_base=True`): Restore 100% pristine `XHToken/Spark-X2.6-4B` weights into `model.base`
@@ -3892,7 +3893,14 @@ def run_continue_from_hub_engram_expansion(
 
     flight_res = evaluate_dynamic_engram_flight_modes(model, tokenizer)
     active_flight = model.set_engram_flight_mode(default_flight_mode)
-    sleep_val_res = validate_vertical_sleep_memory_compiler(model, tokenizer)
+    # Stage D is experimental (see docs/roadmap/00_REVIEW_AND_VERIFIED_FACTS.md, Phase 0 blockers B1-B4).
+    sleep_val_res = None
+    if run_sleep_compiler_validation:
+        try:
+            sleep_val_res = validate_vertical_sleep_memory_compiler(model, tokenizer)
+        except Exception as e:  # never let the experimental stage destroy a finished training run
+            print(f"[Stage D Skipped] Vertical sleep compiler validation failed: {type(e).__name__}: {e}")
+            sleep_val_res = {"status": "error", "error": f"{type(e).__name__}: {e}"}
     gc_stats = free_vram_and_prune_checkpoints(model=model, keep_latest_n=1, prune_intermediate_stage_dirs=True)
     print(f"[Continued Hub Checkpoint Ready] Active Engram Flight Mode: {active_flight}")
 

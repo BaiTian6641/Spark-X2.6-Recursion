@@ -170,9 +170,9 @@ Used in [`patch_spark_attention_for_long_context`](file:///storage/emulated/10/D
 ### 1.5 Latent Sparse Attention (`D-LSA`), Nested Learning, Sleep-Time Memory Compilation & Null-Space Knowledge Editing (`AlphaEdit`)
 Used in [`LatentSparseAttentionIndexer`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_loop_v03_core.py#L756-L1025), [`ZipfianTieredMoEEngram.compile_clusters_alphaedit`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_loop_v03_core.py#L1867-L2096), [`SparkXLoopV03.run_sleep_time_memory_compiler`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_loop_v03_core.py#L2627-L2779), and [`validate_vertical_sleep_memory_compiler`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_loop_v03_benchmarks.py#L3909-L4062) to implement horizontal working attention (`D-LSA`) coupled with vertical sleep-time memory consolidation (`LSA -> AlphaEdit Null-Space MoE-Engram`):
 
-1. **Latent Sparse Attention: Extending Transformative Context to 10M Tokens via Semantic Index Clustering (`D-LSA` & `T-LSA`)**
-   - **Authors:** Petr Kubicek et al. (*Prefrontal AI*)
-   - **Preprint & Code:** `arXiv:2610.42147` (2026), [https://github.com/Prefrontal-AI/latent-sparse-attention](https://github.com/Prefrontal-AI/latent-sparse-attention)
+1. **Latent Sparse Attention: Towards Subquadratic Ultra-Long Context Attention (`D-LSA` / `N-LSA`, Flat & Tree)**
+   - **Authors:** Ales Kubicek, Andrea Caciolai, Liangzu Peng, Sukrit Sumant, Benjamin Hoover, Fraser Greenlee, Ruairidh M. Battleday, Radim Urban, Torsten Hoefler, James C. R. Whittington (*Prefrontal AI & ETH Zurich*)
+   - **Preprint & Code:** arXiv:2610.42147 (Oct 2026), [https://github.com/Prefrontal-AI/latent-sparse-attention](https://github.com/Prefrontal-AI/latent-sparse-attention)
 2. **AlphaEdit: Null-Space Constrained Knowledge Editing for Language Models**
    - **Authors:** Junfeng Fang, Houcheng Jiang, Kun Wang, Yunshan Ma, Shi Jie, Xiang Wang, Xiangnan He, Tat-Seng Chua
    - **Publication:** *International Conference on Learning Representations (ICLR 2025, Outstanding Paper)*, [arXiv:2410.02355](https://arxiv.org/abs/2410.02355)
@@ -189,7 +189,7 @@ Used in [`LatentSparseAttentionIndexer`](file:///storage/emulated/10/Documents/S
    - **Authors:** Sabri Eyuboglu, Ryan Ehrlich, Simran Arora, Neel Guha, Dylan Zinsley, Emily Liu, Will Tennien, Atri Rudra, James Zou, Azalia Mirhoseini, Christopher Ré (*Hazy Research, Stanford University*)
    - **Preprint:** [arXiv:2506.06266](https://arxiv.org/abs/2506.06266) (2025)
 7. **Doc-to-LoRA (`D2L`): Learning to Instantly Internalize Contexts**
-   - **Authors:** Rujikorn Charakorn, Edoardo Cetin, Yujin Tang, Robert Tjarko Lange (*Sakana AI*)
+   - **Authors:** Rujikorn Charakorn, Edoardo Cetin, Shinnosuke Uesaka, Robert Tjarko Lange (*Sakana AI*)
    - **Preprint:** [arXiv:2602.15902](https://arxiv.org/abs/2602.15902) (2026)
 8. **Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention (`NSA`)**
    - **Authors:** Jingyang Yuan et al. (*DeepSeek-AI & Peking University*)
@@ -197,8 +197,8 @@ Used in [`LatentSparseAttentionIndexer`](file:///storage/emulated/10/Documents/S
 
 ```bibtex
 @article{kubicek2026lsa,
-  title={Latent Sparse Attention: Extending Transformative Context to 10M Tokens via Semantic Index Clustering},
-  author={Kubicek, Petr and others},
+  title={Latent Sparse Attention: Towards Subquadratic Ultra-Long Context Attention},
+  author={Kubicek, Ales and Caciolai, Andrea and Peng, Liangzu and Sumant, Sukrit and Hoover, Benjamin and Greenlee, Fraser and Battleday, Ruairidh M. and Urban, Radim and Hoefler, Torsten and Whittington, James C. R.},
   journal={arXiv preprint arXiv:2610.42147},
   year={2026},
   url={https://github.com/Prefrontal-AI/latent-sparse-attention}
@@ -246,7 +246,7 @@ Used in [`LatentSparseAttentionIndexer`](file:///storage/emulated/10/Documents/S
 
 @article{charakorn2026doctolora,
   title={Doc-to-LoRA: Learning to Instantly Internalize Contexts},
-  author={Charakorn, Rujikorn and Cetin, Edoardo and Tang, Yujin and Lange, Robert Tjarko},
+  author={Charakorn, Rujikorn and Cetin, Edoardo and Uesaka, Shinnosuke and Lange, Robert Tjarko},
   journal={arXiv preprint arXiv:2602.15902},
   year={2026},
   url={https://arxiv.org/abs/2602.15902}
