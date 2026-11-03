@@ -126,8 +126,11 @@ def load_sparkx_loop_v03(
     has_merged_backbone = bool(meta.get('merged_standalone', True)) and not bool(use_pristine_base)
     backbone_source = repo_or_dir if has_merged_backbone else (base_repo or meta.get('base_model', 'XHToken/Spark-X2.6-4B'))
 
-    print(f"[Loader] Loading tokenizer & standalone 36L backbone from `{backbone_source}`...")
-    tok = AutoTokenizer.from_pretrained(repo_or_dir, trust_remote_code=True, token=token)
+    print(f"[Loader] Loading tokenizer & standalone 36L backbone from `{backbone_source}` (+ mHC/Engram state from `{repo_or_dir}`)...")
+    try:
+        tok = AutoTokenizer.from_pretrained(backbone_source, trust_remote_code=True, token=token)
+    except Exception:
+        tok = AutoTokenizer.from_pretrained(repo_or_dir, trust_remote_code=True, token=token)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
 
@@ -139,6 +142,7 @@ def load_sparkx_loop_v03(
         token=token,
     ).to(device)
     patch_spark_for_unsloth_triton(base)
+    base._sparkx_is_pristine_base = not has_merged_backbone
 
     model = SparkXLoopV03(base, settings, patch_sdpa=not enable_loglinear_kv).to(device)
     model.controllers.to(device=device)
@@ -172,6 +176,7 @@ def load_sparkx_loop_v03(
             recent_window=loglinear_recent_window,
             sink_tokens=loglinear_sink_tokens,
         )
+        model.base._sparkx_exact_kv_32k = bool(loglinear_exact_threshold >= 32768)
 
     model.loaded_meta = meta
     model.eval()

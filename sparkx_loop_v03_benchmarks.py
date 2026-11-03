@@ -1626,22 +1626,27 @@ def restore_pristine_base_backbone(
     from sparkx_loop_v03_core import patch_spark_attention_for_loglinear_kv, patch_spark_for_unsloth_triton
 
     print("=" * 108)
-    print(f"[Pristine Backbone Restoration] Reloading clean 36L weights from `{base_model_id}` into `model.base` (CPU -> GPU in-place)...")
     t0 = time.time()
-    clean_base = AutoModelForCausalLM.from_pretrained(
-        base_model_id,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-        low_cpu_mem_usage=True,
-        device_map="cpu",
-        token=token,
-    )
-    clean_sd = clean_base.state_dict()
-    missing, unexpected = model.base.load_state_dict(clean_sd, strict=False)
-    del clean_sd, clean_base
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if getattr(model.base, "_sparkx_is_pristine_base", False):
+        print(f"[Pristine Backbone Verified] `model.base` was already loaded directly from `{base_model_id}` (skipping redundant reload).")
+        missing, unexpected = [], []
+    else:
+        print(f"[Pristine Backbone Restoration] Reloading clean 36L weights from `{base_model_id}` into `model.base` (CPU -> GPU in-place)...")
+        clean_base = AutoModelForCausalLM.from_pretrained(
+            base_model_id,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            device_map="cpu",
+            token=token,
+        )
+        clean_sd = clean_base.state_dict()
+        missing, unexpected = model.base.load_state_dict(clean_sd, strict=False)
+        del clean_sd, clean_base
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        model.base._sparkx_is_pristine_base = True
 
     patch_spark_for_unsloth_triton(model.base)
     patch_spark_attention_for_loglinear_kv(model.base, exact_threshold=32768, recent_window=4096, sink_tokens=32)
@@ -1660,8 +1665,8 @@ def restore_pristine_base_backbone(
 
     dt = time.time() - t0
     print(
-        f"[Pristine Backbone Restoration Complete in {dt:.1f}s] "
-        f"`model.base` restored to 100% exact `{base_model_id}` weights (missing={len(missing)}, unexpected={len(unexpected)})."
+        f"[Pristine Backbone Ready in {dt:.1f}s] "
+        f"`model.base` locked to 100% exact `{base_model_id}` weights (missing={len(missing)}, unexpected={len(unexpected)})."
     )
     print("=" * 108)
     return {
