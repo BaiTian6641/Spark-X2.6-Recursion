@@ -24,7 +24,7 @@
 | Stage 1 research synthesis (`AGENTS.md`) | — | — | — | 🟩 | `0c07b3a` |
 | Stage 2 sleep compiler prototype | M | — | — | 🟥 non-runnable (B1–B5) | `47a7cc6` |
 | Review hotfix: Stage D opt-in, citations | M | — | — | 🟩 | `b841a3e` |
-| Roadmap 00–04 + LB-as-base decision | — | — | — | 🟩 | this commit |
+| Roadmap 00–04 + LB-as-base decision | — | — | — | 🟩 | `c1b6d09` |
 | **Phase 0** repair, guardrails, math tests | M | — | G0 | 🟨 (0.3 guard landed via opt-in) | `b841a3e` |
 | **L1** loop / mHC / Engram diagnostics | L | — | report | ⬜ | |
 | **L2** Engram repair | L | L1 | GL2 | ⬜ | |
