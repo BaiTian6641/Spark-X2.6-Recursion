@@ -1957,6 +1957,7 @@ class SparkXLoopV03(nn.Module):
             'domain_focus': dom if selected_indices else 'general',
             'boost': round(float(boost) if selected_indices else 0.0, 4),
             'zone_experts': selected_indices,
+            'expert_indices': selected_indices,
         }
 
     @torch.no_grad()
@@ -2490,6 +2491,8 @@ def count_en4b_a1b_params(model: SparkXLoopV03) -> dict[str, int]:
         t3_act = mod.active_top_k * per_exp
         proj_act = mod.lexical_up.weight.numel() + mod.query_proj.weight.numel() + mod.ctx_gate.weight.numel() + mod.project.weight.numel()
         active_eng += (t2 + t3_act + proj_act)
+    total_params = backbone_total + ctrl_total + eng_total
+    active_params = backbone_total + ctrl_total + active_eng
     return {
         'backbone_total': backbone_total,
         'controllers_total': ctrl_total,
@@ -2497,8 +2500,10 @@ def count_en4b_a1b_params(model: SparkXLoopV03) -> dict[str, int]:
         'engram_cpu_tier1b_total': eng_cpu_tier1b,
         'engram_total': eng_total,
         'engram_active_per_pass': active_eng,
-        'model_total_params': backbone_total + ctrl_total + eng_total,
-        'model_active_params': backbone_total + ctrl_total + active_eng,
+        'model_total_params': total_params,
+        'model_active_params': active_params,
+        'grand_total': total_params,
+        'active_total_per_token': active_params,
     }
 
 
