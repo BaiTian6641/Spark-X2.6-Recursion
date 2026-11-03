@@ -366,13 +366,16 @@ def generate_chat_response(
     if prompt_ends_with_think and not raw_text.lstrip().startswith("<think>"):
         raw_text = "<think>\n" + raw_text
     think_text, answer_text, closed_think = strip_thinking_trace(raw_text)
+    n_tok = int(gen_ids.numel())
     return {
         "raw_text": raw_text,
         "think_text": think_text,
         "answer_text": answer_text,
+        "clean_answer": answer_text,
         "closed_think": closed_think,
-        "tokens": int(gen_ids.numel()),
-        "tok_per_sec": float(gen_ids.numel() / dt),
+        "tokens": n_tok,
+        "tokens_generated": n_tok,
+        "tok_per_sec": float(n_tok / dt),
         "elapsed_sec": dt,
     }
 
@@ -1627,7 +1630,8 @@ def restore_pristine_base_backbone(
 
     print("=" * 108)
     t0 = time.time()
-    if getattr(model.base, "_sparkx_is_pristine_base", False):
+    was_already_pristine = bool(getattr(model.base, "_sparkx_is_pristine_base", False))
+    if was_already_pristine:
         print(f"[Pristine Backbone Verified] `model.base` was already loaded directly from `{base_model_id}` (skipping redundant reload).")
         missing, unexpected = [], []
     else:
@@ -1655,8 +1659,8 @@ def restore_pristine_base_backbone(
         p.requires_grad_(False)
     model.base.eval()
 
-    # Softly attenuate mHC residual injection gains so Phase-4 smoothly re-aligns controllers to pristine hidden states
-    if soft_reset_mhc_gain is not None and hasattr(model, "controllers"):
+    # Softly attenuate mHC residual injection gains ONLY if we just replaced drifted base weights
+    if (not was_already_pristine) and soft_reset_mhc_gain is not None and hasattr(model, "controllers"):
         for ctrl in model.controllers.values():
             if hasattr(ctrl, "extra_gain") and ctrl.extra_gain is not None:
                 ctrl.extra_gain.data.mul_(float(soft_reset_mhc_gain))
