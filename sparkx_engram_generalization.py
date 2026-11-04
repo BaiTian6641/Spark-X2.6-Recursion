@@ -478,3 +478,208 @@ def engram_utility_report(
         print("harmful anchors:", rep["harmful_anchors"], "| helpful anchors:", rep["helpful_anchors"])
         print("=" * 100)
     return rep
+
+
+# --------------------------------------------------------------------------------------
+# Train-time validation (used by Cell 4) + post-hoc, cross-validated anchor gating
+# --------------------------------------------------------------------------------------
+def _release_eval_caches(model: Any) -> None:
+    """Drop GPU copies / caches that eval-mode Engram lookups create (stale after optimizer steps; large)."""
+    for m in model.all_engram_modules():
+        m._eval_tier1b_gpu = None
+        m._eval_lex_cache = None
+
+
+def _val_ce(model: Any, samples: Sequence[Dict[str, Any]], max_tokens: int) -> tuple:
+    """Label-masked next-token CE over training-format samples `{'input_ids': 1-D, 'labels': 1-D}` -> (sum_nll, n_tokens)."""
+    import torch
+    import torch.nn.functional as F
+
+    device = next(model.base.parameters()).device
+    tot, n = 0.0, 0
+    for s in samples:
+        ids = s["input_ids"][:max_tokens].unsqueeze(0).to(device)
+        lbl = s["labels"][:max_tokens].unsqueeze(0).to(device)
+        cnt = int((lbl[:, 1:] != -100).sum().item())
+        if cnt == 0:
+            continue
+        with torch.no_grad():
+            logits = model.forward_logits(ids).float()
+        nll = F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)), lbl[:, 1:].reshape(-1),
+                              ignore_index=-100, reduction="sum")
+        tot += float(nll.item())
+        n += cnt
+        del logits
+    return tot, n
+
+
+def stage_validation_report(
+    model: Any,
+    val_samples: Sequence[Dict[str, Any]],
+    restore_loop: Dict[str, Any],
+    max_tokens: int = 4096,
+    anchor_audit: bool = True,
+) -> Dict[str, Any]:
+    """CE on held-out training-distribution sequences with Engram OFF / FULL / leave-one-anchor-out.
+
+    `removal_delta_ce` < 0 means removing that anchor LOWERS validation CE, i.e. the anchor is harmful.
+    Always restores the caller's loop config; the caller restores train mode.
+    """
+    import torch
+
+    prev_ckpt = bool(getattr(model, "enable_checkpoint", False))
+    model.eval()
+    model.enable_checkpoint = False
+    model.settings.checkpoint_layers = False
+    _release_eval_caches(model)
+    rep: Dict[str, Any] = {}
+    try:
+        def ce(use_engram: bool, lex: float = 1.0, sem: float = 1.0, modules=None) -> float:
+            kw = dict(restore_loop)
+            kw["use_engram"] = use_engram
+            model.set_loop(**kw)
+            with engram_ablation(model, lex=lex, sem=sem, modules=modules):
+                s, n = _val_ce(model, val_samples, max_tokens)
+            return s / max(1, n)
+
+        rep["ce_off"] = ce(False)
+        rep["ce_full"] = ce(True)
+        rep["engram_delta_ce"] = rep["ce_full"] - rep["ce_off"]  # positive = Engram hurts
+        rep["n_val_seqs"] = len(val_samples)
+        if anchor_audit:
+            loo = {}
+            for layer, mod in model.iter_engram_anchors():
+                c = ce(True, lex=0.0, sem=0.0, modules=[mod])
+                loo[int(layer)] = c - rep["ce_full"]
+            rep["removal_delta_ce"] = loo
+            rep["harmful_anchors"] = sorted(l for l, d in loo.items() if d < -0.002)
+    finally:
+        model.set_loop(**restore_loop)
+        _release_eval_caches(model)
+        model.enable_checkpoint = prev_ckpt
+        model.settings.checkpoint_layers = prev_ckpt
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return rep
+
+
+def maybe_stage_validation(
+    model: Any,
+    cfg: Dict[str, Any],
+    val_samples: Sequence[Dict[str, Any]],
+    stage_name: str,
+    tag: str,
+    restore_loop: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Crash-proof wrapper used by `run_v03_four_stage_training`; never raises, always returns the model to train mode."""
+    if not val_samples or not bool(cfg.get("ENGRAM_STAGE_VALIDATION", True)) or not restore_loop.get("use_engram", False):
+        return None
+    out: Optional[Dict[str, Any]] = None
+    try:
+        out = stage_validation_report(
+            model, val_samples, restore_loop,
+            max_tokens=int(cfg.get("VAL_MAX_TOKENS", 4096)),
+            anchor_audit=bool(cfg.get("VAL_ANCHOR_AUDIT", True)),
+        )
+        out.update({"stage": stage_name, "tag": tag})
+        verdict = "Engram HURTS held-out CE" if out["engram_delta_ce"] > 0.005 else (
+            "Engram helps" if out["engram_delta_ce"] < -0.005 else "Engram ~neutral")
+        print(f"[Engram Val | {stage_name} | {tag}] {out['n_val_seqs']} held-out seqs: CE off={out['ce_off']:.4f} "
+              f"full={out['ce_full']:.4f} delta={out['engram_delta_ce']:+.4f} -> {verdict}", flush=True)
+        if "removal_delta_ce" in out:
+            print("   anchor removal delta CE (negative = anchor harmful): "
+                  + ", ".join(f"L{l}:{d:+.4f}" for l, d in sorted(out["removal_delta_ce"].items()))
+                  + f" | harmful={out['harmful_anchors']}", flush=True)
+    except Exception as exc:  # validation must never kill a multi-hour run
+        print(f"[Engram Val Notice] skipped ({type(exc).__name__}: {exc})", flush=True)
+    finally:
+        model.train()
+        model.enable_checkpoint = True
+        model.settings.checkpoint_layers = True
+    return out
+
+
+def apply_anchor_gating(model: Any, anchors: Sequence[int]) -> List[int]:
+    """Persistently silence the given anchor layers (gain -> -30, i.e. sigmoid ~ 0; saved in the state dict)."""
+    import torch
+
+    done = []
+    by_layer = dict((int(l), m) for l, m in model.iter_engram_anchors())
+    for l in anchors:
+        mod = by_layer.get(int(l))
+        if mod is None:
+            continue
+        with torch.no_grad():
+            mod.gain.fill_(-30.0)
+        done.append(int(l))
+    return done
+
+
+def cross_validated_anchor_gating(
+    model: Any,
+    tokenizer: Any,
+    texts: Optional[Sequence[str]] = None,
+    threshold: float = 0.002,
+    flight_mode: str = "deep_knowledge",
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Select harmful anchors on one half of the texts and score the gated model on the OTHER half (both directions).
+
+    Avoids reporting a gain on the same texts used to choose the anchors. With very few texts this is still low-power;
+    treat the result as provisional until a larger held-out set exists.
+    """
+    texts = list(texts) if texts is not None else list(TRUE_HELDOUT_TEXTS)
+    folds = [texts[0::2], texts[1::2]]
+    if min(len(f) for f in folds) < 1:
+        raise ValueError("need at least 2 texts")
+    prev_ckpt = bool(getattr(model, "enable_checkpoint", False))
+    model.eval()
+    model.enable_checkpoint = False
+    model.settings.checkpoint_layers = False
+    model.set_engram_flight_mode(flight_mode)
+    model.set_domain_engram_focus("general", boost=0.0)
+    by_layer = dict((int(l), m) for l, m in model.iter_engram_anchors())
+
+    def ce(tx, use_engram=True, modules=None):
+        model.set_loop(start=4, end=28, passes=2, use_mhc=True, use_engram=use_engram, enable_p3=True, p3_start=12, p3_end=24)
+        with engram_ablation(model, lex=0.0, sem=0.0, modules=modules) if modules else engram_ablation(model):
+            rows = _per_text_ce(model, tokenizer, tx)
+        return sum(r[0] for r in rows), sum(r[1] for r in rows)
+
+    res: Dict[str, Any] = {"folds": []}
+    tot = {"off": [0.0, 0], "full": [0.0, 0], "gated": [0.0, 0]}
+    try:
+        for sel, ev in ((folds[0], folds[1]), (folds[1], folds[0])):
+            if not sel or not ev:
+                continue
+            s_full = ce(sel)
+            s_full_ce = s_full[0] / s_full[1]
+            deltas = {}
+            for l, m in by_layer.items():
+                s = ce(sel, modules=[m])
+                deltas[l] = s[0] / s[1] - s_full_ce
+            chosen = sorted(l for l, d in deltas.items() if d < -threshold)
+            e_off, e_full = ce(ev, use_engram=False), ce(ev)
+            e_gated = ce(ev, modules=[by_layer[l] for l in chosen]) if chosen else e_full
+            for k, v in (("off", e_off), ("full", e_full), ("gated", e_gated)):
+                tot[k][0] += v[0]
+                tot[k][1] += v[1]
+            res["folds"].append({"chosen": chosen, "selection_deltas": deltas,
+                                 "eval_ce": {"off": e_off[0] / e_off[1], "full": e_full[0] / e_full[1], "gated": e_gated[0] / e_gated[1]}})
+    finally:
+        model.set_loop(start=4, end=28, passes=2, use_mhc=True, use_engram=True, enable_p3=True, p3_start=12, p3_end=24)
+        model.enable_checkpoint = prev_ckpt
+        model.settings.checkpoint_layers = prev_ckpt
+    res["cv_ce"] = {k: v[0] / max(1, v[1]) for k, v in tot.items()}
+    sets = [set(f["chosen"]) for f in res["folds"]]
+    res["stable_anchors"] = sorted(set.intersection(*sets)) if sets else []
+    if verbose:
+        print("\n" + "=" * 100)
+        print("[CROSS-VALIDATED ANCHOR GATING] select on one half, evaluate on the other (token-weighted over both)")
+        for i, f in enumerate(res["folds"]):
+            print(f"  fold {i}: chosen={f['chosen']}  eval CE off={f['eval_ce']['off']:.4f} full={f['eval_ce']['full']:.4f} gated={f['eval_ce']['gated']:.4f}")
+        c = res["cv_ce"]
+        print(f"  CV CE: OFF={c['off']:.4f}  FULL={c['full']:.4f}  GATED={c['gated']:.4f}   (gated - off = {c['gated'] - c['off']:+.4f})")
+        print(f"  anchors chosen in BOTH folds: {res['stable_anchors']}")
+        print("=" * 100)
+    return res

@@ -100,5 +100,23 @@ class TestSummarizer(unittest.TestCase):
         self.assertIn("CONTROL", eg.interpret(s["mean_transfer"], s["max_transfer"], s["mean_orig_gain"], s["mean_control_ratio"]))
 
 
+class TestStageValidationGuards(unittest.TestCase):
+    """`maybe_stage_validation` must be a no-op (and never touch the model) unless fully enabled."""
+
+    class _Boom:
+        def __getattr__(self, name):  # any model access would raise
+            raise AssertionError(f"model touched: {name}")
+
+    def test_noop_without_val_samples(self):
+        self.assertIsNone(eg.maybe_stage_validation(self._Boom(), {}, [], "s", "start", {"use_engram": True}))
+
+    def test_noop_when_disabled(self):
+        cfg = {"ENGRAM_STAGE_VALIDATION": False}
+        self.assertIsNone(eg.maybe_stage_validation(self._Boom(), cfg, [{"input_ids": 1, "labels": 1}], "s", "start", {"use_engram": True}))
+
+    def test_noop_when_engram_off_in_stage(self):
+        self.assertIsNone(eg.maybe_stage_validation(self._Boom(), {}, [{"input_ids": 1, "labels": 1}], "s", "start", {"use_engram": False}))
+
+
 if __name__ == "__main__":
     unittest.main()

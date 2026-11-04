@@ -1783,6 +1783,7 @@ def run_v03_four_stage_training(
         if is_dirty:
             reload_fresh_posttrained_spark_x26(model, cfg, hf_token=hf_token)
 
+    engram_val_log: List[Dict[str, Any]] = []
     try:
         for stage_idx, stage_cfg in enumerate(cfg['STAGES']):
             if budget_reached:
@@ -1791,6 +1792,13 @@ def run_v03_four_stage_training(
             seq_len = int(stage_cfg['seq_len'])
             stage_steps = int(stage_cfg['steps'])
             pool = stage_pools.get(seq_len) or next(iter(stage_pools.values()))
+            # Hold out a few packed sequences (never trained on) so Engram utility can be measured on unseen data.
+            val_samples: List[Dict[str, Any]] = []
+            _val_k = int(cfg.get('VAL_HOLDOUT_SEQS', 6))
+            if _val_k > 0 and len(pool) >= _val_k * 8:
+                _val_idx = set(random.Random(int(cfg.get('SEED', 42)) + 777).sample(range(len(pool)), _val_k))
+                val_samples = [pool[i] for i in sorted(_val_idx)]
+                pool = [pp for i, pp in enumerate(pool) if i not in _val_idx]
             steps_per_epoch = max(1, len(pool) // grad_accum)
 
             freeze_bb = bool(stage_cfg.get('freeze_backbone', True))
@@ -1881,6 +1889,15 @@ def run_v03_four_stage_training(
             )
             print('=' * 108, flush=True)
 
+            _stage_loop_kw = dict(
+                start=int(stage_cfg['start']), end=int(stage_cfg['end']), passes=eff_passes, use_mhc=use_mhc,
+                use_engram=use_engram, enable_p3=bool(stage_cfg.get('enable_p3', False)),
+                p3_start=int(stage_cfg.get('p3_start', 12)), p3_end=int(stage_cfg.get('p3_end', 24)),
+            )
+            import sparkx_engram_generalization as _eg_val
+            _v0 = _eg_val.maybe_stage_validation(model, cfg, val_samples, stage_name, 'start', _stage_loop_kw)
+            if _v0:
+                engram_val_log.append(_v0)
             optimizer.zero_grad(set_to_none=True)
             pool_idx = 0
             epoch_order = list(range(len(pool)))
@@ -2015,6 +2032,9 @@ def run_v03_four_stage_training(
                     budget_reached = True
                     break
 
+            _v1 = _eg_val.maybe_stage_validation(model, cfg, val_samples, stage_name, 'end', _stage_loop_kw)
+            if _v1:
+                engram_val_log.append(_v1)
             save_and_push_v03_checkpoint(
                 model, tokenizer, cfg, stage_name, global_step,
                 history[-1] if history else {'loss': 0.0},
@@ -2119,6 +2139,7 @@ def run_v03_four_stage_training(
         'phase4_report': phase4_report,
         'si_srsi_report': si_srsi_report,
         'flight_info': flight_info,
+        'engram_stage_validation': engram_val_log,
         'final_dir': str(final_dir),
     }
 
