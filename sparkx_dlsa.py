@@ -198,27 +198,35 @@ class PagedLatentIndex:
                 "max_tokens": float(nz.max())}
 
     @torch.no_grad()
-    def select(self, q_idx: torch.Tensor, budget: int) -> torch.Tensor:
-        """`q_idx`: [d] or [Tq, d] unit-norm (mean-pooled if 2-D). Returns sorted exact key positions (sink+selected+tail)."""
+    def select(self, q_idx: torch.Tensor, budget: int, upto: Optional[int] = None) -> torch.Tensor:
+        """`q_idx`: [d] or [Tq, d] unit-norm (mean-pooled if 2-D). Returns sorted exact key positions (sink+selected+tail).
+
+        `upto`: causal horizon for a query at position `upto - 1` (keys `>= upto` do not exist for it). Because Ward blocks are
+        independent, restricting to the blocks that end before `upto - window` is identical to re-indexing `k[:upto]`; this lets
+        one index serve every decode step (and grow incrementally as the cache grows).
+        """
         dev = q_idx.device
-        sink = torch.arange(0, min(self.n_sink, self.t), device=dev)
-        tail = torch.arange(self.clustered_end, self.t, device=dev)
-        if self.n_blocks == 0:
+        upto = self.t if upto is None else min(int(upto), self.t)
+        limit = 0 if self.n_blocks == 0 else max(0, min(self.n_blocks, (upto - self.window - self.mid_start) // self.n_cluster))
+        clustered_end = self.mid_start + limit * self.n_cluster
+        sink = torch.arange(0, min(self.n_sink, upto), device=dev)
+        tail = torch.arange(clustered_end, upto, device=dev)
+        if limit == 0:
             return torch.cat([sink, tail]).unique()
         q = F.normalize(q_idx.float().reshape(-1, q_idx.shape[-1]).mean(dim=0), dim=-1, eps=1e-6)
-        scores = torch.einsum("bcd,d->bc", self.centroids.to(dev), q)
-        toks = self.bucket_tokens.to(dev)
-        scores = scores.masked_fill(toks == 0, float("-inf"))
+        cents = self.centroids[:limit].to(dev)
+        toks = self.bucket_tokens[:limit].to(dev)
+        scores = torch.einsum("bcd,d->bc", cents, q).masked_fill(toks == 0, float("-inf"))
         flat_s, flat_i = scores.reshape(-1).sort(descending=True)
         flat_t = toks.reshape(-1)[flat_i]
         csum = torch.cumsum(flat_t, dim=0)
         take = (csum - flat_t) < int(budget)  # include a bucket while the budget is not yet exhausted
         take &= torch.isfinite(flat_s)
         sel_flat = flat_i[take]
-        sel_mask = torch.zeros(self.n_blocks * self.pools_per_block, dtype=torch.bool, device=dev)
+        sel_mask = torch.zeros(limit * self.pools_per_block, dtype=torch.bool, device=dev)
         sel_mask[sel_flat] = True
-        sel_mask = sel_mask.view(self.n_blocks, self.pools_per_block)  # [B, C]
-        pool_sel = sel_mask.gather(1, self.labels.to(dev))  # [B, P]
+        sel_mask = sel_mask.view(limit, self.pools_per_block)  # [B, C]
+        pool_sel = sel_mask.gather(1, self.labels[:limit].to(dev))  # [B, P]
         pool_ids = torch.nonzero(pool_sel)  # [M, 2]
         base = self.mid_start + pool_ids[:, 0] * self.n_cluster + pool_ids[:, 1] * self.n_pool
         mid = (base.unsqueeze(1) + torch.arange(self.n_pool, device=dev).unsqueeze(0)).reshape(-1)
@@ -337,7 +345,7 @@ def mid_region_mask(q_positions: Sequence[int], t: int, n_sink: int, window: int
 
 def distill_indexer(indexer: FaithfulDLSAIndexer, samples: Sequence[Dict[str, torch.Tensor]], steps: int = 200,
                     lr: float = 3e-3, queries_per_sample: int = 64, seed: int = 0, log_every: int = 50,
-                    log=print) -> Dict[str, Any]:
+                    log=print, scale: Optional[float] = None) -> Dict[str, Any]:
     """Distil `W_q, W_k, tau` against the frozen teacher with per-key KL on the middle region.
 
     `samples`: dicts with `q` [H_q, T, D] and `k` [H_kv, T, D] (post-RoPE tensors captured from the frozen model on long
@@ -354,7 +362,7 @@ def distill_indexer(indexer: FaithfulDLSAIndexer, samples: Sequence[Dict[str, to
         pos = torch.randint(lo, t, (min(queries_per_sample, t - lo),), generator=g).sort().values.tolist()
         q_in_all, k_in = indexer.inputs(q, k)
         mask = mid_region_mask(pos, t, indexer.n_sink, indexer.window, q.device)
-        p = teacher_attention(q, k, pos)
+        p = teacher_attention(q, k, pos, scale)
         p = p * mask  # renormalise on the middle region: this is what the indexer is responsible for ranking
         p = p / p.sum(dim=-1, keepdim=True).clamp(min=1e-12)
         cache.append((q_in_all[pos], k_in, p, mask))
@@ -394,6 +402,7 @@ def evaluate_selectors(
     q_positions: Sequence[int],
     budget: int = 2048,
     seed: int = 0,
+    scale: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Attention-mass recall at equal key budgets for sampled decode-like queries (each query sees keys `<= pos`).
 
@@ -402,23 +411,24 @@ def evaluate_selectors(
     `random`, `oracle` (true top-k keys by attention: upper bound). Sink and window are always included in every arm.
     """
     g = torch.Generator().manual_seed(seed)
+    dev = q.device
     q_in_all, k_in = indexer.inputs(q, k)
     k_idx_all = indexer.project_k(k_in)
+    index = PagedLatentIndex(k_idx_all, indexer.n_sink, indexer.n_pool, indexer.n_cluster, indexer.avg_bucket_size,
+                             indexer.max_bucket_size, indexer.window)  # built once; `upto` gives per-query causality
     res: Dict[str, List[float]] = {a: [] for a in ("faithful", "flat_oracle_index", "contiguous", "random", "oracle")}
     sizes: List[int] = []
     for p in q_positions:
-        tp = teacher_attention(q, k, [p])[0]  # [T]
+        tp = teacher_attention(q, k, [p], scale)[0]  # [T]
         n = p + 1
-        sink = torch.arange(0, min(indexer.n_sink, n))
-        win = torch.arange(max(0, n - indexer.window), n)
+        sink = torch.arange(0, min(indexer.n_sink, n), device=dev)
+        win = torch.arange(max(0, n - indexer.window), n, device=dev)
         always = torch.cat([sink, win]).unique()
         mid_lo, mid_hi = indexer.n_sink, max(indexer.n_sink, n - indexer.window)
         if mid_hi - mid_lo <= budget:
             continue
         qv = indexer.project_q(q_in_all[p: p + 1])
-        idx = PagedLatentIndex(k_idx_all[: p + 1], indexer.n_sink, indexer.n_pool, indexer.n_cluster,
-                               indexer.avg_bucket_size, indexer.max_bucket_size, indexer.window)
-        sel = idx.select(qv, budget)
+        sel = index.select(qv, budget, upto=n)
         sizes.append(int(sel.numel()))
         res["faithful"].append(recall_of_selection(tp, sel))
         scores = (k_idx_all[mid_lo:mid_hi] @ qv[0])
@@ -428,9 +438,9 @@ def evaluate_selectors(
         n_spans = (mid_hi - mid_lo) // span
         span_scores = (F.normalize(k_idx_all[mid_lo: mid_lo + n_spans * span].view(n_spans, span, -1).sum(1), dim=-1) @ qv[0])
         top_sp = span_scores.topk(min(max(1, budget // span), n_spans)).indices
-        cont = (mid_lo + top_sp.unsqueeze(1) * span + torch.arange(span).unsqueeze(0)).reshape(-1)
+        cont = (mid_lo + top_sp.unsqueeze(1) * span + torch.arange(span, device=dev).unsqueeze(0)).reshape(-1)
         res["contiguous"].append(recall_of_selection(tp, torch.cat([always, cont]).unique()))
-        rnd = (torch.randperm(mid_hi - mid_lo, generator=g)[:budget] + mid_lo)
+        rnd = (torch.randperm(mid_hi - mid_lo, generator=g)[:budget] + mid_lo).to(dev)
         res["random"].append(recall_of_selection(tp, torch.cat([always, rnd]).unique()))
         orc = (tp[mid_lo:mid_hi].topk(min(budget, mid_hi - mid_lo)).indices + mid_lo)
         res["oracle"].append(recall_of_selection(tp, torch.cat([always, orc]).unique()))

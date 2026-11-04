@@ -94,6 +94,18 @@ class TestDLSA(unittest.TestCase):
         n_mid = int(((sel >= 4) & (sel < idx.clustered_end)).sum())  # remainder keys up to clustered_end..T are always read
         self.assertLessEqual(n_mid, 128 + 16)
 
+    def test_single_index_with_upto_equals_reindexing_prefix(self):
+        q, k, _, _ = make_scattered(t=1024, seed=5)
+        ix = small_indexer()
+        ix.fit_pca(ix.inputs(q, k)[1])
+        k_in = ix.inputs(q, k)[1]
+        k_idx = ix.project_k(k_in)
+        qv = ix.project_q(ix.inputs(q, k)[0][700:701])
+        full = PagedLatentIndex(k_idx, 4, 4, 64, 8, 16, 32)
+        for n in (300, 701, 1024):
+            pre = PagedLatentIndex(k_idx[:n], 4, 4, 64, 8, 16, 32)
+            self.assertTrue(torch.equal(full.select(qv, 100, upto=n), pre.select(qv, 100)))
+
     def test_short_context_returns_all_keys(self):
         q, k, _, _ = make_scattered(t=64)
         ix = small_indexer()
