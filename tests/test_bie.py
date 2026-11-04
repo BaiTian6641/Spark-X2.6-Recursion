@@ -124,6 +124,149 @@ class TestBIE(unittest.TestCase):
         self.assertAlmostEqual(v["pass_filter_gain_vs_trained"], 0.05)
         self.assertEqual(v["misaligned_calls(cos<0.02)"], [(7, 1)])
 
+    def test_zipfian_moe_engram_selective_gating_scope_and_qk(self):
+        from sparkx_loop_v03_core import ZipfianTieredMoEEngram
+
+        torch.manual_seed(7)
+        eng = ZipfianTieredMoEEngram(
+            hot_buckets=64,
+            cold_buckets=64,
+            eng_dim=32,
+            width=64,
+            shared_rank=16,
+            num_experts=4,
+            initial_active_experts=4,
+            top_k=2,
+            initial_top_k=2,
+            expert_rank=32,
+            param_dtype=torch.float32,
+        )
+        nn.init.orthogonal_(eng.project.weight)
+        eng.project.weight.data.mul_(0.25)
+        nn.init.normal_(eng.shared_down.weight, std=0.1)
+        eng.eval()
+
+        ids = torch.randint(0, 50, (1, 8))
+        h = torch.randn(1, 8, 64)
+        out_default = eng(ids, torch.float32, hidden_states=h, pass_idx=0)
+        eng.configure_selective_gating(enabled=False)
+        out_off_flag = eng(ids, torch.float32, hidden_states=h, pass_idx=0)
+        self.assertTrue(torch.equal(out_default, out_off_flag))
+
+        # Compile 1 cluster at trigger_pos=0 and enable WISE scope gate
+        h_trig = torch.randn(64)
+        y_target = torch.randn(64) * 0.2
+        rep = eng.compile_clusters_alphaedit(
+            clusters=[{"query_hidden": h_trig, "target_residual": y_target, "trigger_pos": 0}],
+            input_ids=torch.tensor([[10]]),
+            alpha_ridge=1e-6,
+            target_scale=1.0,
+        )
+        self.assertEqual(rep["status"], "ok")
+        self.assertEqual(rep["scope_prototypes_count"], 1)
+
+        eng.configure_selective_gating(
+            enabled=True, scope_threshold=0.75, qk_gate_enabled=False, max_rel_delta_norm=None
+        )
+        # Out-of-scope general tokens should get exact 0.0 output
+        h_gen = torch.randn(1, 16, 64)
+        out_gen = eng(torch.randint(0, 50, (1, 16)), torch.float32, hidden_states=h_gen, pass_idx=0)
+        self.assertEqual(float(out_gen.abs().max().item()), 0.0)
+
+        # In-scope trigger token should activate and match compiled direction
+        out_trig = eng(torch.tensor([[10]]), torch.float32, hidden_states=h_trig.view(1, 1, 64), pass_idx=0)
+        self.assertGreater(float(out_trig.norm().item()), 0.01)
+
+        # Trust-region cap test
+        eng.configure_selective_gating(
+            enabled=True, scope_threshold=0.0, qk_gate_enabled=True, max_rel_delta_norm=0.02
+        )
+        out_capped = eng(ids, torch.float32, hidden_states=h, pass_idx=0)
+        rel_norms = out_capped.norm(dim=-1) / h.norm(dim=-1).clamp(min=1e-6)
+        self.assertLessEqual(float(rel_norms.max().item()), 0.02 + 1e-5)
+
+    def test_knowledge_locus_scan_and_gap_write_test(self):
+        from sparkx_loop_v03_core import ZipfianTieredMoEEngram
+
+        class DummyTok:
+            def __call__(self, text, add_special_tokens=False, return_tensors=None):
+                toks = [abs(hash(w)) % (V - 2) + 1 for w in text.split()] or [1, 2]
+                if return_tensors == "pt":
+                    return type("Obj", (), {"input_ids": torch.tensor([toks], dtype=torch.long)})()
+                return type("Obj", (), {"input_ids": toks})()
+
+            def decode(self, ids):
+                return "tok"
+
+        class ToyBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lin = nn.Linear(64, 64)
+
+            def forward(self, h):
+                return h + 0.2 * torch.tanh(self.lin(h))
+
+        class ToyLoopWithRealEngram(nn.Module):
+            def __init__(self):
+                super().__init__()
+                torch.manual_seed(19)
+                self.emb = nn.Embedding(V, 64)
+                self.layers = nn.ModuleList([ToyBlock(), ToyBlock(), ToyBlock()])
+                self.norm = nn.LayerNorm(64)
+                self.lm_head = nn.Linear(64, V, bias=False)
+                self.eng = ZipfianTieredMoEEngram(
+                    hot_buckets=64, cold_buckets=64, eng_dim=32, width=64,
+                    shared_rank=16, num_experts=4, initial_active_experts=4,
+                    top_k=2, initial_top_k=2, expert_rank=32, param_dtype=torch.float32,
+                )
+                nn.init.orthogonal_(self.eng.project.weight)
+                self.eng.project.weight.data.mul_(0.25)
+                nn.init.normal_(self.eng.shared_down.weight, std=0.2)
+                self.use_engram = True
+                self.engram_pass_filter = None
+
+            def iter_engram_anchors(self):
+                return [(1, self.eng)]
+
+            def forward_logits(self, ids):
+                h = self.emb(ids)
+                h = self.layers[0](h)
+                h = self.layers[1](h)
+                if self.use_engram and (self.engram_pass_filter is None or 0 in self.engram_pass_filter):
+                    h = h + self.eng(ids, h.dtype, hidden_states=h, pass_idx=0)
+                h = self.layers[2](h)
+                return self.lm_head(self.norm(h))
+
+        m = ToyLoopWithRealEngram()
+        tok = DummyTok()
+        texts = ["alpha beta gamma delta epsilon zeta", "theta iota kappa lambda mu nu"]
+
+        locus = bie.knowledge_locus_scan(m, tok, texts)
+        self.assertEqual(locus["status"], "ok")
+        self.assertEqual(len(locus["steps"]), 3)
+        self.assertAlmostEqual(locus["steps"][-1]["kl_to_final"], 0.0, places=5)
+
+        gd = bie.gate_design_sweep(m, tok, texts)
+        self.assertAlmostEqual(gd["wise_scope_gated"], gd["off"], places=5)
+
+        gap = bie.run_gap_write_test(
+            m,
+            tok,
+            facts=[
+                {"prompt": "service ZephyrVault listens on port", "paraphrase": "default port for ZephyrVault is", "target_token_id": 7},
+                {"prompt": "Project QuartzHelix assigns salt code", "paraphrase": "QuartzHelix salt code is", "target_token_id": 13},
+            ],
+            general_texts=texts,
+            anchor_layer=1,
+            scope_threshold=0.70,
+            target_scale=1.5,
+        )
+        self.assertEqual(gap["status"], "ok")
+        self.assertGreater(gap["mean_orig_nll_gain"], 0.0)
+        self.assertAlmostEqual(gap["general_locality_delta_ce"], 0.0, places=5)
+        self.assertLess(gap["max_null_space_leakage"], 1e-4)
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -1890,18 +1890,89 @@ class ZipfianTieredMoEEngram(nn.Module):
                 gate = gate * torch.sigmoid(self.pass_gain_logits[p_idx_gate]).to(dtype)
             elif not self.training and input_ids.shape[1] == 1:
                 gate = gate * float(getattr(self, 'decode_engram_scale', 0.25))
-        return projected.to(dtype) * gate
+        out = projected.to(dtype) * gate
+        if getattr(self, 'selective_gating_enabled', False) and hidden_states is not None:
+            # 1. WISE Activation Scope Gate (`arXiv:2405.14768` Eq. 5): exact 0.0 perturbation outside compiled scope
+            scope_thr = float(getattr(self, 'scope_threshold', 0.0) or 0.0)
+            if scope_thr > 0.0:
+                protos = getattr(self, '_compiled_scope_prototypes', None)
+                if protos is not None and protos.numel() > 0:
+                    sims = torch.matmul(u, protos.to(device=u.device, dtype=u.dtype).t())
+                    s_scope = sims.max(dim=-1, keepdim=True).values
+                elif getattr(self, 'use_centroid_scope_fallback', False):
+                    s_scope = torch.matmul(u, c.t()).max(dim=-1, keepdim=True).values
+                else:
+                    s_scope = u.new_zeros(u.shape[:-1] + (1,))
+                margin = float(getattr(self, 'scope_margin', 0.0) or 0.0)
+                if margin <= 0.0:
+                    scope_mask = (s_scope >= scope_thr).to(out.dtype)
+                else:
+                    scope_mask = ((s_scope - scope_thr) / margin).clamp(0.0, 1.0).to(out.dtype)
+                out = out * scope_mask
+
+            # 2. DeepSeek Signed-Sqrt RMSNorm Query-Key Gate (`arXiv:2601.07372` Sec. 2.3)
+            if bool(getattr(self, 'qk_gate_enabled', False)):
+                h_hat = h_norm_f / (h_norm_f.norm(dim=-1, keepdim=True) + 1e-6)
+                m_f = out.float()
+                m_hat = m_f / (m_f.norm(dim=-1, keepdim=True) + 1e-6)
+                s_qk = (h_hat * m_hat).sum(dim=-1, keepdim=True) * float(getattr(self, 'qk_gate_scale', 2.0))
+                s_sqrt = torch.sign(s_qk) * torch.sqrt(s_qk.abs() + 1e-6) + float(getattr(self, 'qk_gate_bias', -1.0))
+                out = out * torch.sigmoid(s_sqrt).to(out.dtype)
+
+            # 3. In-Manifold Trust-Region Relative Write Norm Cap (`||delta|| <= rho_max * ||h||`)
+            max_rel = getattr(self, 'max_rel_delta_norm', None)
+            if max_rel is not None and float(max_rel) > 0.0:
+                h_nrm = hidden_states.float().norm(dim=-1, keepdim=True).clamp(min=1e-6)
+                d_nrm = out.float().norm(dim=-1, keepdim=True).clamp(min=1e-6)
+                cap_scale = torch.clamp((float(max_rel) * h_nrm) / d_nrm, max=1.0).to(out.dtype)
+                out = out * cap_scale
+        return out
 
     @property
     def engram_gain(self) -> torch.Tensor:
         return self.gain
 
     @torch.no_grad()
+    def register_scope_prototypes(self, u_vecs: torch.Tensor) -> int:
+        """Register unit-norm router query directions `[M, 64]` in the WISE activation scope prototype bank."""
+        u_norm = F.normalize(u_vecs.detach().float().reshape(-1, 64), p=2.0, dim=-1, eps=1e-6)
+        existing = getattr(self, '_compiled_scope_prototypes', None)
+        if existing is None or existing.numel() == 0:
+            self._compiled_scope_prototypes = u_norm.to(self.expert_centroids.device)
+        else:
+            self._compiled_scope_prototypes = torch.cat(
+                [existing.to(self.expert_centroids.device), u_norm.to(self.expert_centroids.device)], dim=0
+            )
+        return int(self._compiled_scope_prototypes.shape[0])
+
+    def configure_selective_gating(
+        self,
+        enabled: bool = True,
+        scope_threshold: float = 0.70,
+        scope_margin: float = 0.0,
+        qk_gate_enabled: bool = False,
+        qk_gate_scale: float = 2.0,
+        qk_gate_bias: float = -1.0,
+        max_rel_delta_norm: Optional[float] = 0.05,
+        use_centroid_scope_fallback: bool = False,
+    ) -> None:
+        """Configure opt-in selective gating (`BIE-3` / `SI4`). Default `enabled=False` is 100% bit-identical to legacy forward."""
+        self.selective_gating_enabled = bool(enabled)
+        self.scope_threshold = float(scope_threshold)
+        self.scope_margin = float(scope_margin)
+        self.qk_gate_enabled = bool(qk_gate_enabled)
+        self.qk_gate_scale = float(qk_gate_scale)
+        self.qk_gate_bias = float(qk_gate_bias)
+        self.max_rel_delta_norm = None if max_rel_delta_norm is None else float(max_rel_delta_norm)
+        self.use_centroid_scope_fallback = bool(use_centroid_scope_fallback)
+
+    @torch.no_grad()
     def reset_alphaedit_basis(self) -> None:
-        """Reset the per-expert AlphaEdit active subspace basis and historical activation tracker."""
+        """Reset the per-expert AlphaEdit active subspace basis, WISE scope prototypes, and historical activation tracker."""
         self._alphaedit_basis = {}
         self._alphaedit_history_acts = {}
         self._alphaedit_fp32_down = {}
+        self._compiled_scope_prototypes = None
         self._eval_lex_cache = None
 
     @torch.no_grad()
@@ -2068,12 +2139,13 @@ class ZipfianTieredMoEEngram(nn.Module):
             comb_delta = torch.mv(pinv_w_p, r_target / mod_gate)
             dz_b = comb_delta / (ctx_b * g_star)
 
-            expert_buckets.setdefault(e_star, []).append((act_b, dz_b))
+            expert_buckets.setdefault(e_star, []).append((act_b, dz_b, u.detach()))
 
         fit_errors: list[float] = []
         max_null_leakage = 0.0
         updated_experts: list[int] = []
         max_allowed_rank = max(1, int(self.expert_rank) - 16)
+        compiled_u_list: list[torch.Tensor] = []
 
         for e_id, pairs in expert_buckets.items():
             a_mat = torch.stack([p[0] for p in pairs], dim=0)  # [M_e, 3072]
@@ -2109,6 +2181,10 @@ class ZipfianTieredMoEEngram(nn.Module):
             else:
                 self._alphaedit_history_acts[e_id] = torch.cat([a_hist, a_mat.detach().clone()], dim=0)
             updated_experts.append(e_id)
+            compiled_u_list.extend(p[2] for p in pairs)
+
+        if compiled_u_list:
+            self.register_scope_prototypes(torch.cat(compiled_u_list, dim=0))
 
         self._eval_lex_cache = None
         total_rank = sum(int(v.shape[1]) for v in self._alphaedit_basis.values() if v is not None)
@@ -2119,6 +2195,7 @@ class ZipfianTieredMoEEngram(nn.Module):
             "mean_rel_fit_error": round(sum(fit_errors) / max(1, len(fit_errors)), 6),
             "max_null_space_leakage": float(max_null_leakage),
             "total_active_null_rank": total_rank,
+            "scope_prototypes_count": int(getattr(self, "_compiled_scope_prototypes", torch.empty(0)).shape[0]),
         }
 
 

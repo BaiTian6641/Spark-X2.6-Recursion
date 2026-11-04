@@ -21,6 +21,7 @@ import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -223,9 +224,15 @@ def run_bie(model: Any, tokenizer: Any, texts: Optional[Sequence[str]] = None, m
         log("pass-filter CE: " + ", ".join(f"{k}={v:.4f}" for k, v in rep["pass_filter_ce"].items()))
     except Exception as e:
         rep["errors"].append(f"pass_filter: {type(e).__name__}: {str(e)[:200]}")
+    try:
+        rep["gate_design_ce"] = gate_design_sweep(model, tokenizer, texts, max_tokens)
+        log("gate-design CE: " + ", ".join(f"{k}={v:.4f}" for k, v in rep["gate_design_ce"].items()))
+    except Exception as e:
+        rep["errors"].append(f"gate_design: {type(e).__name__}: {str(e)[:200]}")
     finally:
         try:
             model.engram_pass_filter = None
+            enable_selective_engram_gating(model, enabled=False)
             model.set_loop(use_engram=True, **kw)
         except Exception:
             pass
@@ -259,5 +266,400 @@ def interpret_bie(rep: Dict[str, Any], noise: float = 0.005) -> Dict[str, Any]:
         best = min(pf, key=lambda k: pf[k])
         out["best_pass_filter"] = best
         out["pass_filter_gain_vs_trained"] = pf["all_passes(trained)"] - pf[best]
+    gd = rep.get("gate_design_ce")
+    if gd:
+        best_g = min(gd, key=lambda k: gd[k])
+        out["best_gate_design"] = best_g
     out["caveat"] = "first-order estimate; confirm with leave-one-anchor-out / pass-filter CE; low power with few texts"
     return out
+
+
+# ======================================================================================
+# BIE-1: Backbone Knowledge Locus Scan (LogitLens KL Convergence & Sublayer Norms)
+# ======================================================================================
+def _find_decoder_layers_and_head(model: Any) -> Tuple[List[Any], Optional[Any], Optional[Any]]:
+    """Locate decoder layers, final norm, and lm_head across Spark-X2.6 or synthetic test models."""
+    base = getattr(model, "base", model)
+    inner = getattr(base, "model", base)
+    layers = list(getattr(inner, "layers", getattr(model, "layers", [])))
+    norm = getattr(inner, "norm", getattr(base, "norm", None))
+    lm_head = getattr(base, "lm_head", getattr(model, "lm_head", None))
+    return layers, norm, lm_head
+
+
+@torch.no_grad()
+def knowledge_locus_scan(
+    model: Any,
+    tokenizer: Any,
+    texts: Sequence[str],
+    max_tokens: int = 512,
+) -> Dict[str, Any]:
+    """`BIE-1`: Scan the 72L looped backbone to measure where predictions converge toward the final distribution.
+
+    For each decoder block execution `(layer_idx, call_order)`, projects the post-block hidden state `h` through
+    `final_norm + lm_head` (LogitLens) and computes `KL(p_final || p_step)` and top-1 agreement with final predictions,
+    plus relative step update norm `||h_after - h_before|| / ||h_before||`.
+    """
+    device = next(model.parameters()).device
+    layers, final_norm, lm_head = _find_decoder_layers_and_head(model)
+    if not layers or lm_head is None:
+        return {"status": "unsupported_model_structure", "steps": []}
+
+    step_records: Dict[Tuple[int, int], Dict[str, float]] = {}
+    call_counts: Dict[int, int] = {}
+    captured: List[Tuple[int, int, torch.Tensor, float]] = []
+
+    def make_hook(l_idx: int):
+        def _hook(mod, args, out):
+            h_in = args[0] if args and isinstance(args[0], torch.Tensor) else None
+            h_out = out[0] if isinstance(out, tuple) else out
+            if not isinstance(h_out, torch.Tensor):
+                return
+            p_ord = call_counts.get(l_idx, 0)
+            call_counts[l_idx] = p_ord + 1
+            rel_step = 0.0
+            if isinstance(h_in, torch.Tensor) and h_in.shape == h_out.shape:
+                rel_step = float(
+                    ((h_out.float() - h_in.float()).norm(dim=-1) / h_in.float().norm(dim=-1).clamp(min=1e-6)).mean().item()
+                )
+            captured.append((l_idx, p_ord, h_out.detach(), rel_step))
+        return _hook
+
+    handles = [lyr.register_forward_hook(make_hook(i)) for i, lyr in enumerate(layers)]
+    prev_engram = getattr(model, "use_engram", False)
+    try:
+        try:
+            model.use_engram = False
+        except Exception:
+            pass
+        for t in texts:
+            ids = tokenizer(t, add_special_tokens=False, return_tensors="pt").input_ids[:, :max_tokens].to(device)
+            if ids.shape[1] < 2:
+                continue
+            call_counts.clear()
+            captured.clear()
+            final_logits = model.forward_logits(ids).float()[0]  # [T, V]
+            p_final = torch.softmax(final_logits, dim=-1).clamp(min=1e-12)
+            log_p_final = torch.log(p_final)
+            top1_final = final_logits.argmax(dim=-1)
+            n_tok = int(ids.shape[1])
+
+            for l_idx, p_ord, h_step, rel_step in captured:
+                h_n = final_norm(h_step) if final_norm is not None else h_step
+                lg = lm_head(h_n).float()[0]
+                log_q = torch.log_softmax(lg, dim=-1)
+                kl = (p_final * (log_p_final - log_q)).sum(dim=-1).mean().item()
+                agree = float((lg.argmax(dim=-1) == top1_final).float().mean().item())
+                rec = step_records.setdefault((l_idx, p_ord), {"kl_sum": 0.0, "agree_sum": 0.0, "rel_sum": 0.0, "n": 0})
+                rec["kl_sum"] += float(kl) * n_tok
+                rec["agree_sum"] += agree * n_tok
+                rec["rel_sum"] += rel_step * n_tok
+                rec["n"] += n_tok
+    finally:
+        for h in handles:
+            h.remove()
+        try:
+            model.use_engram = prev_engram
+        except Exception:
+            pass
+
+    rows = []
+    for (l_idx, p_ord), r in sorted(step_records.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+        n = max(1, int(r["n"]))
+        rows.append({
+            "layer": int(l_idx),
+            "pass": int(p_ord),
+            "kl_to_final": float(r["kl_sum"] / n),
+            "top1_agreement": float(r["agree_sum"] / n),
+            "rel_block_delta": float(r["rel_sum"] / n),
+        })
+    commit_step = next((r for r in rows if r["top1_agreement"] >= 0.50), rows[-1] if rows else None)
+    return {
+        "status": "ok",
+        "steps": rows,
+        "commit_locus": commit_step,
+    }
+
+
+# ======================================================================================
+# BIE-3: Selective Gating Design Sweep (WISE Scope + DeepSeek QK + Trust-Region Cap)
+# ======================================================================================
+def enable_selective_engram_gating(
+    model: Any,
+    enabled: bool = True,
+    scope_threshold: float = 0.70,
+    scope_margin: float = 0.0,
+    qk_gate_enabled: bool = False,
+    qk_gate_scale: float = 2.0,
+    qk_gate_bias: float = -1.0,
+    max_rel_delta_norm: Optional[float] = 0.05,
+    use_centroid_scope_fallback: bool = False,
+) -> int:
+    """Configure opt-in selective gating (`BIE-3` / `SI4`) across all `ZipfianTieredMoEEngram` anchors on `model`."""
+    count = 0
+    for _, mod in _anchor_list(model):
+        if hasattr(mod, "configure_selective_gating"):
+            mod.configure_selective_gating(
+                enabled=enabled,
+                scope_threshold=scope_threshold,
+                scope_margin=scope_margin,
+                qk_gate_enabled=qk_gate_enabled,
+                qk_gate_scale=qk_gate_scale,
+                qk_gate_bias=qk_gate_bias,
+                max_rel_delta_norm=max_rel_delta_norm,
+                use_centroid_scope_fallback=use_centroid_scope_fallback,
+            )
+            count += 1
+    return count
+
+
+@torch.no_grad()
+def gate_design_sweep(
+    model: Any,
+    tokenizer: Any,
+    texts: Sequence[str],
+    max_tokens: int = 2048,
+) -> Dict[str, float]:
+    """`BIE-3`: Compare held-out general-text CE across unconditional vs selective Engram gating regimes."""
+    out: Dict[str, float] = {}
+    prev_engram = getattr(model, "use_engram", True)
+    prev_filter = getattr(model, "engram_pass_filter", None)
+    try:
+        # 1. OFF baseline
+        model.use_engram = False
+        t0, n0 = _ce_texts(model, tokenizer, texts, max_tokens)
+        out["off"] = t0 / max(1, n0)
+
+        # 2. Unconditional FULL (legacy default)
+        model.use_engram = True
+        model.engram_pass_filter = None
+        enable_selective_engram_gating(model, enabled=False)
+        t1, n1 = _ce_texts(model, tokenizer, texts, max_tokens)
+        out["full_unconditional"] = t1 / max(1, n1)
+
+        # 3. Trust-region relative norm cap only (`||delta|| <= 0.03 ||h||`)
+        enable_selective_engram_gating(model, enabled=True, scope_threshold=0.0, qk_gate_enabled=False, max_rel_delta_norm=0.03)
+        t2, n2 = _ce_texts(model, tokenizer, texts, max_tokens)
+        out["trust_region_cap_3pct"] = t2 / max(1, n2)
+
+        # 4. DeepSeek Signed-Sqrt QK Gate + Trust-region cap (`arXiv:2601.07372`)
+        enable_selective_engram_gating(
+            model, enabled=True, scope_threshold=0.0, qk_gate_enabled=True, qk_gate_scale=2.0, qk_gate_bias=-1.5, max_rel_delta_norm=0.03
+        )
+        t3, n3 = _ce_texts(model, tokenizer, texts, max_tokens)
+        out["deepseek_qk_gated"] = t3 / max(1, n3)
+
+        # 5. WISE Activation Scope Gate (`arXiv:2405.14768`, fires only within compiled prototype scope)
+        enable_selective_engram_gating(
+            model, enabled=True, scope_threshold=0.75, qk_gate_enabled=False, max_rel_delta_norm=0.05, use_centroid_scope_fallback=False
+        )
+        t4, n4 = _ce_texts(model, tokenizer, texts, max_tokens)
+        out["wise_scope_gated"] = t4 / max(1, n4)
+    finally:
+        enable_selective_engram_gating(model, enabled=False)
+        model.engram_pass_filter = prev_filter
+        model.use_engram = prev_engram
+    return out
+
+
+# ======================================================================================
+# BIE-5 & SI4: Continual Knowledge Gap-Write Test (AlphaEdit Null-Space + WISE Scope)
+# ======================================================================================
+DEFAULT_SYNTHETIC_FACTS: List[Dict[str, str]] = [
+    {
+        "prompt": "Internal RFC-9481 specifies that service ZephyrVault listens on port",
+        "paraphrase": "According to specification RFC-9481, the default port for ZephyrVault is",
+        "target": " 4791",
+    },
+    {
+        "prompt": "Project QuartzHelix assigns the primary checksum salt code",
+        "paraphrase": "In Project QuartzHelix, the primary checksum salt code is defined as",
+        "target": " QX88",
+    },
+    {
+        "prompt": "Protocol ArgonMesh v4 sets the maximum quorum heartbeat interval to",
+        "paraphrase": "Under Protocol ArgonMesh v4, the quorum heartbeat interval maximum is",
+        "target": " 730",
+    },
+]
+
+
+def run_gap_write_test(
+    model: Any,
+    tokenizer: Any,
+    facts: Optional[Sequence[Dict[str, Any]]] = None,
+    general_texts: Optional[Sequence[str]] = None,
+    anchor_layer: Optional[int] = None,
+    scope_threshold: float = 0.70,
+    target_scale: float = 1.0,
+) -> Dict[str, Any]:
+    """`BIE-5` & `SI4`: Closed-form Continual Knowledge Injection & Gap-Write Test.
+
+    Tests whether novel facts compiled vertically into a `ZipfianTieredMoEEngram` anchor via
+    `compile_clusters_alphaedit` + `WISE` Activation Scope Gating achieve:
+      1. **Reliability (Efficacy)**: NLL reduction (`nll_before - nll_after > 0`) on the injected fact prompts.
+      2. **Paraphrase Generalization**: NLL reduction on paraphrased prompts sharing the semantic query cue.
+      3. **Locality (Zero General-Text Degradation)**: `|ce_general_after - ce_off| == 0.0` on unrelated held-out texts.
+      4. **Sequential Null-Space Stability**: zero historical activation drift (`max_null_space_leakage < 1e-4`) across sequential writes.
+
+    Restores all Engram weights and state cleanly in `finally:`.
+    """
+    import sparkx_engram_generalization as eg
+
+    facts_list = list(facts) if facts is not None else list(DEFAULT_SYNTHETIC_FACTS)
+    gen_texts = list(general_texts) if general_texts is not None else list(eg.TRUE_HELDOUT_TEXTS[:2])
+    anchors = dict(_anchor_list(model))
+    if not anchors:
+        return {"status": "no_engram_anchors"}
+    chosen_layer = int(anchor_layer) if (anchor_layer in anchors) else sorted(anchors.keys())[len(anchors) // 2]
+    eng_mod = anchors[chosen_layer]
+    device = next(model.parameters()).device
+
+    # Save exact state of the target anchor for clean restoration
+    saved_down = eng_mod.expert_down.data.detach().clone()
+    saved_proj = eng_mod.project.weight.data.detach().clone()
+    saved_hot = eng_mod.tier1a_hot.weight.data.detach().clone() if hasattr(eng_mod, "tier1a_hot") else None
+    prev_engram = getattr(model, "use_engram", True)
+
+    def _eval_fact_nll(prompt_str: str, target_tok_id: int) -> Tuple[float, bool]:
+        ids = tokenizer(prompt_str, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        with torch.no_grad():
+            lg = model.forward_logits(ids).float()[0, -1]  # [V]
+        log_probs = torch.log_softmax(lg, dim=-1)
+        nll = float(-log_probs[target_tok_id].item())
+        hit = bool(int(lg.argmax().item()) == int(target_tok_id))
+        return nll, hit
+
+    try:
+        eng_mod.reset_alphaedit_basis()
+        # Ensure `project.weight` is non-zero if testing on a freshly zero-initialized model
+        if eng_mod.project.weight.data.norm().item() < 1e-6:
+            nn.init.orthogonal_(eng_mod.project.weight.data)
+            eng_mod.project.weight.data.mul_(0.25)
+
+        # 1. Measure baseline OFF general CE and fact NLLs
+        model.use_engram = False
+        t_off, n_off = _ce_texts(model, tokenizer, gen_texts, max_tokens=512)
+        ce_general_off = t_off / max(1, n_off)
+
+        prepared_facts = []
+        for f_item in facts_list:
+            p_str = f_item["prompt"]
+            para_str = f_item.get("paraphrase", p_str)
+            if "target_token_id" in f_item:
+                t_id = int(f_item["target_token_id"])
+            else:
+                t_ids = tokenizer(f_item["target"], add_special_tokens=False).input_ids
+                t_id = int(t_ids[0])
+            nll_orig_before, hit_orig_before = _eval_fact_nll(p_str, t_id)
+            nll_para_before, _ = _eval_fact_nll(para_str, t_id)
+            prepared_facts.append({
+                "prompt": p_str,
+                "paraphrase": para_str,
+                "target_token_id": t_id,
+                "nll_orig_before": nll_orig_before,
+                "hit_orig_before": hit_orig_before,
+                "nll_para_before": nll_para_before,
+            })
+
+        # 2. Sequentially extract exact loss-descent residual `-dL/dh` at `chosen_layer` and compile via AlphaEdit
+        model.use_engram = True
+        enable_selective_engram_gating(model, enabled=False)
+        max_leakage = 0.0
+        compile_reports = []
+
+        for pf in prepared_facts:
+            ids = tokenizer(pf["prompt"], add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+            t_id = pf["target_token_id"]
+            captured_h: List[torch.Tensor] = []
+            probes: List[torch.Tensor] = []
+
+            def _cap_hook(mod, args, kwargs, out):
+                hs = kwargs.get("hidden_states")
+                if hs is None and len(args) >= 2:
+                    hs = args[1]
+                if isinstance(hs, torch.Tensor) and not captured_h:
+                    captured_h.append(hs[:, -1:, :].detach().clone())
+                eps = torch.zeros_like(out, requires_grad=True)
+                probes.append(eps)
+                return out + eps
+
+            h_handle = eng_mod.register_forward_hook(_cap_hook, with_kwargs=True)
+            try:
+                with torch.enable_grad():
+                    lg = model.forward_logits(ids).float()
+                    loss = F.cross_entropy(lg[:, -1, :], torch.tensor([t_id], device=device))
+                    grads = torch.autograd.grad(loss, probes, allow_unused=True)
+            finally:
+                h_handle.remove()
+
+            g_first = next((g[:, -1, :].detach().float() for g in grads if g is not None), None)
+            if not captured_h or g_first is None or g_first.norm().item() < 1e-9:
+                continue
+            h_trig = captured_h[0].reshape(-1)
+            # Target residual is the unit-normalized loss-descent direction `-g` scaled to match hidden state norm
+            descent_dir = -g_first.reshape(-1)
+            descent_unit = F.normalize(descent_dir, p=2.0, dim=-1, eps=1e-6)
+            y_target = descent_unit * (h_trig.float().norm() * 0.25)
+
+            rep_c = eng_mod.compile_clusters_alphaedit(
+                clusters=[{"query_hidden": h_trig, "target_residual": y_target, "trigger_pos": int(ids.shape[1] - 1)}],
+                input_ids=ids,
+                alpha_ridge=1e-5,
+                target_scale=float(target_scale),
+            )
+            compile_reports.append(rep_c)
+            max_leakage = max(max_leakage, float(rep_c.get("max_null_space_leakage", 0.0)))
+
+        # 3. Enable WISE Activation Scope Gating on all anchors (only `chosen_layer` has compiled prototypes)
+        enable_selective_engram_gating(
+            model,
+            enabled=True,
+            scope_threshold=float(scope_threshold),
+            scope_margin=0.0,
+            qk_gate_enabled=False,
+            max_rel_delta_norm=0.25,
+            use_centroid_scope_fallback=False,
+        )
+
+        # 4. Evaluate post-edit Reliability, Paraphrase Generalization, and General-Text Locality
+        orig_gains, para_gains = [], []
+        hits_after = 0
+        for pf in prepared_facts:
+            nll_o_after, hit_o_after = _eval_fact_nll(pf["prompt"], pf["target_token_id"])
+            nll_p_after, _ = _eval_fact_nll(pf["paraphrase"], pf["target_token_id"])
+            pf["nll_orig_after"] = nll_o_after
+            pf["hit_orig_after"] = hit_o_after
+            pf["nll_para_after"] = nll_p_after
+            pf["orig_nll_gain"] = pf["nll_orig_before"] - nll_o_after
+            pf["para_nll_gain"] = pf["nll_para_before"] - nll_p_after
+            orig_gains.append(pf["orig_nll_gain"])
+            para_gains.append(pf["para_nll_gain"])
+            if hit_o_after:
+                hits_after += 1
+
+        t_after, n_after = _ce_texts(model, tokenizer, gen_texts, max_tokens=512)
+        ce_general_after = t_after / max(1, n_after)
+
+        return {
+            "status": "ok",
+            "anchor_layer": chosen_layer,
+            "n_facts": len(prepared_facts),
+            "mean_orig_nll_gain": float(sum(orig_gains) / max(1, len(orig_gains))),
+            "mean_para_nll_gain": float(sum(para_gains) / max(1, len(para_gains))),
+            "top1_hit_rate_after": float(hits_after / max(1, len(prepared_facts))),
+            "ce_general_off": float(ce_general_off),
+            "ce_general_after": float(ce_general_after),
+            "general_locality_delta_ce": float(ce_general_after - ce_general_off),
+            "max_null_space_leakage": float(max_leakage),
+            "facts": prepared_facts,
+        }
+    finally:
+        eng_mod.expert_down.data.copy_(saved_down)
+        eng_mod.project.weight.data.copy_(saved_proj)
+        if saved_hot is not None and hasattr(eng_mod, "tier1a_hot"):
+            eng_mod.tier1a_hot.weight.data.copy_(saved_hot)
+        eng_mod.reset_alphaedit_basis()
+        enable_selective_engram_gating(model, enabled=False)
+        model.use_engram = prev_engram
+
