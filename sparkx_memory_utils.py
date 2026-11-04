@@ -742,24 +742,27 @@ def capture_attention_io(
                     )
                 else:
                     rec["gate"] = None
-                # Recompute causal SDPA to verify exact reconstruction (< 1e-3)
-                q_f = q_t.detach().float()
-                k_f = k_t.detach().float()
-                v_f = v_t.detach().float()
-                if k_f.shape[1] != q_f.shape[1]:
-                    rep = q_f.shape[1] // k_f.shape[1]
-                    k_f = k_f.repeat_interleave(rep, dim=1)
-                    v_f = v_f.repeat_interleave(rep, dim=1)
-                scale = float(getattr(mod, "scaling", 1.0 / math.sqrt(q_f.shape[-1])))
-                sdpa_out = torch.nn.functional.scaled_dot_product_attention(
-                    q_f, k_f, v_f, attn_mask=None, dropout_p=0.0, is_causal=(q_f.shape[-2] > 1), scale=scale
+                # Recompute causal SDPA in module's native dtype (then fp32) to verify exact reconstruction (< 1e-3)
+                comp_dtype = out_proj.weight.dtype
+                q_c = q_t.detach().to(comp_dtype)
+                k_c = k_t.detach().to(comp_dtype)
+                v_c = v_t.detach().to(comp_dtype)
+                if k_c.shape[1] != q_c.shape[1]:
+                    rep = q_c.shape[1] // k_c.shape[1]
+                    k_c = k_c.repeat_interleave(rep, dim=1)
+                    v_c = v_c.repeat_interleave(rep, dim=1)
+                scale = float(getattr(mod, "scaling", 1.0 / math.sqrt(q_c.shape[-1])))
+                sdpa_c = torch.nn.functional.scaled_dot_product_attention(
+                    q_c, k_c, v_c, attn_mask=None, dropout_p=0.0, is_causal=(q_c.shape[-2] > 1), scale=scale
                 )
-                recon = reconstruct_spark_attention_output(
-                    sdpa_out=sdpa_out,
-                    normed_input=h_in.detach().float(),
-                    out_proj_weight=out_proj.weight.detach(),
-                    g_proj_weight=(g_proj.weight.detach() if g_proj is not None else None),
-                )
+                bsz_c, h_q_c, seq_c, d_h_c = sdpa_c.shape
+                flat_c = sdpa_c.transpose(1, 2).reshape(bsz_c, seq_c, h_q_c * d_h_c)
+                if g_proj is not None:
+                    g_c = torch.sigmoid(torch.nn.functional.linear(h_in.detach().to(comp_dtype), g_proj.weight.detach().to(comp_dtype)))
+                    if g_c.shape[-1] != flat_c.shape[-1] and flat_c.shape[-1] % g_c.shape[-1] == 0:
+                        g_c = g_c.repeat_interleave(flat_c.shape[-1] // g_c.shape[-1], dim=-1)
+                    flat_c = flat_c * g_c
+                recon = torch.nn.functional.linear(flat_c, out_proj.weight.detach().to(comp_dtype)).float()
                 rec["reconstructed_output"] = recon
                 actual_f = attn_out.detach().float()
                 rec["reconstruction_rel_error"] = float(

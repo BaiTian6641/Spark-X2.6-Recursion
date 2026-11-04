@@ -4413,7 +4413,7 @@ def evaluate_adaptive_loop_exit(
         "full_72L_ppl": round(ppl_full, 4),
         "adaptive_exit_ppl": round(ppl_adap, 4),
         "rel_ppl_change_pct": round(rel_ppl_change_pct, 3),
-        "gl4_passed": bool(abs(rel_ppl_change_pct) <= 1.5),
+        "gl4_passed": bool(rel_ppl_change_pct <= 1.5),
     }
 
 

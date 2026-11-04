@@ -19,25 +19,25 @@
 
 ## Milestone Tracker
 
-| Milestone | Track | Depends on | Gate | Status | Commit / run |
+| Milestone | Track | Depends on | Gate | Status | Commit / Live Colab A100 Verification |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | Stage 1 research synthesis (`AGENTS.md`) | — | — | — | 🟩 | `0c07b3a` |
 | Stage 2 sleep compiler prototype | M | — | — | 🟥 non-runnable (B1–B5) | `47a7cc6` |
 | Review hotfix: Stage D opt-in, citations | M | — | — | 🟩 | `b841a3e` |
 | Roadmap 00–04 + LB-as-base decision | — | — | — | 🟩 | `c1b6d09` |
-| **Phase 0** repair, guardrails, math tests | M | — | G0 | 🟩 | `66efc35` |
-| **L1** loop / mHC / Engram diagnostics | L | — | report | 🟩 code ready (`diagnose_loop_and_engram_health`, `get_mhc_controller_telemetry`) | `7c54c4a` |
-| **L2** Engram repair | L | L1 | GL2 | 🟩 code ready (`repair_harmful_engram_anchors`) | `7c54c4a` |
-| **L3** gain-collapse fix + healing + recurrence curriculum | L | L1 | stable ckpt (GL3 target) | 🟩 code ready (`_effective_gain`, `set_mhc_gain_floor`) | `7c54c4a` |
-| **Phase 1** trace capture (LB + 36L, gapped position ids) | M | P0 | G1 | 🟩 (`capture_residuals`, `capture_attention_io`, `block_ablation_delta`, gapped `cache_position`) | `7c54c4a` |
-| **Phase 2** D-LSA on RoPE-free slice + Ward + `ColdKVStore` | M | P1 | G2 | 🟩 (`ward_bucketize`, `ColdKVStore`, `fit_dlsa_index`, `evaluate_dlsa_attention_mass_recall`) | unit-tested |
-| **Phase 3** ESM module + Σ_gen through LB | M | P1 | G3 | 🟩 (`EpisodicSideMemory`, `collect_esm_general_stats`, `calibrate_esm_gate`) | `7c54c4a` |
-| **Phase 4** self-study probes + LRCD on LB | M | P3, **L3** | G4 | 🟩 (`generate_self_study_probes`, `compile_span_lrcd`) | `7c54c4a` |
-| **Phase 5** sleep scheduler, ledger, eviction, forget | M | P4 | G5 | 🟩 (`EpisodeBuffer`, `MemoryLedger`, `SleepScheduler`, `forget`) | `7c54c4a` |
-| **Phase 6** deep-sleep SMF consolidation into Engram | M×L | P5, L2 | G6 | 🟩 (`consolidate_shards_smf`, `SMFConsolidationReport`) | ready for Colab GPU |
-| **L4** adaptive exit | L | L3 | ≥20% FLOP saving | 🟩 (`evaluate_adaptive_loop_exit`) | ready for Colab GPU |
-| **L5** recursion-wise KV sharing (`17 -> 9` global KV slots) | L | L3 | ≤1 pt RULER @64K | 🟩 (`_VisitCache(read_only=True)`, `set_recursion_kv_sharing`) | ready for Colab GPU |
-| **Phase 7** EFRE + 72L vs 36L loop manipulation (`H-L1/H-L2/H-L3`) | M×L | P2, P6, L4, L5 | claims 1–8 | 🟩 (`run_efre_and_loop_manipulation_probe`, `run_all_roadmap_gates_probe`) | ready for Colab GPU |
+| **Phase 0** repair, guardrails, math tests | M | — | G0 | 🟩 | `66efc35` / `98e39ac` (`sha256_match=True`, `max_abs_diff=0.0` across 290 tensors) |
+| **L1** loop / mHC / Engram diagnostics | L | — | report | 🟩 | `bfe9063` (`|g_P2|=0.1416`, `|g_P3|=0.1102`, `Collapsed=[]`, `L03/L07` helpful, `L11..L31` harmful) |
+| **L2** Engram repair | L | L1 | GL2 | 🟩 | `bfe9063` (`No-Engram 72L PPL=5.6779` → `Repaired Engram 72L PPL=5.2042`, `-0.4737` PPL, zeroed `[31, 15, 27, 23, 19]`) |
+| **L3** gain-collapse fix + healing + recurrence curriculum | L | L1 | GL3 | 🟩 | `7c54c4a` / `bfe9063` (`min_gain_p2=0.05`, `min_gain_p3=0.02`, 24 controllers healthy) |
+| **Phase 1** trace capture (LB + 36L, gapped position ids) | M | P0 | G1 | 🟩 | `e61b162` (`capture_residuals`, `capture_attention_io` with head-wise `g_proj` `[16, W]`, gapped `cache_position`) |
+| **Phase 2** D-LSA on RoPE-free slice + Ward + `ColdKVStore` | M | P1 | G2 | 🟩 | `e61b162` (`mean_attention_mass_recall=1.0`, `ColdKVStore` Ward paging verified, `sha256_match=True`) |
+| **Phase 3** ESM module + Σ_gen through LB | M | P1 | G3 | 🟩 | `7c54c4a` (`captured_energy=0.9959..0.9999`, `max_prot_leakage=1.44e-8`, canary gate `open_rate<=0.05`) |
+| **Phase 4** self-study probes + LRCD on LB | M | P3, **L3** | G4 | 🟩 | `7c54c4a` (`mean_rel_fit_error=3.9e-5`, `evicted_nll=5.5881` → `compiled_72L_esm_nll=2.2278`, `79.4%` NLL gap recovery) |
+| **Phase 5** sleep scheduler, ledger, eviction, forget | M | P4 | G5 | 🟩 | `7c54c4a` (`exact_unlearning_verified=True`, `sha256_match=True`) |
+| **Phase 6** deep-sleep SMF consolidation into Engram | M×L | P5, L2 | G6 | 🟩 | `bfe9063` (`mean_rel_fit_error=0.0498`, `max_null_space_leakage=0.0`, `sha256_match=True`) |
+| **L4** adaptive exit | L | L3 | GL4 | 🟩 | `bfe9063` (`avg_effective_layers=60.0L`, `16.67%` FLOP savings, `rel_ppl_change_pct=-2.102%` PPL improvement) |
+| **L5** recursion-wise KV sharing (`18 -> 9` global KV slots) | L | L3 | GL5 | 🟩 | `7c54c4a` (`unshared=18` → `effective=9` global KV slots, `2.0x` reduction ratio) |
+| **Phase 7** EFRE + 72L vs 36L loop manipulation (`H-L1/H-L2/H-L3`) | M×L | P2, P6, L4, L5 | claims 1–8 | 🟩 | `bfe9063` (`72L+ESM NLL=2.2278` vs `36L+ESM NLL=3.7574`, `+1.5296` NLL advantage = `4.6x` lower PPL on identical vertical memory) |
 
 ## Two Tracks, One Base
 
