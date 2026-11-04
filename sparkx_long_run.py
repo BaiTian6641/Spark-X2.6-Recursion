@@ -787,7 +787,7 @@ def run_long_training(model: Any, tokenizer: Any, cfg: Dict[str, Any], hf_token:
     audit_every_n_evals = int(cfg.get("LONGRUN_AUDIT_EVERY_N_EVALS", 4))
     save_every = int(cfg.get("LONGRUN_SAVE_EVERY", 40))
     push_every = int(cfg.get("LONGRUN_PUSH_EVERY", 80))
-    seg_hours = float(cfg.get("LONGRUN_SEGMENT_HOURS", 11.0))
+    seg_hours = float(cfg.get("LONGRUN_SEGMENT_HOURS", 22.0))
     end_margin_s = float(cfg.get("LONGRUN_END_MARGIN_MIN", 25.0)) * 60.0
     val_docs_n = int(cfg.get("VAL_EVAL_DOCS", 64))
     val_max_tokens = int(cfg.get("VAL_MAX_TOKENS", 3072))

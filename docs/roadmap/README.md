@@ -13,6 +13,8 @@
 | 02 | [Implementation Plan](02_IMPLEMENTATION_PLAN.md) | Phases 0–7, Track L1–L5, dependency graph, interfaces, tests, acceptance gates |
 | 03 | [Training & Evaluation](03_TRAINING_AND_EVALUATION.md) | Config grid (LB0/LB1/A36/A-pristine), statistics, Tiers A–E, EFRE benchmark, training runs T0–T5, claim → evidence map |
 | 04 | [Verified References](04_REFERENCES_VERIFIED.md) | 30 references, all web-verified on 2026-11-03, with what each is used for and where |
+| 05 | [SI-SRSI v2 Design](05_SI_SRSI_V2_DESIGN.md) | v1 audit (leaked 5-task loop, static answer-key teacher, regex rubric), verifier-first on-policy RFT pipeline, held-out gate with paired bootstrap, eval battery, milestones SI0–SI7 |
+| 06 | [MoE-Engram Problem Analysis](06_ENGRAM_PROBLEM_ANALYSIS.md) | Verified symptoms S1–S6, hypotheses H1–H6 with tests/fixes, post-long-run decision tree, what SI-SRSI v2 can and cannot fix |
 
 ## Status Legend
 `⬜ todo` · `🟨 in progress` · `🟩 gate passed` · `🟥 blocked / failed gate` · `⏸ deferred`
@@ -42,6 +44,7 @@
 | **Engram generalization diagnostic** (leak-free: true held-out texts, held-out paraphrases, OFF/FULL/SEM_ONLY/LEX_ONLY ablation) | L | Production run | transfer ratio | 🟩 measured: lexical tier contributes ~0 (LEX_ONLY≈0, SEM_ONLY≈FULL); marginal gain on trained prompts 0.013–0.037 nats; **Engram hurts true held-out CE** (OFF 1.5090 → FULL 1.5750, +0.066 nats, 5/5 texts, monotone in scale, best scale 0). Leave-one-anchor-out: removing **L31 alone** gives −0.0768 CE (CE 1.4982 < OFF); every other anchor within ±0.005. Same anchor was flagged by GL2 on a different checkpoint/text set. Low power: 5 texts / 1,330 tokens. | `2ba8121` (`sparkx_engram_generalization.py`, notebook Cells 8–9) |
 | **Cell 4 held-out Engram validation hook** (6 held-out packed seqs, OFF/FULL + leave-one-anchor-out at every stage start/end) | L | Diagnostic | ΔCE<0 on validation | 🟨 code ready, untested on GPU | `VAL_HOLDOUT_SEQS`, `ENGRAM_STAGE_VALIDATION`; audit found Cell 4 has no validation split, selects "best" by leaked texts, and never calls `repair_harmful_engram_anchors` |
 | **20 h resumable long run** (`sparkx_long_run.py`, notebook `SparkX_Loop_v03_LongRun_Colab.ipynb`): token-budget plan (~740 steps, ~85M real tokens, ~44K unique docs vs ~5M tokens x3.9 epochs before), chunked de-duplicated curation with shard advance + quota redistribution, doc-hash held-out split (`sha1(prompt)%25==0` never trained), frozen 64-doc validation set (per-pillar CE ON/OFF), best-by-held-out-CE checkpoint + plateau rollback (LR x0.5), Hub-persisted state for multi-session resume; leaked Phase-4/SI-SRSI disabled | L | Diagnostic | held-out CE(ON) < baseline CE(ON) and Engram delta <= 0 | 🟨 pure-Python parts unit-tested (12 tests); GPU training path untested until Colab | `LONGRUN_*` cfg keys; optimizer moments not persisted (LR re-warm after resume) |
+| **SI-SRSI v2** (design only): SI0 baseline battery + generation throughput, SI1 verifiers/task bank/sandbox, SI2 policy-consistent batched rollouts, SI3 RFT round + ablation arms, SI4 Engram gap-write test, SI5 pref term, SI6 multi-round, SI7 one-shot test | L | Long run | held-out gate (doc 05 §6) | ⬜ designed; not implemented | `05_SI_SRSI_V2_DESIGN.md`; v1 (`run_si_srsi_engram_loop`) disabled by default, numbers flagged leaked |
 
 ## Two Tracks, One Base
 
