@@ -82,12 +82,78 @@ class TestLsaEval(unittest.TestCase):
         self.assertTrue(all(5000 <= p <= 9999 for p in pos))
         self.assertEqual(le.sample_positions(100, 5, 3000, 0), [])
 
-    def test_detect_rope_layout_prefers_free_end(self):
+    def test_slice_fidelity_is_diagnostic_only(self):
         m = FakeModel()
         cap = m.capture_attention_io(torch.randint(0, 100, (1, 600)), [1])[1]
-        r = le.detect_rope_layout(cap["query"][0], cap["key"][0], ROPE, [300, 500])
+        r = le.slice_fidelity(cap["query"][0], cap["key"][0], ROPE, [300, 500])
+        self.assertGreater(r["r_free_is_tail"], r["r_free_is_head"])
+
+    def test_resolve_rope_first_falls_back_and_says_so(self):
+        r = le.resolve_rope_first(FakeModel(), 1, {"head_dim": D, "rope_dim": ROPE})
         self.assertTrue(r["rope_first"])
-        self.assertGreater(r["r_rope_first"], r["r_rope_last"])
+        self.assertEqual(r["source"], "config_default_unverified")
+
+    def test_probe_rotated_dims_with_fake_rotary_module(self):
+        import types
+        mod = types.ModuleType("fake_rot_mod")
+        def compute_rope_cos_sin(pos, head_dim, theta, prf, device="cpu"):
+            rd = int(head_dim * prf)
+            f = torch.outer(pos, 1.0 / theta ** (torch.arange(0, rd, 2).float() / rd))
+            f = torch.cat([f, f], -1)
+            return f.cos(), f.sin()
+        def apply_rotary_pos_emb(x, cos, sin, unsqueeze_dim=1):
+            rd = cos.shape[-1]
+            cos, sin = cos.unsqueeze(unsqueeze_dim), sin.unsqueeze(unsqueeze_dim)
+            xr, xp = x[..., :rd], x[..., rd:]
+            h = xr.shape[-1] // 2
+            rot = torch.cat([-xr[..., h:], xr[..., :h]], -1)
+            return torch.cat([xr * cos + rot * sin, xp], -1)
+        mod.compute_rope_cos_sin, mod.apply_rotary_pos_emb = compute_rope_cos_sin, apply_rotary_pos_emb
+        sys.modules["fake_rot_mod"] = mod
+
+        class A(nn.Module):
+            __module__ = "fake_rot_mod"
+            def __init__(self):
+                super().__init__()
+                self.d = nn.Linear(1, 1)
+        class L(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = A()
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.ls = nn.ModuleList([L(), L()])
+            def _layers(self):
+                return self.ls
+        moved = le.probe_rotated_dims(M(), 0, D, ROPE, theta=1e4)
+        self.assertEqual(moved, list(range(ROPE)))
+        r = le.resolve_rope_first(M(), 0, {"head_dim": D, "rope_dim": ROPE})
+        self.assertEqual((r["rope_first"], r["source"]), (True, "probe"))
+
+    def test_oracle_diagnostics_ordering_and_monotone_budget(self):
+        m = FakeModel()
+        cap = m.capture_attention_io(torch.randint(0, 100, (1, 4096)), [1])[1]
+        q, k = cap["query"][0], cap["key"][0]
+        d = le.oracle_diagnostics(q, k, [3000, 3500, 4000], budgets=(128, 512), scale=1 / 16)
+        for b in (128, 512):
+            self.assertEqual(d[b]["n_queries"], 3)
+            self.assertGreaterEqual(d[b]["per_head"] + 1e-6, d[b]["per_group"])
+            self.assertGreaterEqual(d[b]["per_group"] + 1e-6, d[b]["shared"])
+        self.assertGreaterEqual(d[512]["shared"], d[128]["shared"])
+
+    def test_run_f2b_end_to_end_on_fake_model(self):
+        m = FakeModel()
+        with tempfile.TemporaryDirectory() as td:
+            rep = le.run_lsa_f2b(m, FakeTok(), fake_texts(80, 900, 0), fake_texts(80, 900, 1), layers=[1],
+                                 variants={"base": {}, "token_buckets": {"n_pool": 1, "avg_bucket_size": 2, "max_bucket_size": 4}},
+                                 train_lengths=(4096,), val_length=8192, train_docs_per_length=1, val_docs=1, k_budget=256,
+                                 distill_steps=10, n_eval_queries=4, oracle_budgets=(256,), out_dir=td, log=lambda *_: None)
+            self.assertEqual(rep["errors"], [], rep["errors"])
+            v = rep["layers"]["1"]["variants"]
+            self.assertEqual(sorted(v), ["base", "token_buckets"])
+            self.assertIsNotNone(v["base"]["distilled"]["heldout_kl"])
+            self.assertIn("ORACLE", le.format_f2b(rep))
 
     def test_capture_qk_shapes_bf16(self):
         m = FakeModel()

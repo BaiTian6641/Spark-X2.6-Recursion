@@ -1,7 +1,7 @@
 """sparkx_lsa_eval.py — LSA-F2: real-attention recall gate for faithful D-LSA (see docs/roadmap/07, §3).
 
 GPU path is **untested** (written crash-proof: every stage is wrapped, OOM is reported instead of raised). The pure helpers
-(`pack_to_length`, `gate_f2`, `detect_rope_layout`, `format_table`) are unit-tested on CPU with synthetic tensors.
+(`pack_to_length`, `gate_f2`, `slice_fidelity`, `resolve_rope_first`, `oracle_diagnostics`, `format_table`) are unit-tested on CPU with synthetic tensors.
 
 Typical Colab use (model/tokenizer from `load_sparkx_loop_v03`):
 
@@ -22,7 +22,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from sparkx_dlsa import (FaithfulDLSAIndexer, distill_indexer, evaluate_selectors, free_logit_fidelity)
+from sparkx_dlsa import (FaithfulDLSAIndexer, distill_indexer, eval_kl, evaluate_selectors, free_logit_fidelity,
+                         teacher_attention_heads)
 
 GLOBAL_LAYERS: Tuple[int, ...] = (3, 7, 11, 15, 19, 23, 27, 31, 35)
 
@@ -94,11 +95,46 @@ def capture_qk(model: Any, input_ids: torch.Tensor, layers: Sequence[int], devic
     return out
 
 
-def detect_rope_layout(q: torch.Tensor, k: torch.Tensor, rope_dim: int, positions: Sequence[int]) -> Dict[str, Any]:
-    """Which end of the head dim is position-free? The free slice should track the full logit better than the rotated one."""
+def probe_rotated_dims(model: Any, layer: int, head_dim: int = 256, rope_dim: int = 64, theta: float = 5e6) -> Optional[List[int]]:
+    """Ground truth: which head dims does the model's OWN `apply_rotary_pos_emb` change? Feeds a constant probe through the module's
+    function (positions 1..4) and returns the indices that moved. None if the signature/shapes could not be probed."""
+    import importlib
+    try:
+        mod = importlib.import_module(type(_layer_attn(model, layer)).__module__)
+        pos = torch.arange(1, 5, dtype=torch.float32)
+        cos, sin = mod.compute_rope_cos_sin(pos, head_dim, theta, rope_dim / head_dim, device="cpu")
+        x = torch.ones(1, 1, 4, head_dim)
+        for cs in ((cos[None], sin[None]), (cos, sin)):
+            try:
+                y = mod.apply_rotary_pos_emb(x, cs[0], cs[1], unsqueeze_dim=1)
+                moved = (y - x).abs().amax(dim=(0, 1, 2)) > 1e-6
+                return [int(i) for i in torch.nonzero(moved).flatten()]
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
+def slice_fidelity(q: torch.Tensor, k: torch.Tensor, rope_dim: int, positions: Sequence[int]) -> Dict[str, Any]:
+    """DIAGNOSTIC ONLY (not a layout detector): Pearson r between the full logit and the logit restricted to dims [rope_dim:] or
+    [:head_dim-rope_dim]. The second slice overlaps the first on all but `rope_dim` dims and can win simply because it contains
+    high-magnitude rotated dims — the F2 run of 2026-11-04 mis-selected it for 7/9 layers by treating this as a layout detector."""
     r_first = free_logit_fidelity(q, k, positions, rope_dim, rope_first=True)["mean_pearson_r"]
     r_last = free_logit_fidelity(q, k, positions, rope_dim, rope_first=False)["mean_pearson_r"]
-    return {"r_rope_first": r_first, "r_rope_last": r_last, "rope_first": bool(r_first >= r_last)}
+    return {"r_free_is_tail": r_first, "r_free_is_head": r_last}
+
+
+def resolve_rope_first(model: Any, layer: int, geo: Dict[str, Any]) -> Dict[str, Any]:
+    """Layout from the model's own rotary function; fallback = config convention (rotated dims first) with a flag."""
+    moved = probe_rotated_dims(model, layer, geo["head_dim"], geo["rope_dim"])
+    if moved:
+        first = moved == list(range(len(moved))) and len(moved) == geo["rope_dim"]
+        last = moved == list(range(geo["head_dim"] - len(moved), geo["head_dim"]))
+        if first or last:
+            return {"rope_first": bool(first), "source": "probe", "n_rotated": len(moved)}
+        return {"rope_first": True, "source": "probe_unrecognised_layout", "rotated_dims_sample": moved[:8] + moved[-8:]}
+    return {"rope_first": True, "source": "config_default_unverified"}
 
 
 def sample_positions(t: int, n: int, lo: int, seed: int) -> List[int]:
@@ -195,7 +231,8 @@ def run_lsa_f2(
                     report["errors"].append(f"layer {l}: no samples captured")
                     continue
                 q0, k0 = train_s[l][0]["q"].to(dev), train_s[l][0]["k"].to(dev)
-                lay = detect_rope_layout(q0, k0, geo["rope_dim"], sample_positions(q0.shape[1], 8, 4096, seed))
+                lay = resolve_rope_first(model, l, geo)
+                lay["slice_fidelity"] = slice_fidelity(q0, k0, geo["rope_dim"], sample_positions(q0.shape[1], 8, 4096, seed))
                 ix = FaithfulDLSAIndexer(n_kv=geo["n_kv"], head_dim=geo["head_dim"], rope_dim=geo["rope_dim"],
                                          rope_first=lay["rope_first"], k_long_range=k_budget).to(dev)
                 ix.fit_pca(torch.cat([ix.inputs(s["q"].to(dev), s["k"].to(dev))[1][:: max(1, s["k"].shape[1] // 16384)]
@@ -238,6 +275,165 @@ def run_lsa_f2(
 
 
 # ======================================================================================
+# LSA-F2b: why did F2 fail?  (diagnostics requested by the 2026-11-04 result; see docs/roadmap/07 §3.2)
+# ======================================================================================
+@torch.no_grad()
+def oracle_diagnostics(q: torch.Tensor, k: torch.Tensor, positions: Sequence[int], budgets: Sequence[int] = (2048, 4096, 8192, 16384),
+                       scale: Optional[float] = None, n_sink: int = 4, window: int = 512) -> Dict[str, Any]:
+    """Upper bounds, no index involved. For each budget b (long-range keys; sink + window always read) report the mean per-head
+    attention-mass recall of: `shared` (one oracle selection from the head-mean attention, what the decode path does today),
+    `per_group` (one per KV group) and `per_head`. If per_head >> shared the head-shared selection, not the index, is the limit."""
+    hq = q.shape[0]
+    hkv = k.shape[0]
+    g = hq // hkv
+    out: Dict[str, Any] = {b: {"shared": [], "per_group": [], "per_head": []} for b in budgets}
+    for p in positions:
+        probs = teacher_attention_heads(q, k, [p], scale)[:, 0]  # [Hq, T]
+        n = p + 1
+        always = torch.zeros(probs.shape[-1], dtype=torch.bool, device=probs.device)
+        always[:min(n_sink, n)] = True
+        always[max(0, n - window):n] = True
+        lo, hi = n_sink, max(n_sink, n - window)
+        if hi - lo <= max(budgets):
+            continue
+        mean_p = probs.mean(0)
+        for b in budgets:
+            def recall(sel_mask: torch.Tensor, rows: torch.Tensor) -> float:
+                return float((rows * (sel_mask | always)).sum(-1).mean())
+            sh = torch.zeros_like(always)
+            sh[lo + mean_p[lo:hi].topk(b).indices] = True
+            out[b]["shared"].append(recall(sh, probs))
+            gm = []
+            for gi in range(hkv):
+                rows = probs[gi * g:(gi + 1) * g]
+                sel = torch.zeros_like(always)
+                sel[lo + rows.mean(0)[lo:hi].topk(b).indices] = True
+                gm.append(float((rows * (sel | always)).sum(-1).mean()))
+            out[b]["per_group"].append(sum(gm) / len(gm))
+            ph = []
+            for h in range(hq):
+                sel = torch.zeros_like(always)
+                sel[lo + probs[h, lo:hi].topk(b).indices] = True
+                ph.append(float((probs[h] * (sel | always)).sum()))
+            out[b]["per_head"].append(sum(ph) / len(ph))
+    return {int(b): {k_: (sum(v) / len(v) if v else None) for k_, v in d.items()} | {"n_queries": len(d["shared"])} for b, d in out.items()}
+
+
+F2B_VARIANTS: Dict[str, Dict[str, Any]] = {
+    "base": {},                                                    # free slice, pool 4, avg bucket 8 (the F2 setting, correct layout)
+    "full_head_input": {"rope_dim": 0},                            # index on the whole head incl. rotated dims
+    "fine_buckets": {"n_pool": 2, "avg_bucket_size": 4, "max_bucket_size": 8},
+    "token_buckets": {"n_pool": 1, "avg_bucket_size": 2, "max_bucket_size": 4},
+    "train_incl_64k": {"train_lengths_extra": (65536,)},           # distillation sees the evaluation length
+}
+
+
+def run_lsa_f2b(
+    model: Any,
+    tokenizer: Any,
+    train_texts: Sequence[str],
+    val_texts: Sequence[str],
+    layers: Sequence[int] = (3, 15, 31),
+    variants: Optional[Dict[str, Dict[str, Any]]] = None,
+    train_lengths: Sequence[int] = (16384, 32768),
+    val_length: int = 65536,
+    train_docs_per_length: int = 3,
+    val_docs: int = 2,
+    k_budget: int = 2048,
+    distill_steps: int = 300,
+    n_eval_queries: int = 16,
+    oracle_budgets: Sequence[int] = (2048, 4096, 8192, 16384),
+    out_dir: str = "/content/lsa_f2b",
+    seed: int = 0,
+    log=print,
+) -> Dict[str, Any]:
+    """Ablations on a few representative layers, correct rotary layout (probed). Per layer and variant: held-out recall of every arm
+    at `val_length`, held-out per-key KL before/after distillation, plus `oracle_diagnostics` (budget curve and shared/group/head)."""
+    os.makedirs(out_dir, exist_ok=True)
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    variants = variants or F2B_VARIANTS
+    rep: Dict[str, Any] = {"config": dict(layers=list(layers), variants=variants, val_length=val_length, k_budget=k_budget), "layers": {}, "errors": []}
+    all_train_lengths = sorted({int(L) for L in train_lengths} | {int(L) for v in variants.values() for L in v.get("train_lengths_extra", ())})
+    def ids_for(texts, L, n, off):
+        out = []
+        for d in range(n):
+            ids = pack_to_length(tokenizer, texts, int(L), seed=seed * 1000 + int(L) % 97 + d + off)
+            if ids is not None:
+                out.append((int(L), ids))
+            else:
+                rep["errors"].append(f"corpus too small for length {L}")
+        return out
+    train_ids = [x for L in all_train_lengths for x in ids_for(train_texts, L, train_docs_per_length, 0)]
+    val_ids = ids_for(val_texts, val_length, val_docs, 500)
+    for l in [int(x) for x in layers]:
+        try:
+            geo = layer_geometry(model, l)
+            lay = resolve_rope_first(model, l, geo)
+            tr, va = [], []
+            for (L, ids) in train_ids:
+                c = capture_qk(model, ids, [l], device="cpu")
+                if l in c:
+                    tr.append((L, c[l]))
+            for (L, ids) in val_ids:
+                c = capture_qk(model, ids, [l], device="cpu")
+                if l in c:
+                    va.append(c[l])
+            _free()
+            lrep: Dict[str, Any] = {"geometry": geo, "layout": lay, "variants": {}}
+            pos0 = sample_positions(va[0]["q"].shape[1], n_eval_queries, 4 + 512 + k_budget + 1, seed)
+            lrep["oracle"] = oracle_diagnostics(va[0]["q"].to(dev), va[0]["k"].to(dev), pos0[: max(4, n_eval_queries // 2)], budgets=oracle_budgets,
+                                                 scale=geo["scale"])
+            for name, v in variants.items():
+                cfg = dict(n_kv=geo["n_kv"], head_dim=geo["head_dim"], rope_dim=v.get("rope_dim", geo["rope_dim"]),
+                           rope_first=lay["rope_first"], k_long_range=k_budget)
+                for key in ("n_pool", "avg_bucket_size", "max_bucket_size"):
+                    if key in v:
+                        cfg[key] = v[key]
+                ix = FaithfulDLSAIndexer(**cfg).to(dev)
+                use = [s for (L, s) in tr if L in set(train_lengths) | set(v.get("train_lengths_extra", ()))]
+                ix.fit_pca(torch.cat([ix.inputs(s["q"].to(dev), s["k"].to(dev))[1][:: max(1, s["k"].shape[1] // 16384)] for s in use], 0))
+                vs = [{"q": s["q"].to(dev), "k": s["k"].to(dev)} for s in va]
+                def measure(tag: str, vrep: Dict[str, Any]) -> None:
+                    rs = [evaluate_selectors(ix, s["q"], s["k"], pos0, budget=k_budget, seed=seed, scale=geo["scale"]) for s in vs]
+                    vrep[tag] = {a: sum(r[a] for r in rs if r.get(a) is not None) / max(1, sum(1 for r in rs if r.get(a) is not None))
+                                 for a in ("faithful", "flat_oracle_index", "contiguous", "random", "oracle")}
+                    vrep[tag]["heldout_kl"] = eval_kl(ix, vs, scale=geo["scale"])
+                vrep: Dict[str, Any] = {}
+                measure("pca_init", vrep)
+                distill_indexer(ix, [{"q": s["q"].to(dev), "k": s["k"].to(dev)} for s in use], steps=distill_steps, seed=seed, log_every=0,
+                                scale=geo["scale"])
+                measure("distilled", vrep)
+                lrep["variants"][name] = vrep
+                log(f"[LSA-F2b] L{l} {name}: faithful {vrep['pca_init']['faithful']:.3f} -> {vrep['distilled']['faithful']:.3f} "
+                    f"(flat {vrep['distilled']['flat_oracle_index']:.3f}, oracle {vrep['distilled']['oracle']:.3f}, "
+                    f"held-out KL {vrep['pca_init']['heldout_kl']:.3f} -> {vrep['distilled']['heldout_kl']:.3f})")
+                del ix, vs
+                _free()
+            rep["layers"][str(l)] = lrep
+        except Exception as e:
+            rep["errors"].append(f"layer {l}: {type(e).__name__}: {str(e)[:300]}")
+            _free()
+    with open(os.path.join(out_dir, "lsa_f2b_report.json"), "w") as f:
+        json.dump(rep, f, indent=1, default=str)
+    return rep
+
+
+def format_f2b(rep: Dict[str, Any]) -> str:
+    rows = ["layer variant            tag        faith  flat   contig oracle  heldoutKL"]
+    for l, lr in sorted(rep.get("layers", {}).items(), key=lambda kv: int(kv[0])):
+        for name, v in lr["variants"].items():
+            for tag in ("pca_init", "distilled"):
+                r = v[tag]
+                rows.append(f"{int(l):>5} {name:<19} {tag:<9} {r['faithful']:6.3f} {r['flat_oracle_index']:6.3f} {r['contiguous']:6.3f} "
+                            f"{r['oracle']:6.3f}  {r['heldout_kl'] if r['heldout_kl'] is not None else float('nan'):8.3f}")
+        rows.append(f"{int(l):>5} ORACLE (no index) mean per-head recall by budget:")
+        for b, d in sorted(lr["oracle"].items()):
+            fm = lambda x: "  n/a " if x is None else f"{x:.3f}"
+            rows.append(f"        budget {b:>6}: shared {fm(d['shared'])} | per-KV-group {fm(d['per_group'])} | per-head {fm(d['per_head'])}  (n={d['n_queries']})")
+    return "\n".join(rows)
+
+
+# ======================================================================================
 # Reporting + gate (pure python)
 # ======================================================================================
 GATE = {"min_recall": 0.90, "min_margin_vs_contiguous": 0.10, "max_clustering_loss": 0.03, "min_len_for_claim": 65536}
@@ -260,7 +456,8 @@ def gate_f2(report: Dict[str, Any], gate: Dict[str, float] = GATE) -> Dict[str, 
         ok_clu = (r["flat_oracle_index"] - r["faithful"]) <= gate["max_clustering_loss"]
         per[l] = {"pass": bool(ok_abs and ok_margin and ok_clu), "faithful": r["faithful"], "contiguous": r["contiguous"],
                   "random": r["random"], "flat_oracle_index": r["flat_oracle_index"], "oracle": r["oracle"],
-                  "abs": bool(ok_abs), "margin": bool(ok_margin), "clustering": bool(ok_clu)}
+                  "abs": bool(ok_abs), "margin": bool(ok_margin), "clustering": bool(ok_clu),
+                  "faithful_over_oracle": r["faithful"] / max(1e-9, r["oracle"])}  # report-only (the v1 gate does not use it)
     passed = [int(l) for l, v in per.items() if v["pass"]]
     failed = sorted(int(l) for l, v in per.items() if not v["pass"])
     return {"evaluated": True, "length": L, "claim_grade": bool(L >= gate["min_len_for_claim"]), "layers_passed": sorted(passed),

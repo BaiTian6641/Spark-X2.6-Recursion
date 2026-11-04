@@ -336,11 +336,46 @@ def teacher_attention(q: torch.Tensor, k: torch.Tensor, q_positions: Sequence[in
     return out / hq
 
 
+def teacher_attention_heads(q: torch.Tensor, k: torch.Tensor, q_positions: Sequence[int], scale: Optional[float] = None) -> torch.Tensor:
+    """Per-head causal attention probabilities `[H_q, len(q_positions), T]` (diagnostics: shared vs per-group vs per-head selection)."""
+    hq, t, d = q.shape
+    g = hq // k.shape[0]
+    scale = scale if scale is not None else 1.0 / math.sqrt(d)
+    pos = torch.as_tensor(list(q_positions), device=q.device)
+    out = torch.zeros(hq, len(q_positions), t, device=q.device)
+    kpos = torch.arange(t, device=q.device).unsqueeze(0)
+    for h in range(hq):
+        logits = (q[h, pos].float() @ k[h // g].float().t()) * scale
+        out[h] = torch.softmax(logits.masked_fill(kpos > pos.unsqueeze(1), float("-inf")), dim=-1)
+    return out
+
+
 def mid_region_mask(q_positions: Sequence[int], t: int, n_sink: int, window: int, device: Any = "cpu") -> torch.Tensor:
     """Keys the indexer must rank for each query: causal, excluding sink and the always-read local window."""
     pos = torch.as_tensor(list(q_positions), device=device).unsqueeze(1)
     kpos = torch.arange(t, device=device).unsqueeze(0)
     return (kpos >= n_sink) & (kpos <= pos - window)
+
+
+@torch.no_grad()
+def eval_kl(indexer: FaithfulDLSAIndexer, samples: Sequence[Dict[str, torch.Tensor]], queries_per_sample: int = 64, seed: int = 123,
+            scale: Optional[float] = None) -> Optional[float]:
+    """Per-key KL (middle region) of the indexer on samples it was NOT trained on (same definition as the training loss)."""
+    g = torch.Generator().manual_seed(seed)
+    vals = []
+    for s in samples:
+        q, k = s["q"], s["k"]
+        t = q.shape[1]
+        lo = indexer.n_sink + indexer.window + 64
+        if t <= lo + 1:
+            continue
+        pos = torch.randint(lo, t, (min(queries_per_sample, t - lo),), generator=g).sort().values.tolist()
+        q_in_all, k_in = indexer.inputs(q, k)
+        mask = mid_region_mask(pos, t, indexer.n_sink, indexer.window, q.device)
+        p = teacher_attention(q, k, pos, scale) * mask
+        p = p / p.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        vals.append(float(indexer.distill_loss(q_in_all[pos], k_in, p, mask)))
+    return sum(vals) / len(vals) if vals else None
 
 
 def distill_indexer(indexer: FaithfulDLSAIndexer, samples: Sequence[Dict[str, torch.Tensor]], steps: int = 200,
