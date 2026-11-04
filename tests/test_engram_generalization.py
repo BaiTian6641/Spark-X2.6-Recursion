@@ -83,7 +83,21 @@ class TestSummarizer(unittest.TestCase):
     def test_interpret_buckets(self):
         self.assertIn("LEXICAL", eg.interpret({"FULL": 0.1}))
         self.assertIn("PARTIAL", eg.interpret({"FULL": 0.5}))
-        self.assertIn("GOOD", eg.interpret({"FULL": 0.9}))
+        self.assertTrue(eg.interpret({"FULL": 0.9}).startswith("TRANSFER"))
+
+    def test_transfer_above_one_is_flagged_anomalous_not_good(self):
+        # Regression: the Colab run (transfer 5.3, gains ~0.03 nats) was previously labelled "GOOD TRANSFER".
+        v = eg.interpret({"FULL": 5.28}, max_transfer=9.16, mean_orig_gain=0.027)
+        self.assertIn("ANOMALOUS", v)
+        self.assertIn("WEAK", v)
+        self.assertNotIn("GOOD", v)
+
+    def test_control_arm_flags_prompt_independence(self):
+        t = self._table(orig_full=0.5, para_full=0.4)
+        t["t"]["ctrl"] = {"OFF": 2.0, "FULL": 1.6}  # unrelated prompt keeps 80% of the gain
+        s = eg.summarize_transfer(t)
+        self.assertAlmostEqual(s["mean_control_ratio"], 0.8)
+        self.assertIn("CONTROL", eg.interpret(s["mean_transfer"], s["max_transfer"], s["mean_orig_gain"], s["mean_control_ratio"]))
 
 
 if __name__ == "__main__":

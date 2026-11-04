@@ -150,12 +150,19 @@ def word_trigram_overlap(a: str, b: str) -> float:
 def summarize_transfer(per_task: Dict[str, Dict[str, Any]], min_gain: float = 0.02) -> Dict[str, Any]:
     """Aggregate per-task NLL tables into gain-transfer ratios.
 
-    `per_task[tid] = {"orig": {cond: nll}, "para": [{cond: nll, "overlap": float}, ...]}`.
+    `per_task[tid] = {"orig": {cond: nll}, "para": [{cond: nll, "overlap": float}, ...], "ctrl": {cond: nll}?}`.
     gain(cond, prompt) = NLL_OFF(prompt) - NLL_cond(prompt)   (positive = Engram helps).
     transfer(cond)     = mean_para_gain / orig_gain           (only when orig_gain > `min_gain`).
+    control_ratio      = gain(unrelated prompt, same target) / gain(orig)  -> ~1 means the gain does NOT depend on the prompt.
+
+    NOTE: teacher forcing feeds the gold prefix, so a gain can come from recalling the response text from its own earlier
+    tokens. Transfer > 1 or a control ratio near 1 are therefore signs of prompt-independent response recall, NOT of good
+    prompt-conditioned generalization.
     """
     rows: Dict[str, Any] = {}
     agg: Dict[str, List[float]] = {c: [] for c in ("FULL", "SEM_ONLY", "LEX_ONLY")}
+    orig_gains: List[float] = []
+    ctrl_ratios: List[float] = []
     for tid, d in per_task.items():
         o = d["orig"]
         r: Dict[str, Any] = {"orig_nll": o}
@@ -167,33 +174,66 @@ def summarize_transfer(per_task: Dict[str, Dict[str, Any]], min_gain: float = 0.
             r[cond] = {"gain_orig": g_orig, "gain_para_mean": mean_g_para, "transfer": tr}
             if tr is not None:
                 agg[cond].append(tr)
+        orig_gains.append(o["OFF"] - o["FULL"])
+        c = d.get("ctrl")
+        if c:
+            g_ctrl = c["OFF"] - c["FULL"]
+            g_o = o["OFF"] - o["FULL"]
+            r["control"] = {"gain_ctrl": g_ctrl, "ratio_vs_orig": (g_ctrl / g_o) if g_o > min_gain else None}
+            if g_o > min_gain:
+                ctrl_ratios.append(g_ctrl / g_o)
         r["mean_overlap"] = sum(p.get("overlap", 0.0) for p in d["para"]) / max(1, len(d["para"]))
         rows[tid] = r
     mean_tr = {c: (sum(v) / len(v) if v else None) for c, v in agg.items()}
-    return {"tasks": rows, "mean_transfer": mean_tr, "n_tasks_scored": {c: len(v) for c, v in agg.items()}}
+    all_tr = [x for v in agg.values() for x in v]
+    return {
+        "tasks": rows,
+        "mean_transfer": mean_tr,
+        "max_transfer": max(all_tr) if all_tr else None,
+        "mean_orig_gain": sum(orig_gains) / max(1, len(orig_gains)),
+        "mean_control_ratio": (sum(ctrl_ratios) / len(ctrl_ratios)) if ctrl_ratios else None,
+        "n_tasks_scored": {c: len(v) for c, v in agg.items()},
+    }
 
 
-def interpret(mean_transfer: Dict[str, Optional[float]]) -> str:
+def interpret(
+    mean_transfer: Dict[str, Optional[float]],
+    max_transfer: Optional[float] = None,
+    mean_orig_gain: Optional[float] = None,
+    mean_control_ratio: Optional[float] = None,
+) -> str:
     """Heuristic reading of the aggregate. Thresholds are rules of thumb, not calibrated statistics."""
     full = mean_transfer.get("FULL")
     if full is None:
         return "INCONCLUSIVE: Engram gives no measurable NLL gain on the original prompts (nothing to transfer)."
+    notes: List[str] = []
+    if (max_transfer is not None and max_transfer > 1.5) or full > 1.5:
+        notes.append("ANOMALOUS: gain is LARGER on reworded prompts than on the trained prompt (transfer > 1.5), so it is not "
+                     "tied to the trained prompt; likely prompt-independent recall of the response text from its own prefix.")
+    if mean_control_ratio is not None and mean_control_ratio > 0.7:
+        notes.append(f"CONTROL: an unrelated prompt keeps {mean_control_ratio:.0%} of the gain -> the gain does not depend on the prompt.")
+    if mean_orig_gain is not None and mean_orig_gain < 0.05:
+        notes.append(f"WEAK: mean marginal gain on trained prompts is only {mean_orig_gain:.3f} nats.")
+    if notes:
+        return " | ".join(notes)
     if full < 0.30:
         return ("LEXICAL-MEMORIZATION DOMINATED: <30% of the original-prompt gain survives rewording. "
                 "Priority: paraphrase-augmented consolidation + token-level lexical dropout.")
     if full < 0.70:
         return "PARTIAL TRANSFER: some semantic carry-over; augmentation should help but the semantic path is not the bottleneck alone."
-    return ("GOOD TRANSFER: gains survive rewording. If generation still fails on paraphrases, suspect decoding/prompt-format "
-            "effects rather than the Engram.")
+    return "TRANSFER: gains survive rewording with a prompt-dependent signature."
 
 
 # --------------------------------------------------------------------------------------
 # Torch-dependent pieces (lazy imports)
 # --------------------------------------------------------------------------------------
 @contextmanager
-def engram_ablation(model: Any, lex: float = 1.0, sem: float = 1.0):
-    """Temporarily scale the Tier-1 lexical path (`lex`) and/or shared+routed semantic path (`sem`) on every Engram anchor."""
-    mods = list(model.all_engram_modules())
+def engram_ablation(model: Any, lex: float = 1.0, sem: float = 1.0, modules: Optional[Sequence[Any]] = None):
+    """Temporarily scale the Tier-1 lexical path (`lex`) and/or shared+routed semantic path (`sem`).
+
+    Applies to every Engram anchor unless `modules` (a subset of `model.all_engram_modules()`) is given.
+    """
+    mods = list(modules) if modules is not None else list(model.all_engram_modules())
     prev = [(getattr(m, "_ablate_lex", 1.0), getattr(m, "_ablate_sem", 1.0)) for m in mods]
     try:
         for m in mods:
@@ -261,11 +301,17 @@ def diagnose_engram_generalization(
             target = t["teacher_instructed_target"]
             if use_domain_focus:
                 model.set_domain_engram_focus(t["domain"], boost=0.08)
+            other = [x for k, x in tasks.items() if x["domain"] != t["domain"]]
+            ctrl_prompt = other[0]["prompt"] if other else None
             prompts = [("orig", t["prompt"])] + [(f"para{i + 1}", p) for i, p in enumerate(paras)]
+            if ctrl_prompt:
+                prompts.append(("ctrl", ctrl_prompt))
             entry: Dict[str, Any] = {"orig": {}, "para": []}
             for name, prompt in prompts:
                 row: Dict[str, float] = {}
                 for cname, cfg in CONDITIONS.items():
+                    if name == "ctrl" and cname not in ("OFF", "FULL"):
+                        continue
                     model.set_loop(start=4, end=28, passes=2, use_mhc=True, use_engram=cfg["use_engram"],
                                    enable_p3=True, p3_start=12, p3_end=24)
                     with engram_ablation(model, lex=cfg["lex"], sem=cfg["sem"]):
@@ -278,6 +324,8 @@ def diagnose_engram_generalization(
                     continue
                 if name == "orig":
                     entry["orig"] = row
+                elif name == "ctrl":
+                    entry["ctrl"] = row
                 else:
                     row["overlap"] = word_trigram_overlap(t["prompt"], prompt)
                     entry["para"].append(row)
@@ -293,7 +341,9 @@ def diagnose_engram_generalization(
             model.base.eval()
 
     summary = summarize_transfer(per_task)
-    summary["verdict"] = interpret(summary["mean_transfer"])
+    summary["verdict"] = interpret(
+        summary["mean_transfer"], summary["max_transfer"], summary["mean_orig_gain"], summary["mean_control_ratio"]
+    )
 
     # Leak-free sanity PPL (texts present in no training path)
     heldout = bench.evaluate_engram_perplexity_delta(model, tokenizer, eval_texts=TRUE_HELDOUT_TEXTS)
@@ -316,6 +366,8 @@ def diagnose_engram_generalization(
         print("-" * len(hdr))
         print("mean transfer:", {k: (None if v is None else round(v, 3)) for k, v in summary["mean_transfer"].items()},
               "| tasks scored:", summary["n_tasks_scored"])
+        print(f"mean orig gain: {summary['mean_orig_gain']:.4f} nats | max transfer: {summary['max_transfer']} | "
+              f"control(unrelated prompt) ratio: {summary['mean_control_ratio']}")
         print("VERDICT:", summary["verdict"])
         print(f"True held-out  : no-Engram PPL={heldout['no_engram_ppl']:.4f}  with-Engram PPL={heldout['with_engram_ppl']:.4f}  "
               f"(delta={heldout['delta_ppl']:+.4f}, acc {heldout['no_engram_acc']:.2f}% -> {heldout['with_engram_acc']:.2f}%)")
@@ -323,3 +375,106 @@ def diagnose_engram_generalization(
               f"(these texts were TRAINED ON in Phase-4 and SI-SRSI)")
         print("=" * 118)
     return summary
+
+
+# --------------------------------------------------------------------------------------
+# Engram utility on leak-free text: scale sweep + leave-one-anchor-out + per-text paired deltas
+# --------------------------------------------------------------------------------------
+def _per_text_ce(model: Any, tokenizer: Any, texts: Sequence[str]) -> List[tuple]:
+    """Return `[(sum_nll, n_tokens), ...]` (teacher-forced next-token CE over the whole text)."""
+    import torch
+    import torch.nn.functional as F
+
+    device = next(model.base.parameters()).device
+    out = []
+    for txt in texts:
+        ids = tokenizer(txt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        with torch.no_grad():
+            logits = model.forward_logits(ids).float()
+        sl = logits[:, :-1, :].contiguous()
+        tl = ids[:, 1:].contiguous()
+        nll = F.cross_entropy(sl.view(-1, sl.size(-1)), tl.view(-1), reduction="sum")
+        out.append((float(nll.item()), int(tl.numel())))
+    return out
+
+
+def _mean_ce(rows: Sequence[tuple]) -> float:
+    return sum(r[0] for r in rows) / max(1, sum(r[1] for r in rows))
+
+
+def engram_utility_report(
+    model: Any,
+    tokenizer: Any,
+    texts: Optional[Sequence[str]] = None,
+    scales: Sequence[float] = (0.0, 0.25, 0.5, 0.75, 1.0),
+    flight_mode: str = "deep_knowledge",
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Does the Engram help on text it was never trained on, at which strength, and which anchors help or hurt?
+
+    * `OFF` vs `FULL` per-text paired CE deltas (positive delta = Engram hurts).
+    * Scale sweep: semantic+lexical path scaled by s in `scales` (s=1 is the trained model, s=0 removes the layer's contribution).
+    * Leave-one-anchor-out: ablate a single anchor; `removal_delta_ce` > 0 means the anchor was helping.
+
+    Low power warning: the default 5 texts are ~1-2K tokens in total, so treat differences below ~0.02 nats as noise.
+    """
+    texts = list(texts) if texts is not None else list(TRUE_HELDOUT_TEXTS)
+    was_training = model.training
+    prev_ckpt = bool(getattr(model, "enable_checkpoint", False))
+    model.eval()
+    model.enable_checkpoint = False
+    model.settings.checkpoint_layers = False
+    model.set_engram_flight_mode(flight_mode)
+    model.set_domain_engram_focus("general", boost=0.0)
+
+    def run(use_engram: bool, lex: float = 1.0, sem: float = 1.0, modules: Optional[Sequence[Any]] = None):
+        model.set_loop(start=4, end=28, passes=2, use_mhc=True, use_engram=use_engram, enable_p3=True, p3_start=12, p3_end=24)
+        with engram_ablation(model, lex=lex, sem=sem, modules=modules):
+            return _per_text_ce(model, tokenizer, texts)
+
+    rep: Dict[str, Any] = {"n_texts": len(texts)}
+    try:
+        off = run(False)
+        full = run(True)
+        rep["n_tokens"] = sum(r[1] for r in full)
+        rep["ce_off"], rep["ce_full"] = _mean_ce(off), _mean_ce(full)
+        rep["per_text_delta_ce"] = [f[0] / f[1] - o[0] / o[1] for o, f in zip(off, full)]
+        rep["n_texts_engram_hurts"] = sum(1 for d in rep["per_text_delta_ce"] if d > 0)
+
+        rep["scale_sweep"] = {}
+        for sc in scales:
+            rep["scale_sweep"][float(sc)] = _mean_ce(run(True, lex=float(sc), sem=float(sc)))
+
+        rep["leave_one_anchor_out"] = {}
+        for layer, mod in model.iter_engram_anchors():
+            ce_wo = _mean_ce(run(True, lex=0.0, sem=0.0, modules=[mod]))
+            rep["leave_one_anchor_out"][int(layer)] = {"ce_without": ce_wo, "removal_delta_ce": ce_wo - rep["ce_full"]}
+    finally:
+        model.set_loop(start=4, end=28, passes=2, use_mhc=True, use_engram=True, enable_p3=True, p3_start=12, p3_end=24)
+        model.enable_checkpoint = prev_ckpt
+        model.settings.checkpoint_layers = prev_ckpt
+        if was_training:
+            model.train()
+            model.base.eval()
+
+    sweep = rep["scale_sweep"]
+    best_scale = min(sweep, key=lambda k: sweep[k])
+    rep["best_scale"] = best_scale
+    rep["harmful_anchors"] = sorted(l for l, v in rep["leave_one_anchor_out"].items() if v["removal_delta_ce"] < -0.002)
+    rep["helpful_anchors"] = sorted(l for l, v in rep["leave_one_anchor_out"].items() if v["removal_delta_ce"] > 0.002)
+
+    if verbose:
+        print("\n" + "=" * 100)
+        print(f"[ENGRAM UTILITY ON LEAK-FREE TEXT] {rep['n_texts']} texts, {rep['n_tokens']} tokens  (noise floor ~0.02 nats)")
+        print("=" * 100)
+        print(f"CE  OFF={rep['ce_off']:.4f}   FULL={rep['ce_full']:.4f}   delta(FULL-OFF)={rep['ce_full'] - rep['ce_off']:+.4f}  "
+              f"| engram hurts on {rep['n_texts_engram_hurts']}/{rep['n_texts']} texts")
+        print("per-text delta CE:", [round(x, 4) for x in rep["per_text_delta_ce"]])
+        print("scale sweep (CE):", {k: round(v, 4) for k, v in sweep.items()}, "| best scale:", best_scale)
+        print(f"{'anchor':>6} {'CE w/o anchor':>14} {'removal delta':>14}  verdict")
+        for l, v in sorted(rep["leave_one_anchor_out"].items()):
+            tag = "HELPS" if v["removal_delta_ce"] > 0.002 else ("HURTS" if v["removal_delta_ce"] < -0.002 else "~neutral")
+            print(f"{l:>6} {v['ce_without']:>14.4f} {v['removal_delta_ce']:>+14.4f}  {tag}")
+        print("harmful anchors:", rep["harmful_anchors"], "| helpful anchors:", rep["helpful_anchors"])
+        print("=" * 100)
+    return rep
