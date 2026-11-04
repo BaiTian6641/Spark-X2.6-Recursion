@@ -15,6 +15,7 @@
 | 04 | [Verified References](04_REFERENCES_VERIFIED.md) | 30 references, all web-verified on 2026-11-03, with what each is used for and where |
 | 05 | [SI-SRSI v2 Design](05_SI_SRSI_V2_DESIGN.md) | v1 audit (leaked 5-task loop, static answer-key teacher, regex rubric), verifier-first on-policy RFT pipeline, held-out gate with paired bootstrap, eval battery, milestones SI0–SI7 |
 | 06 | [MoE-Engram Problem Analysis](06_ENGRAM_PROBLEM_ANALYSIS.md) | Verified symptoms S1–S6, hypotheses H1–H6 with tests/fixes, post-long-run decision tree, what SI-SRSI v2 can and cannot fix |
+| 07 | [Faithful D-LSA, Dynamic Memory & Backbone↔Engram Integration](07_LSA_FAITHFUL_AND_DYNAMIC_MEMORY.md) | Honest D-LSA status (G2 was vacuous), faithful module design, LSA-F1…F8 gates, 1–2M memory arithmetic, dynamic memory graph / recall / consolidation, BIE experiments |
 
 ## Status Legend
 `⬜ todo` · `🟨 in progress` · `🟩 gate passed` · `🟥 blocked / failed gate` · `⏸ deferred`
@@ -32,7 +33,7 @@
 | **L2** Engram repair | L | L1 | GL2 | 🟩 | `bfe9063` (`No-Engram 72L PPL=5.6779` → `Repaired Engram 72L PPL=5.2042`, `-0.4737` PPL, zeroed `[31, 15, 27, 23, 19]`) |
 | **L3** gain-collapse fix + healing + recurrence curriculum | L | L1 | GL3 | 🟩 | `7c54c4a` / `bfe9063` (`min_gain_p2=0.05`, `min_gain_p3=0.02`, 24 controllers healthy) |
 | **Phase 1** trace capture (LB + 36L, gapped position ids) | M | P0 | G1 | 🟩 | `e61b162` (`capture_residuals`, `capture_attention_io` with head-wise `g_proj` `[16, W]`, gapped `cache_position`) |
-| **Phase 2** D-LSA on RoPE-free slice + Ward + `ColdKVStore` | M | P1 | G2 | 🟩 | `e61b162` (`mean_attention_mass_recall=1.0`, `ColdKVStore` Ward paging verified, `sha256_match=True`) |
+| **Phase 2** D-LSA on RoPE-free slice + Ward + `ColdKVStore` | M | P1 | G2 | 🟨 plumbing only — **G2 was vacuous** (~25-token input, `k_budget=32` selects every key, so recall=1.0 is trivial); claim gate (recall ≥ 0.90 @ ≥64K vs baselines) = LSA-F2 | `e61b162` (`ColdKVStore` Ward paging at page_size=64, `sha256_match=True`) |
 | **Phase 3** ESM module + Σ_gen through LB | M | P1 | G3 | 🟩 | `7c54c4a` (`captured_energy=0.9959..0.9999`, `max_prot_leakage=1.44e-8`, canary gate `open_rate<=0.05`) |
 | **Phase 4** self-study probes + LRCD on LB | M | P3, **L3** | G4 | 🟩 | `7c54c4a` (`mean_rel_fit_error=3.9e-5`, `evicted_nll=5.5881` → `compiled_72L_esm_nll=2.2278`, `79.4%` NLL gap recovery) |
 | **Phase 5** sleep scheduler, ledger, eviction, forget | M | P4 | G5 | 🟩 | `7c54c4a` (`exact_unlearning_verified=True`, `sha256_match=True`) |
@@ -45,6 +46,9 @@
 | **Cell 4 held-out Engram validation hook** (6 held-out packed seqs, OFF/FULL + leave-one-anchor-out at every stage start/end) | L | Diagnostic | ΔCE<0 on validation | 🟨 code ready, untested on GPU | `VAL_HOLDOUT_SEQS`, `ENGRAM_STAGE_VALIDATION`; audit found Cell 4 has no validation split, selects "best" by leaked texts, and never calls `repair_harmful_engram_anchors` |
 | **20 h resumable long run** (`sparkx_long_run.py`, notebook `SparkX_Loop_v03_LongRun_Colab.ipynb`): token-budget plan (~740 steps, ~85M real tokens, ~44K unique docs vs ~5M tokens x3.9 epochs before), chunked de-duplicated curation with shard advance + quota redistribution, doc-hash held-out split (`sha1(prompt)%25==0` never trained), frozen 64-doc validation set (per-pillar CE ON/OFF), best-by-held-out-CE checkpoint + plateau rollback (LR x0.5), Hub-persisted state for multi-session resume; leaked Phase-4/SI-SRSI disabled | L | Diagnostic | held-out CE(ON) < baseline CE(ON) and Engram delta <= 0 | 🟨 pure-Python parts unit-tested (12 tests); GPU training path untested until Colab | `LONGRUN_*` cfg keys; optimizer moments not persisted (LR re-warm after resume) |
 | **SI-SRSI v2** (design only): SI0 baseline battery + generation throughput, SI1 verifiers/task bank/sandbox, SI2 policy-consistent batched rollouts, SI3 RFT round + ablation arms, SI4 Engram gap-write test, SI5 pref term, SI6 multi-round, SI7 one-shot test | L | Long run | held-out gate (doc 05 §6) | ⬜ designed; not implemented | `05_SI_SRSI_V2_DESIGN.md`; v1 (`run_si_srsi_engram_loop`) disabled by default, numbers flagged leaked |
+| **LSA-F1** faithful D-LSA module (group-aligned free-slice index, batched MNN Ward, paged exact-key selection, per-key KL distillation) | M | P1 | 11 unit tests | 🟩 mechanism only (synthetic); no real-attention claim | `6d470a1` (`sparkx_dlsa.py`, `tests/test_dlsa.py`) |
+| **LSA-F2…F8** real-data recall gate, end-to-end decode, hot/cold paging, KV sharing, dynamic memory graph, sleep consolidation, 1–2M scale | M×L | LSA-F1, long run | doc 07 §3 | ⬜ designed | `07_LSA_FAITHFUL_AND_DYNAMIC_MEMORY.md` |
+| **BIE** backbone↔Engram integration evaluation (knowledge locus, early anchors, gate design, adapter decision, gap-write) | L | long run | doc 07 §5 decision rule | ⬜ designed | `07_LSA_FAITHFUL_AND_DYNAMIC_MEMORY.md` |
 
 ## Two Tracks, One Base
 

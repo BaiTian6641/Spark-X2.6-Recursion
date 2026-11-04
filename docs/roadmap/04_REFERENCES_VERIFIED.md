@@ -63,6 +63,11 @@
 | R28 | Wu et al., *LongMemEval: Benchmarking Chat Assistants on Long-Term Interactive Memory* | arXiv 2410.10813 (ICLR 2025) | Tier D2 (external validity) |
 | R29 | ZsRE (Levy et al. 2017) / CounterFact (Meng et al. 2022) | CoNLL 2017 / R6 | Tier D3 (editing comparability) |
 | R30 | Zhou et al., *Instruction-Following Evaluation for LLMs* (IFEval) | arXiv 2311.07911 | Tier B (full 541 prompts, never n=50 for claims) |
+| R31 | DeepSeek-AI, *Conditional Memory via Scalable Lookup: A New Axis of Sparsity for LLMs* (Engram) | arXiv 2601.07372 | Placement (early layers in sweeps), context-aware sigmoid gate, deterministic hashed addressing. Details beyond the abstract come from secondary summaries — **(unverified)** | `07 §5`, `06` |
+| R32 | Gutiérrez, Shu, Qi, Zhou, Su, *From RAG to Memory: Non-Parametric Continual Learning for LLMs* (HippoRAG 2) | arXiv 2502.14802 | Personalized-PageRank spreading activation over a passage/phrase graph; our co-access prefetch is the KV-bucket analogue | `07 §4` |
+| R33 | Xu et al., *A-MEM: Agentic Memory for LLM Agents* | arXiv 2502.12110 | Zettelkasten-style linked, evolving notes; related work for memory linking | `07 §4` |
+| R34 | Rasmussen et al., *Zep: A Temporal Knowledge Graph Architecture for Agent Memory* (Graphiti) | arXiv 2501.13956 | Bi-temporal invalidate-don't-overwrite; maps to our ledger + exact unlearning | `07 §4` |
+| R35 | `Prefrontal-AI/latent-sparse-attention` README + `docs/guide/training.md` | GitHub | Per-key KL distillation, group-aligned position-free index input, docs 16K–1M balanced by length/domain, ~2,560 keys/query | `01 C1.2`, `07 §2` |
 
 ---
 
