@@ -3277,6 +3277,8 @@ class SparkXLoopV03(nn.Module):
         share_global_kv = bool(getattr(self, 'share_global_kv_across_passes', False))
         global_layer_set = set(getattr(self, 'esm_layers', (3, 7, 11, 15, 19, 23, 27, 31, 35)))
         cap_hook = getattr(self, '_residual_capture_hook', None)
+        # BIE experiments: restrict in-loop Engram anchors to a subset of passes (None = all passes, the trained behaviour)
+        engram_pass_filter = getattr(self, 'engram_pass_filter', None)
         esm_on = bool(getattr(self, 'esm_enabled', False)) and hasattr(self, 'esm')
         esm_visits_mode = str(getattr(self, 'esm_visits', 'first'))
 
@@ -3401,12 +3403,12 @@ class SparkXLoopV03(nn.Module):
                         else None
                     )
                     virtual_idx += 1
-                    def step(s, _ctrl=ctrl, _layer=layer, _rp=rp, _mk=mk, _extra=(p > 0), _p=p, _vc=v_cache, _cp=cache_position, _eng=eng_mod, _idx=idx, _v_idx=v_idx):
+                    def step(s, _ctrl=ctrl, _layer=layer, _rp=rp, _mk=mk, _extra=(p > 0), _p=p, _vc=v_cache, _cp=cache_position, _eng=eng_mod, _idx=idx, _v_idx=v_idx, _pf=engram_pass_filter):
                         s_out = _ctrl(s, _layer, _rp, _mk, extra=_extra, pass_idx=_p,
                                       past_key_values=_vc, cache_position=_cp)
                         if cap_hook is not None:
                             cap_hook(_idx, _v_idx, _p, 'post_layer', s_out[0])
-                        if _eng is not None:
+                        if _eng is not None and (_pf is None or _p in _pf):
                             eng_delta = _eng(
                                 input_ids, s_out.dtype, prev_ids=prev_ids, hidden_states=s_out[0],
                                 pass_idx=_p, ngram_indices=ngram_indices,
