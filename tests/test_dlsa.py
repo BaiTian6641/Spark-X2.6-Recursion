@@ -199,6 +199,45 @@ class TestDLSA(unittest.TestCase):
         self.assertEqual(idx.n_blocks, 0)
         self.assertEqual(idx.select(torch.randn(8), 16).numel(), 90)
 
+    def test_paged_index_extend_to_bit_identical_to_full_rebuild(self):
+        g = torch.Generator().manual_seed(77)
+        k_idx = F.normalize(torch.randn(600, 16, generator=g), dim=-1)
+        q_idx = F.normalize(torch.randn(16, generator=g), dim=-1)
+        inc = PagedLatentIndex(k_idx[:120], n_sink=4, n_pool=4, n_cluster=64, avg_bucket_size=8, max_bucket_size=16, window=32, rerank=2)
+        for step_t in (200, 350, 480, 600):
+            inc.extend_to(k_idx[:step_t])
+            full = PagedLatentIndex(k_idx[:step_t], n_sink=4, n_pool=4, n_cluster=64, avg_bucket_size=8, max_bucket_size=16, window=32, rerank=2)
+            self.assertEqual(inc.n_blocks, full.n_blocks)
+            self.assertEqual(inc.clustered_end, full.clustered_end)
+            self.assertTrue(torch.equal(inc.labels, full.labels))
+            self.assertTrue(torch.allclose(inc.centroids, full.centroids, atol=1e-6))
+            self.assertTrue(torch.equal(inc.bucket_tokens, full.bucket_tokens))
+            self.assertTrue(torch.equal(inc.select(q_idx, 32), full.select(q_idx, 32)))
+
+    def test_decode_cache_incremental_and_selection_reuse(self):
+        q, k, _, _ = make_scattered(t=420, seed=19)
+        ix = small_indexer(n_pool=4, n_cluster=64, window=32, k_long_range=32)
+        ix.fit_pca(ix.inputs(q, k)[1])
+        ix.reset_decode_cache()
+        for t in (260, 290, 330, 380, 420):
+            q_step = q[:, t - 1 : t].unsqueeze(0)
+            k_step = k[:, :t].unsqueeze(0)
+            sel_cached = ix.select_key_indices(q_step, k_step, k_budget=32, use_cache=True)
+            sel_uncached = ix.select_key_indices(q_step, k_step, k_budget=32, use_cache=False)
+            self.assertTrue(torch.equal(sel_cached, sel_uncached))
+        self.assertEqual(ix.decode_cache_misses, 1)
+        self.assertEqual(ix.decode_cache_hits, 4)
+
+        # Now test step-to-step selection reuse with coherent consecutive decode queries
+        ix.reset_decode_cache()
+        ix.selection_reuse_steps = 4
+        ix.reuse_cos_threshold = 0.90
+        q_coherent = q[:, 399:400].unsqueeze(0)
+        for t in (400, 401, 402, 403):
+            _ = ix.select_key_indices(q_coherent, k[:, :t].unsqueeze(0), k_budget=32, use_cache=True)
+        self.assertGreaterEqual(ix.selection_reuse_hits, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
+

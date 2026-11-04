@@ -175,10 +175,13 @@ class PagedLatentIndex:
         self.mid_start = self.n_sink
         self.clustered_end = self.n_sink + n_blocks * self.n_cluster  # keys in [clustered_end, T) are always read
         self.pools_per_block = self.n_cluster // self.n_pool
+        self.avg_bucket_size = int(avg_bucket_size)
+        self.max_bucket_size = int(max_bucket_size)
         if n_blocks == 0:
             self.centroids = torch.zeros(0, 0, d)
             self.labels = torch.zeros(0, 0, dtype=torch.long)
             self.bucket_tokens = torch.zeros(0, 0)
+            self.k_idx_n = F.normalize(k_idx.float(), dim=-1, eps=1e-6) if self.rerank > 1 else None
             return
         kk = F.normalize(k_idx.float(), dim=-1, eps=1e-6)
         self.k_idx_n = kk if self.rerank > 1 else None
@@ -191,6 +194,55 @@ class PagedLatentIndex:
         sums = torch.einsum("bpc,bpd->bcd", onehot, pools)
         self.centroids = F.normalize(sums, dim=-1, eps=1e-6)  # [B, C, d]
         self.bucket_tokens = onehot.sum(dim=1) * self.n_pool  # [B, C] token count per bucket (0 = empty slot)
+        self.avg_bucket_size = int(avg_bucket_size)
+        self.max_bucket_size = int(max_bucket_size)
+
+    @torch.no_grad()
+    def extend_to(self, k_idx: torch.Tensor) -> int:
+        """Incrementally extend the index to a longer key sequence `k_idx` (`[T_new, d]`, `T_new >= self.t`) without
+        re-clustering already-completed blocks `[mid_start, clustered_end)`. Returns the number of newly clustered blocks."""
+        new_t = int(k_idx.shape[0])
+        if new_t < self.t:
+            raise ValueError(f"extend_to requires new_t ({new_t}) >= current t ({self.t})")
+        if new_t == self.t:
+            return 0
+        d = int(k_idx.shape[-1])
+        old_t = self.t
+        self.t = new_t
+        if self.rerank > 1:
+            kk_tail = F.normalize(k_idx[old_t:new_t].float(), dim=-1, eps=1e-6)
+            self.k_idx_n = kk_tail if self.k_idx_n is None else torch.cat([self.k_idx_n.to(kk_tail.device), kk_tail], dim=0)
+        mid_end = max(self.n_sink, new_t - self.window)
+        new_blocks = max(0, (mid_end - self.n_sink) // self.n_cluster)
+        delta_blocks = new_blocks - self.n_blocks
+        if delta_blocks <= 0:
+            return 0
+        start = self.clustered_end
+        end = self.n_sink + new_blocks * self.n_cluster
+        kk_new = F.normalize(k_idx[start:end].float(), dim=-1, eps=1e-6)
+        blk = kk_new.view(delta_blocks, self.pools_per_block, self.n_pool, d)
+        pools = F.normalize(blk.mean(dim=2), dim=-1, eps=1e-6)
+        avg_bs = getattr(self, "avg_bucket_size", 8)
+        max_bs = getattr(self, "max_bucket_size", 16)
+        target = max(1, self.n_cluster // int(avg_bs))
+        new_labels = ward_partition(pools, target, max_pools_per_bucket=max(1, int(max_bs) // self.n_pool))
+        p = self.pools_per_block
+        onehot = F.one_hot(new_labels, num_classes=p).float()
+        sums = torch.einsum("bpc,bpd->bcd", onehot, pools)
+        new_centroids = F.normalize(sums, dim=-1, eps=1e-6)
+        new_btoks = onehot.sum(dim=1) * self.n_pool
+        if self.n_blocks == 0:
+            self.labels = new_labels
+            self.centroids = new_centroids
+            self.bucket_tokens = new_btoks
+        else:
+            dev = self.centroids.device
+            self.labels = torch.cat([self.labels, new_labels.to(self.labels.device)], dim=0)
+            self.centroids = torch.cat([self.centroids, new_centroids.to(dev)], dim=0)
+            self.bucket_tokens = torch.cat([self.bucket_tokens, new_btoks.to(dev)], dim=0)
+        self.n_blocks = new_blocks
+        self.clustered_end = end
+        return int(delta_blocks)
 
     def bucket_stats(self) -> Dict[str, float]:
         if self.n_blocks == 0:
@@ -293,18 +345,103 @@ class FaithfulDLSAIndexer(nn.Module):
         return PagedLatentIndex(self.project_k(k_in), self.n_sink, self.n_pool, self.n_cluster, self.avg_bucket_size,
                                 self.max_bucket_size, self.window, self.rerank)
 
+    def reset_decode_cache(self) -> None:
+        """Clear cached decode `PagedLatentIndex` and step-to-step selection reuse state."""
+        self._cached_index: Optional[PagedLatentIndex] = None
+        self._cached_k_idx: Optional[torch.Tensor] = None
+        self._cached_sig: Optional[Tuple[Any, ...]] = None
+        self._last_q_vec: Optional[torch.Tensor] = None
+        self._last_mid_sel: Optional[torch.Tensor] = None
+        self._last_clustered_end: int = -1
+        self._reuse_age: int = 0
+        self.decode_cache_hits: int = 0
+        self.decode_cache_misses: int = 0
+        self.selection_reuse_hits: int = 0
+
+    @staticmethod
+    def _prefix_signature(k0: torch.Tensor, check_len: int) -> Tuple[Any, ...]:
+        p0 = float(k0[0, 0, 0].item()) if check_len > 0 else 0.0
+        pm = float(k0[0, check_len // 2, 0].item()) if check_len > 1 else 0.0
+        pe = float(k0[0, check_len - 1, -1].item()) if check_len > 0 else 0.0
+        return (int(k0.shape[0]), int(k0.shape[2]), round(p0, 5), round(pm, 5), round(pe, 5))
+
     @torch.no_grad()
-    def select_key_indices(self, query: torch.Tensor, key: torch.Tensor, k_budget: Optional[int] = None) -> torch.Tensor:
+    def get_or_update_index(self, k0: torch.Tensor) -> PagedLatentIndex:
+        """Return a `PagedLatentIndex` for `k0` `[H_kv, T, D]`, incrementally projecting & Ward-clustering only new keys when
+        `k0` extends the previously indexed sequence."""
+        t = int(k0.shape[1])
+        idx = getattr(self, "_cached_index", None)
+        k_idx_prev = getattr(self, "_cached_k_idx", None)
+        sig_prev = getattr(self, "_cached_sig", None)
+        if idx is not None and k_idx_prev is not None and idx.t <= t and sig_prev is not None:
+            if self._prefix_signature(k0, idx.t) == sig_prev:
+                if t > idx.t:
+                    _, k_in_new = self.inputs(_dummy_q(k0[:, idx.t:t]), k0[:, idx.t:t])
+                    k_idx_new = self.project_k(k_in_new)
+                    k_idx_full = torch.cat([k_idx_prev, k_idx_new.to(k_idx_prev.device)], dim=0)
+                    idx.extend_to(k_idx_full)
+                    self._cached_k_idx = k_idx_full
+                    self._cached_sig = self._prefix_signature(k0, t)
+                self.decode_cache_hits = int(getattr(self, "decode_cache_hits", 0)) + 1
+                return idx
+        _, k_in = self.inputs(_dummy_q(k0), k0)
+        k_idx_full = self.project_k(k_in)
+        idx = PagedLatentIndex(k_idx_full, self.n_sink, self.n_pool, self.n_cluster, self.avg_bucket_size,
+                               self.max_bucket_size, self.window, self.rerank)
+        self._cached_index = idx
+        self._cached_k_idx = k_idx_full
+        self._cached_sig = self._prefix_signature(k0, t)
+        self.decode_cache_misses = int(getattr(self, "decode_cache_misses", 0)) + 1
+        return idx
+
+    @torch.no_grad()
+    def select_key_indices(self, query: torch.Tensor, key: torch.Tensor, k_budget: Optional[int] = None,
+                           use_cache: bool = True) -> torch.Tensor:
         """API-compatible with `LatentSparseAttentionIndexer.select_key_indices`: `query` [1, H_q, T_q, D], `key`
-        [1, H_kv, T_k, D] -> exact key positions shared by all heads (decode / <=64 queries; mean of the query index vectors)."""
+        [1, H_kv, T_k, D] -> exact key positions shared by all heads (decode / <=64 queries; mean of the query index vectors).
+
+        When `use_cache=True` (default), reuses and incrementally extends the cached `PagedLatentIndex` across decode steps.
+        When `self.selection_reuse_steps > 1` (default 1 = off), consecutive single-token decode steps whose query latent has
+        cosine similarity >= `self.reuse_cos_threshold` (default 0.92) reuse the middle-region bucket selection.
+        """
         assert query.shape[0] == 1 and key.shape[0] == 1
         budget = int(k_budget or self.k_long_range)
         t = key.shape[2]
         if t <= self.n_sink + self.window + budget:
             return torch.arange(t, device=key.device)
-        idx = self.build_index(key[0])
+        idx = self.get_or_update_index(key[0]) if use_cache else self.build_index(key[0])
         q_in, _ = self.inputs(query[0], key[0][:, :1])
-        return idx.select(self.project_q(q_in), budget).to(key.device)
+        q_proj = self.project_q(q_in)
+        q_vec = F.normalize(q_proj.float().reshape(-1, q_proj.shape[-1]).mean(dim=0), dim=-1, eps=1e-6)
+        reuse_steps = int(getattr(self, "selection_reuse_steps", 1) or 1)
+        reuse_thr = float(getattr(self, "reuse_cos_threshold", 0.92) or 0.92)
+        last_q = getattr(self, "_last_q_vec", None)
+        last_mid = getattr(self, "_last_mid_sel", None)
+        last_ce = int(getattr(self, "_last_clustered_end", -1))
+        age = int(getattr(self, "_reuse_age", 0))
+        if (
+            use_cache
+            and reuse_steps > 1
+            and query.shape[2] == 1
+            and last_q is not None
+            and last_mid is not None
+            and last_ce == idx.clustered_end
+            and age + 1 < reuse_steps
+            and float(torch.dot(q_vec, last_q.to(q_vec.device)).item()) >= reuse_thr
+        ):
+            self._reuse_age = age + 1
+            self.selection_reuse_hits = int(getattr(self, "selection_reuse_hits", 0)) + 1
+            sink = torch.arange(0, min(self.n_sink, t), device=key.device)
+            tail = torch.arange(idx.clustered_end, t, device=key.device)
+            return torch.cat([sink, last_mid.to(key.device), tail]).unique()
+        sel = idx.select(q_proj, budget).to(key.device)
+        if use_cache and reuse_steps > 1 and query.shape[2] == 1:
+            mid_mask = (sel >= self.n_sink) & (sel < idx.clustered_end)
+            self._last_q_vec = q_vec.detach()
+            self._last_mid_sel = sel[mid_mask].detach()
+            self._last_clustered_end = idx.clustered_end
+            self._reuse_age = 0
+        return sel
 
     # ---- distillation
     def distill_loss(self, q_in: torch.Tensor, k_in: torch.Tensor, teacher_p: torch.Tensor,
