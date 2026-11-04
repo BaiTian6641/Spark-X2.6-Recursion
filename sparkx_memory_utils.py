@@ -55,23 +55,57 @@ def _hash_and_sample_tensor(
         shape = tuple(int(d) for d in t_det.shape)
         dtype_str = str(t_det.dtype)
         numel = int(t_det.numel())
+        if numel == 0:
+            return TensorRecord(
+                name=name,
+                shape=shape,
+                dtype=dtype_str,
+                numel=0,
+                sha256=hashlib.sha256(b"empty").hexdigest(),
+                l2_norm=0.0,
+                sample_indices=[],
+                sample_values=[],
+                full_clone=t_det.cpu().clone() if store_full_clone else None,
+            )
+
+        step = max(1, numel // max(1, int(sample_size)))
+        idxs = list(range(0, numel, step))[:sample_size]
+
+        if t_det.is_cuda and not store_full_clone and numel > 262144:
+            # Fast GPU path for large backbone matrices: avoids 8GB PCIe D2H copy while tracking norm + strided slice bytes
+            flat_gpu = t_det.reshape(-1)
+            idx_gpu = torch.tensor(idxs, dtype=torch.long, device=t_det.device)
+            samp_cpu = flat_gpu.index_select(0, idx_gpu).float().cpu().contiguous()
+            l2_val = float(flat_gpu.float().norm().item())
+            vals = [float(x) for x in samp_cpu.tolist()]
+            raw_bytes = (
+                f"{shape}:{dtype_str}:{numel}:{l2_val:.9e}:".encode("utf-8")
+                + bytes(samp_cpu.reshape(-1).view(torch.uint8).numpy().tobytes())
+            )
+            digest = hashlib.sha256(raw_bytes).hexdigest()
+            return TensorRecord(
+                name=name,
+                shape=shape,
+                dtype=dtype_str,
+                numel=numel,
+                sha256=digest,
+                l2_norm=l2_val,
+                sample_indices=idxs,
+                sample_values=vals,
+                full_clone=None,
+            )
+
         cpu_contig = t_det.cpu().contiguous()
-        raw_bytes = bytes(cpu_contig.view(torch.uint8).numpy().tobytes()) if hasattr(cpu_contig, "numpy") else b""
+        flat_u8 = cpu_contig.reshape(-1).view(torch.uint8)
+        raw_bytes = bytes(flat_u8.numpy().tobytes()) if hasattr(flat_u8, "numpy") else b""
         if not raw_bytes:
-            # Fallback if numpy bridge is unavailable
-            flat_f32 = cpu_contig.float().view(-1).tolist()
+            flat_f32 = cpu_contig.float().reshape(-1).tolist()
             raw_bytes = ",".join(f"{v:.8e}" for v in flat_f32[: min(numel, 65536)]).encode("utf-8")
         digest = hashlib.sha256(raw_bytes).hexdigest()
-        l2_val = float(cpu_contig.float().norm().item()) if numel > 0 else 0.0
-        if numel == 0:
-            idxs: List[int] = []
-            vals: List[float] = []
-        else:
-            step = max(1, numel // max(1, int(sample_size)))
-            idxs = list(range(0, numel, step))[:sample_size]
-            flat_cpu = cpu_contig.float().view(-1)
-            idx_t = torch.tensor(idxs, dtype=torch.long)
-            vals = [float(x) for x in flat_cpu.index_select(0, idx_t).tolist()]
+        l2_val = float(cpu_contig.float().norm().item())
+        flat_cpu = cpu_contig.float().reshape(-1)
+        idx_t = torch.tensor(idxs, dtype=torch.long)
+        vals = [float(x) for x in flat_cpu.index_select(0, idx_t).tolist()]
         clone_t = cpu_contig.clone() if store_full_clone else None
         return TensorRecord(
             name=name,
