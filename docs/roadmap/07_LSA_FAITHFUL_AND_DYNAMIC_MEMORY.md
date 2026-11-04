@@ -46,13 +46,41 @@ Tests (`tests/test_dlsa.py`, 11) check mechanism on synthetic scattered-topic ke
 | ID | Deliverable | Gate (claim-grade) | Status |
 | :--- | :--- | :--- | :--- |
 | LSA-F1 | `sparkx_dlsa.py` + tests | 11 unit tests pass | 🟩 `6d470a1` |
-| LSA-F2 | **Real-data recall.** Capture q/k via `capture_attention_io` on real long documents (8K/32K/64K/128K, balanced by length/domain, doc-hash split); per layer: `free_logit_fidelity`, PCA-init recall, distilled recall; table of arms {faithful, flat_oracle_index, contiguous, random, oracle} at k=2048 | faithful recall ≥ **0.90** at 64K on held-out docs and ≥ contiguous + 0.10; flat_oracle − faithful ≤ 0.03 (clustering loss small); report per-layer | 🟨 code + 7 CPU tests (`sparkx_lsa_eval.py`, notebook `SparkX_Loop_v03_LSA_Colab.ipynb`, `6b608d2`); **GPU run pending** |
+| LSA-F2 | **Real-data recall.** Capture q/k via `capture_attention_io` on real long documents (8K/32K/64K/128K, balanced by length/domain, doc-hash split); per layer: `free_logit_fidelity`, PCA-init recall, distilled recall; table of arms {faithful, flat_oracle_index, contiguous, random, oracle} at k=2048 | faithful recall ≥ **0.90** at 64K on held-out docs and ≥ contiguous + 0.10; flat_oracle − faithful ≤ 0.03 (clustering loss small); report per-layer | 🟥 **FAILED on first GPU run (2026-11-04, details in §3.2)**: 0/9 layers pass at 65,536; run had a layout bug (fixed in `715e170`); diagnostics LSA-F2b pending |
 | LSA-F3 | **End-to-end decode.** Swap `FaithfulDLSAIndexer` into `patch_spark_attention_for_lsa`; single/multi-needle retrieval at 32K/64K/128K; held-out CE on long docs: exact vs D-LSA | needle accuracy within 2 pts of exact attention at 64K; ΔCE ≤ 0.02 nats vs exact; fallback to exact if index missing | ⬜ |
 | LSA-F4 | **Hot/cold paging.** GPU-resident centroids + labels; cold K/V pages in pinned host RAM (FP8 optional); selected-page fetch with step-to-step selection reuse | 1M-token run on A100 without OOM; tokens/s reported; PCIe fetch bytes/token logged | ⬜ |
 | LSA-F5 | **Recursion-wise KV sharing** (L5) enabled for long context (72 → 36 KiB/token) | ΔCE vs unshared ≤ 0.02 nats on long-doc held-out set (else pass-1 KV only for cold tier) | ⬜ L5 exists as plumbing |
 | LSA-F6 | **Dynamic memory graph + recall** (§4) | multi-session recall suite (below) beats contiguous-selection and recency baselines at equal key budget | ⬜ |
 | LSA-F7 | **Sleep consolidation** of salient buckets → ESM → Engram (existing C4/C5/C7), buckets evicted | post-eviction recall ≥ 0.8 × pre-eviction recall with **0** KV tokens; held-out CE unchanged (≤ +0.01) | ⬜ depends on Engram being a net-positive consumer (§5) |
 | LSA-F8 | 1M → 2M scale test, FP8 cold tier | quality vs 128K reference on needle + long-QA | ⬜ stretch |
+
+### 3.2 LSA-F2 first GPU run — result, honest reading, next steps (2026-11-04)
+
+Setup: PG-19 books (train vs validation split), distil on 6 samples (16K/32K), evaluate on 3 held-out docs × {32K, 65K}, k = 2,048, 300 steps. 490 s, no errors. Held-out documents: 3 per length (low power, treat differences < ~0.03 as noise).
+
+**Gate v1 (pre-registered): FAIL, 0/9 layers.** Recall at 65,536 (distilled): faithful / contiguous / flat-oracle-index / oracle:
+
+| L | faithful | contig | flat | oracle | faithful/oracle | flat − faithful |
+| :-- | :-- | :-- | :-- | :-- | :-- | :-- |
+| 3 | 0.449 | 0.413 | 0.506 | 0.604 | 0.74 | 0.057 |
+| 7 | 0.601 | 0.558 | 0.654 | 0.785 | 0.77 | 0.053 |
+| 11 | 0.638 | 0.611 | 0.699 | 0.783 | 0.81 | 0.061 |
+| 15 | 0.659 | 0.639 | 0.713 | 0.754 | 0.87 | 0.054 |
+| 19 | 0.522 | 0.490 | 0.590 | 0.657 | 0.79 | 0.068 |
+| 23 | 0.579 | 0.540 | 0.685 | 0.757 | 0.76 | 0.106 |
+| 27 | 0.587 | 0.547 | 0.775 | 0.831 | 0.71 | 0.188 |
+| 31 | 0.601 | 0.502 | 0.867 | 0.926 | 0.65 | 0.266 |
+| 35 | 0.901 | 0.885 | 0.931 | 0.968 | 0.93 | 0.030 |
+
+What the data does and does not say:
+1. **The absolute 0.90 threshold was mis-specified, not just missed.** Even the *oracle* (true top-2,048 keys by head-mean attention) reaches only 0.60–0.93 at 65K: head-averaged attention is diffuse, so no 2,048-key selector can clear 0.90 in 8/9 layers. The gate conflated attention diffuseness with index quality. Gate v1 stays recorded as FAIL; **gate v2 (relative + end-to-end) is registered *now*, before any F3 data**: faithful/oracle ≥ 0.90 *and* end-to-end ΔCE ≤ 0.02 nats vs exact attention (LSA-F3). This is a post-hoc change motivated by this result and is labelled as such.
+2. **Layout bug in the run.** The runner chose the free slice with a "which slice correlates better with the full logit" heuristic, which is not a layout detector (the slice `[:192]` overlaps `[64:]` on 128 dims and wins by containing high-magnitude rotated dims). It picked `[:192]` for 7/9 layers (3, 7, 11, 23, 27, 31, 35), i.e. an index input *contaminated by rotated dims*; only L15 and L19 used `[64:]`. The reported `fid_r` therefore describes the slice actually used. Fixed: layout is now probed from the model's own `apply_rotary_pos_emb` (`resolve_rope_first`), with an explicit `source` flag when it falls back. A useful side finding: with the correct tail slice the free-logit correlation was only 0.55–0.70 in L3/L31/L35 → a purely position-free index is a poor predictor of the logit there (doc §2.1 item 6 rule: such layers keep exact attention or use the full head).
+3. **Distillation did not generalise in length.** Held-out recall improved at 32K but was flat or worse at 65K for L3 (−0.019), L7 (−0.031), L11 (−0.018), while per-key KL on the training samples fell 3–10×. Train-sample KL is not evidence; 6 samples × 300 steps over ~100K parameters/layer likely over-fit, and the maps never saw 65K. F2b measures held-out KL and a `train_incl_64k` arm.
+4. **Ward buckets lose a lot of the index's quality in later layers.** flat − faithful is 0.19 (L27) and 0.27 (L31): the token-level ranking is near-oracle there (flat 0.87 vs oracle 0.93 in L31) but filling the budget with ~8–16-token buckets wastes it. Margin of faithful over contiguous spans is small everywhere (+0.02…+0.04, +0.10 in L31) — at this evidence level semantic Ward buckets add little over scoring contiguous 8-token spans with the learned space. F2b tests finer buckets (pool 2/avg 4, pool 1/avg 2).
+5. **L35 is trivial**: random selection already reaches 0.82 (mass sits in sink + window).
+6. **Not yet tested, plausible limiters:** one selection shared by all 16 heads (F2b reports shared vs per-KV-group vs per-head oracle — if per-head ≫ shared, selection per KV group is the architectural fix); budget 2,048 itself (F2b reports 4K/8K/16K oracle curves).
+
+**Decision tree after F2b** (pre-registered): (a) per-group oracle ≫ shared → implement per-KV-group selection in the decode path; (b) `token_buckets` closes most of flat − faithful at acceptable index size → change default bucket size and re-state memory arithmetic; (c) `full_head_input` ≫ `base` → the position-free restriction is the limiter for that layer; use full-head index there (the position-free argument only matters for cold-page indices that must survive position changes; revisit); (d) oracle at 8K–16K budget still < 0.9 → report honestly that mass-recall is the wrong metric and rely on F3 end-to-end; (e) nothing helps → D-LSA is not adopted for those layers; the 1–2M goal falls back to sleep-compiled memory + exact attention on short windows.
 
 ### 3.1 Memory arithmetic (arith; bf16, head_dim 256, 4 KV heads, 9 global layers)
 - KV per token per global layer = 2·4·256·2 B = 4 KiB → **36 KiB/token** (36L), **72 KiB/token** (72L loop, 18 global visits), back to 36 KiB with recursion-wise sharing. SWA layers are bounded by the 512 window (constant).
