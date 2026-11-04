@@ -1665,6 +1665,8 @@ def restore_pristine_base_backbone(
     soft_reset_mhc_gain: Optional[float] = None,
     coop_interface_beta: float = 0.30,
     coop_body_beta: float = 0.12,
+    blend_interface_alpha: Optional[float] = None,
+    blend_body_alpha: Optional[float] = None,
     token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Cooperative Backbone Task-Vector Restoration + `TwoStreamMHC` Sublayer Gain Synchronization:
@@ -1681,7 +1683,13 @@ def restore_pristine_base_backbone(
     """
     import gc
     from transformers import AutoModelForCausalLM
-    from sparkx_loop_v03_core import patch_spark_attention_for_loglinear_kv, patch_spark_for_unsloth_triton
+    from sparkx_loop_v03_core import patch_spark_attention_for_lsa, patch_spark_for_unsloth_triton
+    from sparkx_memory_utils import EpisodicSideMemory
+
+    if blend_interface_alpha is not None:
+        coop_interface_beta = float(blend_interface_alpha)
+    if blend_body_alpha is not None:
+        coop_body_beta = float(blend_body_alpha)
 
     print("=" * 108)
     t0 = time.time()
@@ -1789,8 +1797,17 @@ def restore_pristine_base_backbone(
         model.base._sparkx_coop_blended = True
 
     patch_spark_for_unsloth_triton(model.base)
-    patch_spark_attention_for_loglinear_kv(model.base, exact_threshold=32768, recent_window=4096, sink_tokens=32)
+    patch_spark_attention_for_lsa(model.base, exact_threshold=32768)
     model.base._sparkx_exact_kv_32k = True
+    dev = next(model.base.parameters()).device
+    if not hasattr(model, "esm") or model.esm is None:
+        w_dim = int(getattr(model.base.config, "hidden_size", 2560))
+        model.esm_layers = [3, 7, 11, 15, 19, 23, 27, 31, 35]
+        model.esm_enabled = False
+        model.esm_visits = "first"
+        model.esm = torch.nn.ModuleDict({str(idx): EpisodicSideMemory(width=w_dim) for idx in model.esm_layers}).to(device=dev)
+    else:
+        model.esm.to(device=dev)
     for p in model.base.parameters():
         p.requires_grad_(False)
     model.base.eval()
