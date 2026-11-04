@@ -3759,15 +3759,14 @@ def run_si_srsi_engram_loop(
 
         # Accept round snapshot if Composite Judge Score improves OR if Domain Rubric improves within ppl_ceiling
         accept_round = (cur_ppl <= ppl_ceiling) and (
-            (cur_composite >= best_composite - 0.5)
-            or (round_mean_rubric >= best_mean_rubric + 1.0)
-            or (cur_ppl < best_ppl and round_mean_rubric >= best_mean_rubric - 2.0)
+            (cur_composite >= best_composite)
+            or (round_mean_rubric > best_mean_rubric)
         )
         if accept_round:
-            best_ppl = min(best_ppl, cur_ppl) if cur_ppl <= best_ppl else cur_ppl
+            best_ppl = cur_ppl
             best_ppl_eval = cur_ppl_eval
-            best_mean_rubric = max(best_mean_rubric, round_mean_rubric)
-            best_composite = max(best_composite, cur_composite)
+            best_mean_rubric = round_mean_rubric
+            best_composite = cur_composite
             best_round_idx = r_idx
             best_audits = round_audits
             best_bank_snap = model.snapshot_engram_bank()
