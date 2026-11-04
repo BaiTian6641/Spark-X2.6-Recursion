@@ -113,15 +113,67 @@ class TestDLSA(unittest.TestCase):
         self.assertEqual(sel.numel(), 64)
 
     def test_faithful_beats_contiguous_and_random_on_scattered_structure(self):
+        # Equal-budget semantics: every arm reads as many long-range keys as the faithful arm (mean_long_keys). Topics here are
+        # per-token (scattered), so token-level buckets (n_pool=1) are the faithful configuration; coarse pooling mixes topics.
+        for seed in (3, 4, 5):
+            q, k, _, _ = make_scattered(t=1024, seed=seed)
+            ix = small_indexer(n_pool=1)
+            ix.fit_pca(ix.inputs(q, k)[1])
+            res = evaluate_selectors(ix, q, k, [700, 800, 900, 1000], budget=128)
+            self.assertEqual(res["n_queries"], 4)
+            self.assertGreater(res["faithful"], res["contiguous"] + 0.05)
+            self.assertGreater(res["faithful"], res["random"] + 0.05)
+            self.assertGreaterEqual(res["oracle"] + 1e-6, res["faithful"])
+            self.assertGreaterEqual(res["oracle"] + 1e-6, res["flat_oracle_index"])
+            self.assertGreaterEqual(res["mean_long_keys"], 128 - 1)  # faithful reads >= budget; baselines were matched to it
+
+    def test_coarse_pooling_loses_to_token_buckets_on_scattered_structure(self):
         q, k, _, _ = make_scattered(t=1024, seed=3)
-        ix = small_indexer()
+        out = {}
+        for npool in (1, 4):
+            ix = small_indexer(n_pool=npool)
+            ix.fit_pca(ix.inputs(q, k)[1])
+            out[npool] = evaluate_selectors(ix, q, k, [700, 800, 900, 1000], budget=128)["faithful"]
+        self.assertGreater(out[1], out[4])
+
+    def test_evaluate_selectors_output_error_oracle_not_worse_than_random(self):
+        q, k, _, _ = make_scattered(t=1024, seed=3)
+        v = torch.randn(H_KV, 1024, D, generator=torch.Generator().manual_seed(9))
+        ix = small_indexer(n_pool=1)
         ix.fit_pca(ix.inputs(q, k)[1])
-        res = evaluate_selectors(ix, q, k, [700, 800, 900, 1000], budget=128)
-        self.assertEqual(res["n_queries"], 4)
-        self.assertGreater(res["faithful"], res["contiguous"] + 0.05)
-        self.assertGreater(res["faithful"], res["random"] + 0.05)
-        self.assertGreaterEqual(res["oracle"] + 1e-6, res["faithful"])
-        self.assertGreaterEqual(res["oracle"] + 1e-6, res["flat_oracle_index"])
+        res = evaluate_selectors(ix, q, k, [700, 900], budget=128, v=v)
+        for a in ("faithful", "flat_oracle_index", "contiguous", "random", "oracle"):
+            self.assertIsNotNone(res["err_" + a])
+        self.assertLessEqual(res["err_oracle"], res["err_random"] + 1e-6)
+
+    def test_rerank_selection_is_sorted_causal_and_within_budget(self):
+        q, k, _, _ = make_scattered(t=1024, seed=3)
+        ix = small_indexer(n_pool=1, rerank=4)
+        ix.fit_pca(ix.inputs(q, k)[1])
+        sel = ix.select_key_indices(q[None, :, 900:901], k[None, :, :901], k_budget=128)
+        self.assertTrue(bool((sel[1:] > sel[:-1]).all()))
+        self.assertLess(int(sel.max()), 901)
+        idx = ix.build_index(k[None, :, :901][0])
+        n_mid = int(((sel >= 4) & (sel < idx.clustered_end)).sum())
+        self.assertLessEqual(n_mid, 128 + 16)
+
+    def test_rerank_not_worse_than_single_stage_on_recall(self):
+        q, k, _, _ = make_scattered(t=1024, seed=3)
+        r = {}
+        for rr in (1, 4):
+            ix = small_indexer(n_pool=4, rerank=rr)  # coarse pooling is where rerank should help
+            ix.fit_pca(ix.inputs(q, k)[1])
+            r[rr] = evaluate_selectors(ix, q, k, [700, 800, 900, 1000], budget=128)["faithful"]
+        self.assertGreaterEqual(r[4] + 1e-6, r[1])
+
+    def test_distillation_early_stopping_never_worse_than_init_on_val(self):
+        q, k, _, _ = make_scattered(t=512, seed=4)
+        qv, kv, _, _ = make_scattered(t=512, seed=8)
+        ix = small_indexer(window=16)
+        out = distill_indexer(ix, [{"q": q, "k": k}], steps=40, lr=5e-3, queries_per_sample=16, log_every=0,
+                              val_samples=[{"q": qv, "k": kv}], eval_every=10)
+        self.assertLessEqual(out["val_kl_after"], out["val_kl_before"] + 1e-6)
+        self.assertIn("best_step", out)
 
     def test_distillation_reduces_kl(self):
         q, k, _, _ = make_scattered(t=512, seed=4)

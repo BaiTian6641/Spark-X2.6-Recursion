@@ -80,8 +80,10 @@ def layer_geometry(model: Any, layer: int) -> Dict[str, Any]:
 
 
 @torch.no_grad()
-def capture_qk(model: Any, input_ids: torch.Tensor, layers: Sequence[int], device: str = "cpu") -> Dict[int, Dict[str, torch.Tensor]]:
-    """Post-RoPE q `[H_q, T, D]` and k `[H_kv, T, D]` (bf16, on `device`) from the first visit of each requested layer."""
+def capture_qk(model: Any, input_ids: torch.Tensor, layers: Sequence[int], device: str = "cpu",
+               with_v: bool = False) -> Dict[int, Dict[str, torch.Tensor]]:
+    """Post-RoPE q `[H_q, T, D]` and k `[H_kv, T, D]` (bf16, on `device`) from the first visit of each requested layer.
+    `with_v=True` also returns `v` `[H_kv, T, D]` (needed for attention-output error, not just attention-mass recall)."""
     ids = input_ids.to(next(model.parameters()).device)
     recs = model.capture_attention_io(ids, list(layers), visit=0)
     out: Dict[int, Dict[str, torch.Tensor]] = {}
@@ -90,6 +92,8 @@ def capture_qk(model: Any, input_ids: torch.Tensor, layers: Sequence[int], devic
         if r.get("query") is None or r.get("key") is None:
             continue
         out[l] = {"q": r["query"][0].to(torch.bfloat16).to(device), "k": r["key"][0].to(torch.bfloat16).to(device)}
+        if with_v and r.get("value") is not None:
+            out[l]["v"] = r["value"][0].to(torch.bfloat16).to(device)
         del r
     del recs
     return out
@@ -97,23 +101,66 @@ def capture_qk(model: Any, input_ids: torch.Tensor, layers: Sequence[int], devic
 
 def probe_rotated_dims(model: Any, layer: int, head_dim: int = 256, rope_dim: int = 64, theta: float = 5e6) -> Optional[List[int]]:
     """Ground truth: which head dims does the model's OWN `apply_rotary_pos_emb` change? Feeds a constant probe through the module's
-    function (positions 1..4) and returns the indices that moved. None if the signature/shapes could not be probed."""
+    function (positions 1..4) and returns the indices that moved. None if the signature/shapes could not be probed.
+
+    The real signature (modeling_spark.py, verified 2026-11-04) is `apply_rotary_pos_emb(x, cos, sin)` with 2-D cos/sin `[T, rd]` and **no**
+    `unsqueeze_dim` argument; the first probe version passed `unsqueeze_dim=1`, raised TypeError, and silently returned None. All plausible
+    call conventions are now tried and the failures are recorded by `describe_rotary`."""
+    return _probe_rotary(model, layer, head_dim, rope_dim, theta)[0]
+
+
+def _probe_rotary(model: Any, layer: int, head_dim: int, rope_dim: int, theta: float) -> Tuple[Optional[List[int]], List[str]]:
     import importlib
+    errs: List[str] = []
     try:
         mod = importlib.import_module(type(_layer_attn(model, layer)).__module__)
+    except Exception as e:  # noqa: BLE001
+        return None, [f"import_module: {type(e).__name__}: {e}"]
+    try:
         pos = torch.arange(1, 5, dtype=torch.float32)
         cos, sin = mod.compute_rope_cos_sin(pos, head_dim, theta, rope_dim / head_dim, device="cpu")
-        x = torch.ones(1, 1, 4, head_dim)
-        for cs in ((cos[None], sin[None]), (cos, sin)):
+    except Exception as e:  # noqa: BLE001
+        return None, [f"compute_rope_cos_sin: {type(e).__name__}: {e}"]
+    x = torch.ones(1, 1, 4, head_dim)
+    calls = (("x,cos,sin", lambda: mod.apply_rotary_pos_emb(x, cos, sin)),
+             ("x,cos,sin,unsqueeze_dim=1", lambda: mod.apply_rotary_pos_emb(x, cos, sin, unsqueeze_dim=1)),
+             ("x,cos[None],sin[None],unsqueeze_dim=1", lambda: mod.apply_rotary_pos_emb(x, cos[None], sin[None], unsqueeze_dim=1)))
+    for name, fn in calls:
+        try:
+            y = fn()
+            if isinstance(y, tuple):
+                y = y[0]
+            moved = (y.float() - x).abs().amax(dim=(0, 1, 2)) > 1e-6
+            idx = [int(i) for i in torch.nonzero(moved).flatten()]
+            if idx:
+                return idx, errs
+            errs.append(f"{name}: ran but no dim moved")
+        except Exception as e:  # noqa: BLE001
+            errs.append(f"{name}: {type(e).__name__}: {e}")
+    return None, errs
+
+
+def describe_rotary(model: Any, layer: int = 3) -> Dict[str, Any]:
+    """Paste-able diagnostic of the rotary layout: probe result, per-convention errors, and the source of the (possibly patched) functions."""
+    import importlib
+    import inspect
+    geo = layer_geometry(model, layer)
+    moved, errs = _probe_rotary(model, layer, geo["head_dim"], geo["rope_dim"], 5e6)
+    out: Dict[str, Any] = {"layer": layer, "geometry": geo, "n_moved": None if moved is None else len(moved),
+                           "moved_head": None if moved is None else moved[:4], "moved_tail": None if moved is None else moved[-4:],
+                           "errors": errs}
+    try:
+        mod = importlib.import_module(type(_layer_attn(model, layer)).__module__)
+        for nm in ("compute_rope_cos_sin", "apply_rotary_pos_emb"):
             try:
-                y = mod.apply_rotary_pos_emb(x, cs[0], cs[1], unsqueeze_dim=1)
-                moved = (y - x).abs().amax(dim=(0, 1, 2)) > 1e-6
-                return [int(i) for i in torch.nonzero(moved).flatten()]
-            except Exception:
-                continue
-    except Exception:
-        return None
-    return None
+                out["src_" + nm] = inspect.getsource(getattr(mod, nm))
+            except Exception as e:  # noqa: BLE001
+                out["src_" + nm] = f"unavailable: {type(e).__name__}: {e}"
+        out["orig_apply_rope"] = getattr(getattr(mod, "_sparkx_orig_apply_rope", None), "__name__", None)
+    except Exception as e:  # noqa: BLE001
+        out["module_error"] = f"{type(e).__name__}: {e}"
+    out["resolved"] = resolve_rope_first(model, layer, geo)
+    return out
 
 
 def slice_fidelity(q: torch.Tensor, k: torch.Tensor, rope_dim: int, positions: Sequence[int]) -> Dict[str, Any]:
@@ -175,9 +222,16 @@ def run_lsa_f2(
     out_dir: str = "/content/lsa_f2",
     seed: int = 0,
     log=print,
+    indexer_kwargs: Optional[Dict[str, Any]] = None,
+    early_stop: bool = True,
 ) -> Dict[str, Any]:
     """Per layer: PCA-init recall (training-free D-LSA), per-key-KL distillation on train docs, recall of every arm on held-out
-    docs at each val length. Returns a JSON-able report; saves distilled indexers to `out_dir/dlsa_indexers.pt`."""
+    docs at each val length. Returns a JSON-able report; saves distilled indexers to `out_dir/dlsa_indexers.pt`.
+
+    Revision 2026-11-04 (after the first F2/F2b runs): all arms are compared at **equal total key budget** and the attention-**output**
+    relative error (`err_*`, needs `v`) is reported next to attention-mass recall; `indexer_kwargs` forwards `n_pool/avg_bucket_size/
+    max_bucket_size/rerank` (F2b: token-level buckets or coarse-bucket→token rerank beat the coarse default); with >= 2 train samples
+    the last one is held out for distillation **early stopping** (`early_stop`), never the evaluation docs."""
     os.makedirs(out_dir, exist_ok=True)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     t0 = time.time()
@@ -218,7 +272,7 @@ def run_lsa_f2(
                 _free()
         for (L, ids) in val_ids:
             try:
-                cap = capture_qk(model, ids, group, device="cpu")
+                cap = capture_qk(model, ids, group, device="cpu", with_v=True)
                 for l, d in cap.items():
                     val_s[l].append((L, d))
             except Exception as e:
@@ -234,7 +288,7 @@ def run_lsa_f2(
                 lay = resolve_rope_first(model, l, geo)
                 lay["slice_fidelity"] = slice_fidelity(q0, k0, geo["rope_dim"], sample_positions(q0.shape[1], 8, 4096, seed))
                 ix = FaithfulDLSAIndexer(n_kv=geo["n_kv"], head_dim=geo["head_dim"], rope_dim=geo["rope_dim"],
-                                         rope_first=lay["rope_first"], k_long_range=k_budget).to(dev)
+                                         rope_first=lay["rope_first"], k_long_range=k_budget, **(indexer_kwargs or {})).to(dev)
                 ix.fit_pca(torch.cat([ix.inputs(s["q"].to(dev), s["k"].to(dev))[1][:: max(1, s["k"].shape[1] // 16384)]
                                       for s in train_s[l]], dim=0))
                 lrep: Dict[str, Any] = {"geometry": geo, "rope_layout": lay, "val": {}}
@@ -244,14 +298,17 @@ def run_lsa_f2(
                         q, k = s["q"].to(dev), s["k"].to(dev)
                         pos = sample_positions(q.shape[1], n_eval_queries, ix.n_sink + ix.window + k_budget + 1, seed + L)
                         fid = free_logit_fidelity(q, k, pos[:8], geo["rope_dim"], lay["rope_first"]) if pos else {}
-                        r = evaluate_selectors(ix, q, k, pos, budget=k_budget, seed=seed, scale=geo["scale"]) if pos else {}
+                        vv = s["v"].to(dev) if s.get("v") is not None else None
+                        r = evaluate_selectors(ix, q, k, pos, budget=k_budget, seed=seed, scale=geo["scale"], v=vv) if pos else {}
                         lrep["val"].setdefault(str(L), {})[tag] = {"recall": r, "fidelity_r": fid.get("mean_pearson_r")}
-                        del q, k
+                        del q, k, vv
 
                 eval_arms("pca_init")
-                dist = distill_indexer(ix, [{"q": s["q"].to(dev), "k": s["k"].to(dev)} for s in train_s[l]], steps=distill_steps,
+                tr_all = [{"q": s["q"].to(dev), "k": s["k"].to(dev)} for s in train_s[l]]
+                use_val = early_stop and len(tr_all) >= 2
+                dist = distill_indexer(ix, tr_all[:-1] if use_val else tr_all, steps=distill_steps,
                                        lr=distill_lr, queries_per_sample=queries_per_sample, seed=seed, log_every=0,
-                                       scale=geo["scale"])
+                                       scale=geo["scale"], val_samples=tr_all[-1:] if use_val else None)
                 lrep["distill"] = dist
                 eval_arms("distilled")
                 report["layers"][str(l)] = lrep
@@ -321,11 +378,20 @@ def oracle_diagnostics(q: torch.Tensor, k: torch.Tensor, positions: Sequence[int
 
 F2B_VARIANTS: Dict[str, Dict[str, Any]] = {
     "base": {},                                                    # free slice, pool 4, avg bucket 8 (the F2 setting, correct layout)
-    "full_head_input": {"rope_dim": 0},                            # index on the whole head incl. rotated dims
     "fine_buckets": {"n_pool": 2, "avg_bucket_size": 4, "max_bucket_size": 8},
-    "token_buckets": {"n_pool": 1, "avg_bucket_size": 2, "max_bucket_size": 4},
-    "train_incl_64k": {"train_lengths_extra": (65536,)},           # distillation sees the evaluation length
+    "token_buckets": {"n_pool": 1, "avg_bucket_size": 2, "max_bucket_size": 4},   # best in the first F2b run (index ~4x centroids)
+    "coarse_rerank4": {"rerank": 4},                               # coarse buckets to 4x budget, then token-level top-budget
+    "fine_rerank4": {"n_pool": 2, "avg_bucket_size": 4, "max_bucket_size": 8, "rerank": 4},
 }
+# Ablations that showed no benefit / layer-dependent benefit in the first F2b run; opt in via `variants=`.
+F2B_VARIANTS_EXTRA: Dict[str, Dict[str, Any]] = {
+    "full_head_input": {"rope_dim": 0},                            # helped L3 pre-distill only; overfit on distillation
+    "train_incl_64k": {"train_lengths_extra": (65536,)},           # no benefit
+}
+
+
+def _f3(x: Optional[float]) -> str:
+    return "n/a" if x is None else f"{x:.3f}"
 
 
 def run_lsa_f2b(
@@ -375,7 +441,7 @@ def run_lsa_f2b(
                 if l in c:
                     tr.append((L, c[l]))
             for (L, ids) in val_ids:
-                c = capture_qk(model, ids, [l], device="cpu")
+                c = capture_qk(model, ids, [l], device="cpu", with_v=True)
                 if l in c:
                     va.append(c[l])
             _free()
@@ -386,27 +452,36 @@ def run_lsa_f2b(
             for name, v in variants.items():
                 cfg = dict(n_kv=geo["n_kv"], head_dim=geo["head_dim"], rope_dim=v.get("rope_dim", geo["rope_dim"]),
                            rope_first=lay["rope_first"], k_long_range=k_budget)
-                for key in ("n_pool", "avg_bucket_size", "max_bucket_size"):
+                for key in ("n_pool", "avg_bucket_size", "max_bucket_size", "rerank"):
                     if key in v:
                         cfg[key] = v[key]
                 ix = FaithfulDLSAIndexer(**cfg).to(dev)
                 use = [s for (L, s) in tr if L in set(train_lengths) | set(v.get("train_lengths_extra", ()))]
                 ix.fit_pca(torch.cat([ix.inputs(s["q"].to(dev), s["k"].to(dev))[1][:: max(1, s["k"].shape[1] // 16384)] for s in use], 0))
-                vs = [{"q": s["q"].to(dev), "k": s["k"].to(dev)} for s in va]
+                vs = [{"q": s["q"].to(dev), "k": s["k"].to(dev), "v": s["v"].to(dev) if s.get("v") is not None else None} for s in va]
+                arms = ("faithful", "flat_oracle_index", "contiguous", "random", "oracle")
                 def measure(tag: str, vrep: Dict[str, Any]) -> None:
-                    rs = [evaluate_selectors(ix, s["q"], s["k"], pos0, budget=k_budget, seed=seed, scale=geo["scale"]) for s in vs]
-                    vrep[tag] = {a: sum(r[a] for r in rs if r.get(a) is not None) / max(1, sum(1 for r in rs if r.get(a) is not None))
-                                 for a in ("faithful", "flat_oracle_index", "contiguous", "random", "oracle")}
+                    rs = [evaluate_selectors(ix, s["q"], s["k"], pos0, budget=k_budget, seed=seed, scale=geo["scale"], v=s["v"]) for s in vs]
+                    def avg(key: str) -> Optional[float]:
+                        xs = [r[key] for r in rs if r.get(key) is not None]
+                        return sum(xs) / len(xs) if xs else None
+                    vrep[tag] = {a: avg(a) for a in arms}
+                    vrep[tag].update({"err_" + a: avg("err_" + a) for a in arms})
+                    vrep[tag]["mean_long_keys"] = avg("mean_long_keys")
                     vrep[tag]["heldout_kl"] = eval_kl(ix, vs, scale=geo["scale"])
                 vrep: Dict[str, Any] = {}
                 measure("pca_init", vrep)
-                distill_indexer(ix, [{"q": s["q"].to(dev), "k": s["k"].to(dev)} for s in use], steps=distill_steps, seed=seed, log_every=0,
-                                scale=geo["scale"])
+                tr_all = [{"q": s["q"].to(dev), "k": s["k"].to(dev)} for s in use]
+                use_val = len(tr_all) >= 2
+                vrep["distill"] = distill_indexer(ix, tr_all[:-1] if use_val else tr_all, steps=distill_steps, seed=seed, log_every=0,
+                                                  scale=geo["scale"], val_samples=tr_all[-1:] if use_val else None)
                 measure("distilled", vrep)
                 lrep["variants"][name] = vrep
                 log(f"[LSA-F2b] L{l} {name}: faithful {vrep['pca_init']['faithful']:.3f} -> {vrep['distilled']['faithful']:.3f} "
                     f"(flat {vrep['distilled']['flat_oracle_index']:.3f}, oracle {vrep['distilled']['oracle']:.3f}, "
-                    f"held-out KL {vrep['pca_init']['heldout_kl']:.3f} -> {vrep['distilled']['heldout_kl']:.3f})")
+                    f"held-out KL {vrep['pca_init']['heldout_kl']:.3f} -> {vrep['distilled']['heldout_kl']:.3f}; "
+                    f"keys read {vrep['distilled']['mean_long_keys']:.0f}; out-err faith/oracle/contig "
+                    f"{_f3(vrep['distilled']['err_faithful'])}/{_f3(vrep['distilled']['err_oracle'])}/{_f3(vrep['distilled']['err_contiguous'])})")
                 del ix, vs
                 _free()
             rep["layers"][str(l)] = lrep
@@ -419,13 +494,19 @@ def run_lsa_f2b(
 
 
 def format_f2b(rep: Dict[str, Any]) -> str:
-    rows = ["layer variant            tag        faith  flat   contig oracle  heldoutKL"]
+    rows = ["layer variant            tag        faith  flat   contig oracle  heldoutKL  keys  | out-err: faith  oracle contig random"]
     for l, lr in sorted(rep.get("layers", {}).items(), key=lambda kv: int(kv[0])):
         for name, v in lr["variants"].items():
             for tag in ("pca_init", "distilled"):
                 r = v[tag]
+                kl = r["heldout_kl"] if r.get("heldout_kl") is not None else float("nan")
+                keys = r.get("mean_long_keys")
                 rows.append(f"{int(l):>5} {name:<19} {tag:<9} {r['faithful']:6.3f} {r['flat_oracle_index']:6.3f} {r['contiguous']:6.3f} "
-                            f"{r['oracle']:6.3f}  {r['heldout_kl'] if r['heldout_kl'] is not None else float('nan'):8.3f}")
+                            f"{r['oracle']:6.3f}  {kl:8.3f} {'  n/a' if keys is None else f'{keys:5.0f}'}  |         "
+                            f"{_f3(r.get('err_faithful'))}  {_f3(r.get('err_oracle'))}  {_f3(r.get('err_contiguous'))}  {_f3(r.get('err_random'))}")
+            d = v.get("distill") or {}
+            if d.get("best_step") is not None:
+                rows.append(f"{'':>5} {'':<19} early-stop: best step {d['best_step']}, val KL {_f3(d.get('val_kl_before'))} -> {_f3(d.get('val_kl_after'))}")
         rows.append(f"{int(l):>5} ORACLE (no index) mean per-head recall by budget:")
         for b, d in sorted(lr["oracle"].items()):
             fm = lambda x: "  n/a " if x is None else f"{x:.3f}"
@@ -465,15 +546,49 @@ def gate_f2(report: Dict[str, Any], gate: Dict[str, float] = GATE) -> Dict[str, 
             "n_val_docs_note": "low power if val_docs_per_length == 1; repeat with more docs before claiming"}
 
 
+# PROPOSED gate v2 (numbers are judgement calls, not derived; registered in docs/roadmap/07 §3.2 as proposed). Recall is judged against
+# the oracle at the *same* key budget (the head-averaged teacher is diffuse, so absolute 0.90 was unreachable even for the oracle), and
+# the attention-OUTPUT error — which is what the model consumes — must be close to the oracle's. End-to-end ΔCE ≤ 0.02 nats is LSA-F3.
+GATE_V2 = {"min_faithful_over_oracle": 0.90, "max_err_ratio_vs_oracle": 1.5, "err_floor": 1e-3, "min_margin_vs_contiguous": 0.02,
+           "min_len_for_claim": 65536}
+
+
+def gate_f2_v2(report: Dict[str, Any], gate: Dict[str, float] = GATE_V2) -> Dict[str, Any]:
+    """Gate v2 on the largest val length of an F2 report (needs `err_*`, i.e. the run must have captured `v`). Layers failing it stay on
+    the exact attention path. Not claim-grade below `min_len_for_claim` or with 1 val doc."""
+    lens = sorted({int(L) for lr in report.get("layers", {}).values() for L in lr.get("val", {})})
+    if not lens:
+        return {"evaluated": False, "reason": "no layers evaluated", "claim_grade": False}
+    L = lens[-1]
+    per: Dict[str, Any] = {}
+    for l, lr in report["layers"].items():
+        r = lr.get("val", {}).get(str(L), {}).get("distilled", {}).get("recall", {})
+        if not r or r.get("faithful") is None or r.get("err_faithful") is None or r.get("err_oracle") is None:
+            per[l] = {"pass": False, "why": "missing recall or output error (rerun with v captured)"}
+            continue
+        ratio = r["faithful"] / max(1e-9, r["oracle"])
+        ok_rec = ratio >= gate["min_faithful_over_oracle"]
+        ok_err = r["err_faithful"] <= gate["max_err_ratio_vs_oracle"] * max(r["err_oracle"], gate["err_floor"])
+        ok_con = r["faithful"] >= r["contiguous"] + gate["min_margin_vs_contiguous"]
+        per[l] = {"pass": bool(ok_rec and ok_err and ok_con), "faithful_over_oracle": ratio, "err_faithful": r["err_faithful"],
+                  "err_oracle": r["err_oracle"], "recall_ok": bool(ok_rec), "err_ok": bool(ok_err), "margin_ok": bool(ok_con)}
+    passed = sorted(int(l) for l, v in per.items() if v["pass"])
+    failed = sorted(int(l) for l, v in per.items() if not v["pass"])
+    return {"evaluated": True, "length": L, "claim_grade": bool(L >= gate["min_len_for_claim"]), "layers_passed": passed,
+            "layers_failed_use_exact_path": failed, "all_pass": not failed and bool(passed), "per_layer": per, "gate": "v2-proposed"}
+
+
 def format_table(report: Dict[str, Any]) -> str:
-    rows = ["layer  len     tag        faith  flat   contig random oracle  fid_r"]
+    rows = ["layer  len     tag        faith  flat   contig random oracle  fid_r  keys | out-err: faith oracle contig random"]
     for l, lr in sorted(report.get("layers", {}).items(), key=lambda kv: int(kv[0])):
         for L, tags in sorted(lr.get("val", {}).items(), key=lambda kv: int(kv[0])):
             for tag, v in tags.items():
                 r = v.get("recall", {}) or {}
                 f = lambda x: "  n/a " if x is None else f"{x:6.3f}"
                 rows.append(f"{int(l):>5}  {int(L):>6}  {tag:<9} {f(r.get('faithful'))} {f(r.get('flat_oracle_index'))} "
-                            f"{f(r.get('contiguous'))} {f(r.get('random'))} {f(r.get('oracle'))}  {f(v.get('fidelity_r'))}")
+                            f"{f(r.get('contiguous'))} {f(r.get('random'))} {f(r.get('oracle'))}  {f(v.get('fidelity_r'))} "
+                            f"{'  n/a' if r.get('mean_long_keys') is None else format(r['mean_long_keys'], '5.0f')} |  "
+                            f"{f(r.get('err_faithful'))} {f(r.get('err_oracle'))} {f(r.get('err_contiguous'))} {f(r.get('err_random'))}")
     return "\n".join(rows)
 
 

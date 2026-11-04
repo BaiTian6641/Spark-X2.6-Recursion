@@ -60,7 +60,7 @@ if HAVE_TORCH:
                 qt = torch.randint(0, 16, (t,), generator=g)
                 for h in range(HQ):
                     q[h, :, ROPE:] = 3.0 * self.topics[qt][:, h // (HQ // HKV)] + 0.3 * torch.randn(t, D - ROPE, generator=g)
-                out[l] = {"query": q[None], "key": k[None]}
+                out[l] = {"query": q[None], "key": k[None], "value": torch.randn(HKV, t, D, generator=g)[None]}
             return out
 
 
@@ -131,6 +131,47 @@ class TestLsaEval(unittest.TestCase):
         r = le.resolve_rope_first(M(), 0, {"head_dim": D, "rope_dim": ROPE})
         self.assertEqual((r["rope_first"], r["source"]), (True, "probe"))
 
+    def test_probe_with_real_modeling_spark_signature_and_describe_rotary(self):
+        # Verbatim semantics of XHToken/Spark-X2.6-4B modeling_spark.py: apply_rotary_pos_emb(x, cos, sin) — 3 args, no unsqueeze_dim.
+        import types
+        mod = types.ModuleType("fake_real_rot_mod")
+        def rotate_half(x):
+            return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
+        def compute_rope_cos_sin(positions, head_dim, rope_theta, partial_rotary_factor=1.0, device="cpu"):
+            rd = int(head_dim * partial_rotary_factor)
+            inv = 1.0 / (rope_theta ** (torch.arange(0, rd, 2).float() / rd))
+            f = torch.outer(positions.float(), inv)
+            f = torch.cat([f, f], -1)
+            return f.cos(), f.sin()
+        def apply_rotary_pos_emb(x, cos, sin):
+            rd = cos.shape[-1]
+            xr, xp = x.float()[..., :rd], x.float()[..., rd:]
+            c, sn = cos.unsqueeze(0).unsqueeze(0), sin.unsqueeze(0).unsqueeze(0)
+            return torch.cat([xr * c + rotate_half(xr) * sn, xp], -1).to(x.dtype)
+        mod.compute_rope_cos_sin, mod.apply_rotary_pos_emb = compute_rope_cos_sin, apply_rotary_pos_emb
+        sys.modules["fake_real_rot_mod"] = mod
+
+        class A(nn.Module):
+            __module__ = "fake_real_rot_mod"
+            def __init__(self):
+                super().__init__()
+                self.d = nn.Linear(1, 1)
+        class L(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = A()
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.ls = nn.ModuleList([L()])
+            def _layers(self):
+                return self.ls
+        self.assertEqual(le.probe_rotated_dims(M(), 0, D, ROPE, theta=1e4), list(range(ROPE)))
+        info = le.describe_rotary(M(), 0)
+        self.assertEqual(info["n_moved"], ROPE)
+        self.assertEqual(info["resolved"]["source"], "probe")
+        self.assertIn("src_apply_rotary_pos_emb", info)
+
     def test_oracle_diagnostics_ordering_and_monotone_budget(self):
         m = FakeModel()
         cap = m.capture_attention_io(torch.randint(0, 100, (1, 4096)), [1])[1]
@@ -155,6 +196,44 @@ class TestLsaEval(unittest.TestCase):
             self.assertIsNotNone(v["base"]["distilled"]["heldout_kl"])
             self.assertIn("ORACLE", le.format_f2b(rep))
 
+    def test_run_f2b_rerank_variants_output_error_and_early_stop(self):
+        m = FakeModel()
+        with tempfile.TemporaryDirectory() as td:
+            rep = le.run_lsa_f2b(m, FakeTok(), fake_texts(80, 900, 0), fake_texts(80, 900, 1), layers=[1],
+                                 variants={"token_buckets": le.F2B_VARIANTS["token_buckets"], "coarse_rerank4": {"rerank": 4}},
+                                 train_lengths=(4096,), val_length=8192, train_docs_per_length=2, val_docs=1, k_budget=256,
+                                 distill_steps=10, n_eval_queries=4, oracle_budgets=(256,), out_dir=td, log=lambda *_: None)
+            self.assertEqual(rep["errors"], [], rep["errors"])
+            for name, v in rep["layers"]["1"]["variants"].items():
+                d = v["distilled"]
+                self.assertIsNotNone(d["err_faithful"], name)
+                self.assertLessEqual(d["err_oracle"], d["err_random"] + 1e-6)
+                self.assertIsNotNone(d["mean_long_keys"])
+                self.assertLessEqual(v["distill"]["val_kl_after"], v["distill"]["val_kl_before"] + 1e-6)
+            self.assertIn("out-err", le.format_f2b(rep))
+            json.dumps(rep, default=str)
+
+    def test_capture_qk_returns_v_only_on_request(self):
+        m = FakeModel()
+        self.assertNotIn("v", le.capture_qk(m, torch.randint(0, 100, (1, 300)), [1])[1])
+        out = le.capture_qk(m, torch.randint(0, 100, (1, 300)), [1], with_v=True)
+        self.assertEqual(tuple(out[1]["v"].shape), (HKV, 300, D))
+
+    def test_gate_v2_logic(self):
+        def lay(f, c, o, ef, eo):
+            return {"val": {"65536": {"distilled": {"recall": {"faithful": f, "contiguous": c, "oracle": o,
+                                                               "err_faithful": ef, "err_oracle": eo}}}}}
+        rep = {"layers": {"3": lay(0.60, 0.50, 0.65, 0.10, 0.08),   # pass
+                          "7": lay(0.50, 0.30, 0.65, 0.10, 0.08),   # recall ratio 0.77 -> fail
+                          "11": lay(0.60, 0.59, 0.65, 0.10, 0.08),  # margin too small -> fail
+                          "15": lay(0.60, 0.40, 0.65, 0.30, 0.08),  # output error too large -> fail
+                          "19": {"val": {"65536": {"distilled": {"recall": {"faithful": 0.6, "contiguous": 0.3, "oracle": 0.6}}}}}}}
+        g = le.gate_f2_v2(rep)
+        self.assertEqual(g["layers_passed"], [3])
+        self.assertEqual(g["layers_failed_use_exact_path"], [7, 11, 15, 19])
+        self.assertTrue(g["claim_grade"])
+        self.assertFalse(le.gate_f2_v2({"layers": {}})["evaluated"])
+
     def test_capture_qk_shapes_bf16(self):
         m = FakeModel()
         out = le.capture_qk(m, torch.randint(0, 100, (1, 300)), [1, 2])
@@ -171,14 +250,16 @@ class TestLsaEval(unittest.TestCase):
         m = FakeModel()
         with tempfile.TemporaryDirectory() as td:
             rep = le.run_lsa_f2(m, FakeTok(), fake_texts(80, 900, 0), fake_texts(80, 900, 1), layers=[1, 2],
-                                train_lengths=(4096,), val_lengths=(8192,), train_docs_per_length=1, layers_per_pass=2,
+                                train_lengths=(4096,), val_lengths=(8192,), train_docs_per_length=2, layers_per_pass=2,
                                 k_budget=256, distill_steps=15, queries_per_sample=16, n_eval_queries=4, out_dir=td,
-                                log=lambda *_: None)
+                                log=lambda *_: None, indexer_kwargs={"n_pool": 1, "avg_bucket_size": 2, "max_bucket_size": 4})
             self.assertEqual(rep["errors"], [], rep["errors"])
             self.assertEqual(sorted(rep["layers"]), ["1", "2"])
             r = rep["layers"]["1"]["val"]["8192"]["distilled"]["recall"]
             self.assertGreater(r["faithful"], r["random"])
             self.assertGreater(r["faithful"], r["contiguous"])
+            self.assertIsNotNone(r["err_faithful"])
+            self.assertIn("val_kl_after", rep["layers"]["1"]["distill"])  # early stopping ran (2 train docs -> 1 held out)
             self.assertTrue(os.path.exists(os.path.join(td, "dlsa_indexers.pt")))
             json.dumps(rep)
             tbl = le.format_table(rep)
