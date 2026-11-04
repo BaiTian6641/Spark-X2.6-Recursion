@@ -73,6 +73,14 @@ flowchart TD
 - **Engram as a storage mechanism:** SI-SRSI v2's **gap-write track (SI4)** is the first experiment that can actually demonstrate or refute the "vertical memory stores knowledge" thesis, because it measures paraphrase recall of facts the backbone did not know, with locality controls.
 - **Capability:** expect *consistency* gains (maj@k → pass@1, constraint and tool-format adherence) on the task-bank pillars, a few points on dev suites, possibly small gains on held-out public suites. The frozen backbone caps what can be learned; no claim of new reasoning ability is made. Every number will carry a CI and a control arm; "no significant gain" is an acceptable, reportable outcome.
 
+## 5b. Architectural Remedies Implemented (`7831f2f` — Opt-In, Non-Destructive to Running 20h Colab Job)
+
+To address H3 (scale/norm miscalibration), H4 (unconditional firing on general text), and H6 (frozen consumer off-manifold sensitivity) without altering the running 20h checkpoint (`selective_gating_enabled=False` by default = 100% bit-identical):
+1. **WISE Activation Scope Gate (`arXiv:2405.14768` §3.2)**: `ZipfianTieredMoEEngram` tracks compiled router directions `_compiled_scope_prototypes` in $\mathbb{S}^{63}$ (populated automatically by `compile_clusters_alphaedit` or `register_scope_prototypes`). When `scope_threshold > 0`, tokens whose router query $u_t$ has $\max_p \langle u_t, p \rangle < \tau_{\text{scope}}$ receive exact `0.0` perturbation (`scope_mask = 0`), guaranteeing `CE(ON) == CE(OFF)` on out-of-scope general text.
+2. **DeepSeek Signed-Sqrt RMSNorm Query-Key Gate (`arXiv:2601.07372` §2.3, `engram_demo_v1.py`)**: When `qk_gate_enabled=True`, computes $\alpha_t = \sigma(\text{RMSNorm}(h_t)^\top \text{RMSNorm}(m_t)/\sqrt{W})$ followed by $\text{sign}(\cdot)\sqrt{|\cdot|}$ to suppress unaligned memory retrievals before projection.
+3. **In-Manifold Trust-Region Relative Write Norm Cap**: When `max_rel_delta_norm > 0` (e.g., `0.03`), bounds $\|\Delta h_{\text{Engram}}\|_2 \le \rho_{\max} \|h\|_2$ per token so no anchor can push the frozen consumer off-manifold.
+4. **Closed-Form Continual Knowledge Injection & Gap-Write Test (`BIE-5` / `SI4`, `sparkx_bie.run_gap_write_test`)**: Compiles synthetic novel entity facts (`Kestrel-941`, `Dr. Soren Vance`, `Aethelgard-7`) directly into `ZipfianTieredMoEEngram` via `compile_clusters_alphaedit` + WISE scope prototypes and measures Reliability (target NLL reduction), Paraphrase Generalization, General-Text Locality (`|CE_general_after - CE_general_before|`), and Sequential Null-Space Stability.
+
 ## 6. Roadmap hooks
 
 | Milestone | Where |
@@ -80,3 +88,4 @@ flowchart TD
 | Long run → decision tree (§4) | tracker row *20 h resumable long run* |
 | SI0–SI7 | [05 §7](05_SI_SRSI_V2_DESIGN.md) |
 | Capability baseline incl. loop-vs-36L on **true** held-out text | SI0 |
+| Selective gating + Gap-Write (BIE-1/3/5, SI4) | `sparkx_bie.py`, Cell 6 of `SparkX_Loop_v03_LongRun_Colab.ipynb` (`7831f2f`) |

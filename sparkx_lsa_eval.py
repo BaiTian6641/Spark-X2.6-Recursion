@@ -599,21 +599,214 @@ def load_indexers(path: str) -> Dict[int, Dict[str, Any]]:
     return torch.load(path, map_location="cpu")["indexers"]
 
 
-def upgrade_lsa_indexers(model: Any, indexers: Dict[int, Dict[str, Any]], k_budget: int = 2048, window: int = 512) -> List[int]:
+def upgrade_lsa_indexers(
+    model: Any,
+    indexers: Dict[int, Dict[str, Any]],
+    k_budget: int = 2048,
+    window: int = 512,
+    layers_to_upgrade: Optional[Sequence[int]] = None,
+    **indexer_kwargs: Any,
+) -> List[int]:
     """Attach distilled `FaithfulDLSAIndexer`s as `self_attn.lsa_indexer` of the global layers. The attention patch
     (`patch_spark_attention_for_lsa`) looks the indexer up at call time, so this takes effect immediately; it is only used for
     decode-like calls with `seq_k > exact_threshold` (unchanged semantics). Returns the layers upgraded."""
+    allow = set(int(x) for x in layers_to_upgrade) if layers_to_upgrade is not None else None
     done: List[int] = []
     for l, d in indexers.items():
+        if allow is not None and int(l) not in allow:
+            continue
         a = _layer_attn(model, int(l))
         geo = d["geometry"]
         dev = next(a.parameters()).device
-        ix = FaithfulDLSAIndexer(n_kv=geo["n_kv"], head_dim=geo["head_dim"], rope_dim=geo["rope_dim"], rope_first=d["rope_first"],
-                                 window=window, k_long_range=k_budget)
+        ix = FaithfulDLSAIndexer(
+            n_kv=geo["n_kv"],
+            head_dim=geo["head_dim"],
+            rope_dim=geo["rope_dim"],
+            rope_first=d["rope_first"],
+            window=window,
+            k_long_range=k_budget,
+            **indexer_kwargs,
+        )
         ix.load_state_dict(d["state"])
+        ix.reset_decode_cache()
         ix.to(dev).eval()
         if "lsa_indexer" in a._modules:
             del a._modules["lsa_indexer"]
         a.add_module("lsa_indexer", ix)
         done.append(int(l))
     return sorted(done)
+
+
+@torch.no_grad()
+def run_lsa_f3(
+    model: Any,
+    tokenizer: Any,
+    indexers: Dict[int, Dict[str, Any]],
+    val_texts: Sequence[str],
+    seq_len: int = 8192,
+    k_budget: int = 2048,
+    window: int = 512,
+    rerank: int = 4,
+    decode_tail: int = 16,
+    layers_to_upgrade: Optional[Sequence[int]] = None,
+    indexer_kwargs: Optional[Dict[str, Any]] = None,
+    seed: int = 0,
+) -> Dict[str, Any]:
+    """`LSA-F3`: End-to-end model decode CE delta (`|CE_dlsa - CE_exact| <= 0.02`), planted needle retrieval,
+    per-layer tail output relative error, and incremental decode cache hit verification on the upgraded layers."""
+    import importlib
+    from sparkx_dlsa import _out_rel_err
+
+    def _sparse_attn_row(q0: torch.Tensor, k0: torch.Tensor, v0: torch.Tensor, p: int, sel: torch.Tensor, sc: float) -> torch.Tensor:
+        hq = q0.shape[0]
+        g = hq // k0.shape[0]
+        rows = []
+        for h in range(hq):
+            kk, vv = k0[h // g, sel].float(), v0[h // g, sel].float()
+            logits = (kk @ q0[h, p].float()) * sc
+            rows.append(torch.softmax(logits, dim=-1) @ vv)
+        return torch.stack(rows, dim=0)
+
+    dev = next(model.parameters()).device
+    kw = dict(rerank=rerank)
+    kw.update(indexer_kwargs or {})
+    upgraded = upgrade_lsa_indexers(
+        model, indexers, k_budget=k_budget, window=window, layers_to_upgrade=layers_to_upgrade, **kw
+    )
+    if not upgraded:
+        return {"status": "no_layers_upgraded", "upgraded_layers": []}
+
+    ids = pack_to_length(tokenizer, val_texts, int(seq_len), seed=seed + 777)
+    if ids is None:
+        return {"status": "corpus_too_small", "seq_len": seq_len}
+    ids = ids.to(dev)
+    t_len = int(ids.shape[1])
+    tail_n = min(max(2, int(decode_tail)), t_len - 1)
+    q_positions = list(range(t_len - tail_n - 1, t_len - 1))
+
+    # 1. Sequential decode simulation per upgraded layer (always runs; verifies decode cache hits & attention output error)
+    cap = capture_qk(model, ids, upgraded, device=str(dev), with_v=True)
+    layer_tail_errors: Dict[int, float] = {}
+    total_hits = 0
+    total_misses = 0
+    total_reuse_hits = 0
+
+    for l in upgraded:
+        if l not in cap or "v" not in cap[l]:
+            continue
+        q, k, v = cap[l]["q"].to(dev), cap[l]["k"].to(dev), cap[l]["v"].to(dev)
+        kf, vf = k.float(), v.float()
+        attn = _layer_attn(model, l)
+        ix: FaithfulDLSAIndexer = attn.lsa_indexer
+        ix.reset_decode_cache()
+        sc = float(layer_geometry(model, l)["scale"] or (1.0 / math.sqrt(q.shape[-1])))
+        errs = []
+        for p in q_positions:
+            q_step = q[:, p : p + 1].unsqueeze(0)
+            k_step = k[:, : p + 1].unsqueeze(0)
+            sel = ix.select_key_indices(q_step, k_step, k_budget=k_budget, use_cache=True)
+            errs.append(_out_rel_err(q, kf, vf, p, {"sp": sel}, sc)["sp"])
+        layer_tail_errors[l] = sum(errs) / max(1, len(errs))
+        total_hits += int(ix.decode_cache_hits)
+        total_misses += int(ix.decode_cache_misses)
+        total_reuse_hits += int(ix.selection_reuse_hits)
+    del cap
+    _free()
+
+    res: Dict[str, Any] = {
+        "status": "ok",
+        "seq_len": t_len,
+        "decode_tail": tail_n,
+        "upgraded_layers": upgraded,
+        "layer_tail_out_err": layer_tail_errors,
+        "mean_tail_out_err": sum(layer_tail_errors.values()) / max(1, len(layer_tail_errors)),
+        "decode_cache_hits": int(total_hits),
+        "decode_cache_misses": int(total_misses),
+        "selection_reuse_hits": int(total_reuse_hits),
+        "decode_cache_hit_rate": float(total_hits / max(1, total_hits + total_misses)),
+    }
+
+    # 2. Full model forward_logits end-to-end CE delta & planted needle retrieval (when model has forward_logits + eager_attention_forward)
+    if hasattr(model, "forward_logits"):
+        try:
+            attn_mod = importlib.import_module(type(_layer_attn(model, upgraded[0])).__module__)
+        except Exception:
+            attn_mod = None
+        orig_eager = getattr(attn_mod, "eager_attention_forward", None) if attn_mod is not None else None
+        if orig_eager is not None:
+            needle_ids = ids.clone()
+            needle_str = " The vault 914 passkey is 83921. "
+            cue_str = " The vault 914 passkey is"
+            try:
+                n_toks = torch.as_tensor(tokenizer(needle_str, add_special_tokens=False)["input_ids"], device=dev, dtype=torch.long)
+                c_toks = torch.as_tensor(tokenizer(cue_str, add_special_tokens=False)["input_ids"], device=dev, dtype=torch.long)
+                if n_toks.numel() >= 2 and c_toks.numel() >= 1 and t_len > (n_toks.numel() + c_toks.numel() + window + 32):
+                    ins_pos = max(8, t_len // 3)
+                    needle_ids[0, ins_pos : ins_pos + n_toks.numel()] = n_toks
+                    needle_ids[0, t_len - 1 - c_toks.numel() : t_len - 1] = c_toks
+                    needle_target_id = int(n_toks[-1].item())
+                else:
+                    needle_target_id = int(ids[0, -1].item())
+            except Exception:
+                needle_target_id = int(ids[0, -1].item())
+
+            logits_exact = model.forward_logits(ids).float()
+            ce_exact = float(
+                F.cross_entropy(logits_exact[0, q_positions], ids[0, [p + 1 for p in q_positions]], reduction="mean").item()
+            )
+            logits_needle_exact = model.forward_logits(needle_ids).float()[0, -2]
+            needle_nll_exact = float(-torch.log_softmax(logits_needle_exact, dim=-1)[needle_target_id].item())
+            needle_hit_exact = bool(int(logits_needle_exact.argmax().item()) == needle_target_id)
+            del logits_exact, logits_needle_exact
+            _free()
+
+            upgraded_attn_ids = {id(_layer_attn(model, l)) for l in upgraded}
+
+            def _f3_wrapped_eager(module, query, key, value, attention_mask=None, scaling=None, dropout=0.0, **kwargs):
+                out, w = orig_eager(
+                    module, query, key, value, attention_mask=attention_mask, scaling=scaling, dropout=dropout, **kwargs
+                )
+                ix_m = getattr(module, "lsa_indexer", None)
+                if id(module) in upgraded_attn_ids and ix_m is not None and out.shape[2] == t_len:
+                    sc = scaling if scaling is not None else 1.0 / math.sqrt(query.shape[-1])
+                    out = out.clone()
+                    q0, k0, v0 = query[0], key[0], value[0]
+                    for p in q_positions:
+                        sel = ix_m.select_key_indices(query[:, :, p : p + 1, :], key[:, :, : p + 1, :], k_budget=k_budget, use_cache=True)
+                        sp_o = _sparse_attn_row(q0, k0, v0, p, sel, float(sc))  # [H_q, D]
+                        out[0, :, p, :] = sp_o.to(out.dtype)
+                return out, w
+
+            try:
+                for l in upgraded:
+                    _layer_attn(model, l).lsa_indexer.reset_decode_cache()
+                attn_mod.eager_attention_forward = _f3_wrapped_eager
+                logits_dlsa = model.forward_logits(ids).float()
+                ce_dlsa = float(
+                    F.cross_entropy(logits_dlsa[0, q_positions], ids[0, [p + 1 for p in q_positions]], reduction="mean").item()
+                )
+                for l in upgraded:
+                    _layer_attn(model, l).lsa_indexer.reset_decode_cache()
+                logits_needle_dlsa = model.forward_logits(needle_ids).float()[0, -2]
+                needle_nll_dlsa = float(-torch.log_softmax(logits_needle_dlsa, dim=-1)[needle_target_id].item())
+                needle_hit_dlsa = bool(int(logits_needle_dlsa.argmax().item()) == needle_target_id)
+                del logits_dlsa, logits_needle_dlsa
+            finally:
+                attn_mod.eager_attention_forward = orig_eager
+                _free()
+
+            delta_ce = float(ce_dlsa - ce_exact)
+            res.update({
+                "ce_exact": ce_exact,
+                "ce_dlsa": ce_dlsa,
+                "delta_ce": delta_ce,
+                "ce_gate_pass": bool(abs(delta_ce) <= 0.02),
+                "needle_nll_exact": needle_nll_exact,
+                "needle_nll_dlsa": needle_nll_dlsa,
+                "needle_delta_nll": float(needle_nll_dlsa - needle_nll_exact),
+                "needle_hit_exact": needle_hit_exact,
+                "needle_hit_dlsa": needle_hit_dlsa,
+            })
+
+    return res
+

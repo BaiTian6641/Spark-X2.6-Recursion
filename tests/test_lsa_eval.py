@@ -284,6 +284,30 @@ class TestLsaEval(unittest.TestCase):
         self.assertFalse(g["all_pass"])
         self.assertFalse(le.gate_f2({"layers": {}})["evaluated"])
 
+    def test_run_lsa_f3_decode_simulation_and_cache_hits(self):
+        m = FakeModel()
+        with tempfile.TemporaryDirectory() as td:
+            rep = le.run_lsa_f2(
+                m, FakeTok(), fake_texts(40, 500, 0), fake_texts(40, 500, 1), layers=[1, 2],
+                train_lengths=(2048,), val_lengths=(4096,), train_docs_per_length=1, layers_per_pass=2,
+                k_budget=128, distill_steps=5, queries_per_sample=8, n_eval_queries=2, out_dir=td,
+                log=lambda *_: None,
+            )
+            self.assertEqual(rep["errors"], [])
+            ixs = le.load_indexers(os.path.join(td, "dlsa_indexers.pt"))
+            f3 = le.run_lsa_f3(
+                m, FakeTok(), ixs, fake_texts(40, 500, 2),
+                seq_len=2048, k_budget=128, window=128, rerank=4, decode_tail=6,
+                layers_to_upgrade=[1],
+            )
+            self.assertEqual(f3["status"], "ok")
+            self.assertEqual(f3["upgraded_layers"], [1])
+            self.assertEqual(f3["decode_cache_misses"], 1)
+            self.assertEqual(f3["decode_cache_hits"], 5)
+            self.assertGreater(f3["mean_tail_out_err"], 0.0)
+            self.assertLess(f3["mean_tail_out_err"], 2.0)
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -188,9 +188,17 @@ class TestBIE(unittest.TestCase):
     def test_knowledge_locus_scan_and_gap_write_test(self):
         from sparkx_loop_v03_core import ZipfianTieredMoEEngram
 
+        V_gap = 128
+        vocab_map = {}
+
         class DummyTok:
             def __call__(self, text, add_special_tokens=False, return_tensors=None):
-                toks = [abs(hash(w)) % (V - 2) + 1 for w in text.split()] or [1, 2]
+                toks = []
+                for w in text.split():
+                    if w not in vocab_map:
+                        vocab_map[w] = (len(vocab_map) % (V_gap - 2)) + 1
+                    toks.append(vocab_map[w])
+                toks = toks or [1, 2]
                 if return_tensors == "pt":
                     return type("Obj", (), {"input_ids": torch.tensor([toks], dtype=torch.long)})()
                 return type("Obj", (), {"input_ids": toks})()
@@ -210,10 +218,10 @@ class TestBIE(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 torch.manual_seed(19)
-                self.emb = nn.Embedding(V, 64)
+                self.emb = nn.Embedding(V_gap, 64)
                 self.layers = nn.ModuleList([ToyBlock(), ToyBlock(), ToyBlock()])
                 self.norm = nn.LayerNorm(64)
-                self.lm_head = nn.Linear(64, V, bias=False)
+                self.lm_head = nn.Linear(64, V_gap, bias=False)
                 self.eng = ZipfianTieredMoEEngram(
                     hot_buckets=64, cold_buckets=64, eng_dim=32, width=64,
                     shared_rank=16, num_experts=4, initial_active_experts=4,

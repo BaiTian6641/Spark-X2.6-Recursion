@@ -200,6 +200,7 @@ class TestProvider(unittest.TestCase):
                 assert [lr.doc_key(r) for r in prov.frozen_val(10)] == [lr.doc_key(r) for r in v1]
             finally:
                 prov.close()
+                prov.thread.join(timeout=0.5)
             # a fresh provider (new session) continues from the persisted manifest, never re-issuing docs
             prov2 = lr.ChunkProvider(Path(td) / "data", curate, n_chunks_target=3, chunk_docs=100, hub=None)
             assert prov2.n_available() >= 2
