@@ -38,11 +38,12 @@ from sparkx_memory_utils import BackboneFingerprint
 
 def strip_thinking_trace(text: str) -> Tuple[str, str, bool]:
     """Split raw model output into `(thinking_trace, final_answer, closed_think_naturally)`."""
-    if "</think>" in text:
-        parts = text.split("</think>", 1)
-        think_part = parts[0].replace("<think>", "").strip()
-        final_part = parts[1].strip()
-        return think_part, final_part, True
+    for close_tag in ("</think>", "</tool_call>"):
+        if close_tag in text:
+            parts = text.split(close_tag, 1)
+            think_part = parts[0].replace("<think>", "").strip()
+            final_part = parts[1].strip()
+            return think_part, final_part, True
     if "<think>" in text:
         # Did not close </think>; take last paragraph as fallback answer
         cleaned = text.replace("<think>", "").strip()
