@@ -167,7 +167,7 @@ Reject ⇒ restore snapshot, `lr ×= 0.5`, halve selected-set size, log reason. 
 | ID | Milestone | Depends on | Acceptance | Effort |
 | :-- | :-- | :-- | :-- | :-- |
 | **SI0** | Baseline battery on 4 configs (§4) + generation throughput at batch 1/8/32 + frozen splits committed | long run best ckpt (can start on current Hub model) | numbers + CIs recorded; throughput known; round size derived | S |
-| **SI1** | Verifier library + task bank + sandbox, pure-Python unit tests | — | ≥ 95 % verifier test pass incl. adversarial cases; code sandbox blocks network/file escape tests | M |
+| **SI1** | Verifier library + task bank + sandbox, pure-Python unit tests | — | ≥ 95 % verifier test pass incl. adversarial cases; code sandbox blocks network/file escape tests | M — 🟩 implemented 2026-11-04 (48 tests; sandbox = defence in depth: scrubbed env, rlimits, nonce sentinel against `exit`/print hijacks, network patched + `unshare -rn` when available; **file-system escape is not blocked** — run only in the ephemeral VM) |
 | **SI2** | Batched rollout engine (policy-consistent) | SI0 | sampled vs teacher-forced logprob mismatch < 1e-3 nats/token on 50 samples (proves same policy) | M |
 | **SI3** | RFT round with gate; arms: mHC-only / Engram-only / both / matched-token unverified control | SI1, SI2 | ≥ 1 accepted round **or** a clean negative with CIs | M |
 | **SI4** | Engram gap-write test (§5) | SI0, SI1 | §5 success criterion met, or negative result documented | M |
