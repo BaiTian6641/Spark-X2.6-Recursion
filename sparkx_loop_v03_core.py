@@ -1737,6 +1737,13 @@ class ZipfianTieredMoEEngram(nn.Module):
             if not self.training:
                 self._eval_lex_cache = (cache_key, e_lexical, lex_hidden)
 
+        # Diagnostic hook (default 1.0 = bit-identical no-op): scale/zero the Tier-1 lexical path AFTER the
+        # eval cache so ablation never poisons cached values. Used by `sparkx_engram_generalization`.
+        _lex_s = getattr(self, '_ablate_lex', 1.0)
+        if _lex_s != 1.0:
+            e_lexical = e_lexical * _lex_s
+            lex_hidden = lex_hidden * _lex_s
+
         if hidden_states is not None:
             h_norm = triton_rmsnorm(hidden_states.to(param_dtype), self.norm_weight, self.norm_eps)
             h_norm_f = h_norm.float()
@@ -1861,6 +1868,10 @@ class ZipfianTieredMoEEngram(nn.Module):
                     routed_flat.index_add_(0, token_rows, torch.cat(out_chunks, dim=0))
 
             routed_out = routed_flat.view_as(shared_out)
+            _sem_s = getattr(self, '_ablate_sem', 1.0)
+            if _sem_s != 1.0:
+                routed_out = routed_out * _sem_s
+                shared_out = shared_out * _sem_s
             combined = 0.5 * lex_hidden + shared_out + routed_out
             ctx = 2.0 * torch.sigmoid(self.ctx_gate(h_norm).float()).to(param_dtype)
             combined = combined * ctx

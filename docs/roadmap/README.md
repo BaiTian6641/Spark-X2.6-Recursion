@@ -38,7 +38,8 @@
 | **L4** adaptive exit | L | L3 | GL4 | 🟩 | `bfe9063` (`avg_effective_layers=60.0L`, `16.67%` FLOP savings, `rel_ppl_change_pct=-2.102%` PPL improvement) |
 | **L5** recursion-wise KV sharing (`18 -> 9` global KV slots) | L | L3 | GL5 | 🟩 | `7c54c4a` (`unshared=18` → `effective=9` global KV slots, `2.0x` reduction ratio) |
 | **Phase 7** EFRE + 72L vs 36L loop manipulation (`H-L1/H-L2/H-L3`) | M×L | P2, P6, L4, L5 | claims 1–8 | 🟩 | `bfe9063` (`72L+ESM NLL=2.2278` vs `36L+ESM NLL=3.7574`, `+1.5296` NLL advantage = `4.6x` lower PPL on identical vertical memory) |
-| **Production Hub Continuation (`Global 358`)** | M×L | Stage 3/4, Phase 4, SI-SRSI | Hub Export | 🟩 | `4ee3e23` (`Stage3/4 CE 0.7758 -> 0.3472`, `Phase-4 Held-Out 72L PPL 7.1759 -> 1.4819` vs `NoEng 1.5502`, `SI-SRSI Rubric 72.40 -> 96.00/100`, uploaded to `TassP0lar/Spark-X2.6-4B-En4B-A1B`) |
+| **Production Hub Continuation (`Global 358`)** | M×L | Stage 3/4, Phase 4, SI-SRSI | Hub Export | 🟨 trained + exported; **generalization unverified** | `4ee3e23` (`Stage3/4 CE 0.7758 -> 0.3472`, uploaded to `TassP0lar/Spark-X2.6-4B-En4B-A1B`). ⚠ Phase-4 "held-out" PPL (`7.1759 -> 1.4819`) is measured on `_HELD_OUT_EVAL_TEXTS`, which Phase-4 (calibration anchors) and SI-SRSI (general items) **train on**; SI-SRSI rubric (`72.40 -> 96.00`) is scored on the same 5 prompts it trains on. Neither is a generalization measurement. |
+| **Engram generalization diagnostic** (leak-free: true held-out texts, held-out paraphrases, OFF/FULL/SEM_ONLY/LEX_ONLY ablation) | L | Production run | transfer ratio | 🟨 code ready, awaiting Colab run | `sparkx_engram_generalization.py`, notebook Cell 8 |
 
 ## Two Tracks, One Base
 
