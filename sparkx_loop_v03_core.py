@@ -890,19 +890,19 @@ class LatentSparseAttentionIndexer(nn.Module):
 
         x_head = x_head - x_head.mean(dim=0, keepdim=True)
         _, _, vh_q = torch.linalg.svd(x_head, full_matrices=False)
-        top_q = vh_q[: self.d_idx, :]  # [d_idx, head_dim]
+        top_q = vh_q[: self.d_idx, :]  # [<= d_idx, head_dim]
         if self.use_rope_free_slice and self.rope_dim > 0:
             top_q[:, : self.rope_dim] = 0.0
-        self.w_q_idx.weight.data.copy_(top_q.to(self.w_q_idx.weight.dtype))
+        self.w_q_idx.weight.data[: top_q.shape[0], :].copy_(top_q.to(self.w_q_idx.weight.dtype))
 
         x_flat = x_flat - x_flat.mean(dim=0, keepdim=True)
         _, _, vh_k = torch.linalg.svd(x_flat, full_matrices=False)
-        top_k = vh_k[: self.d_idx, :]  # [d_idx, num_kv_heads * head_dim]
+        top_k = vh_k[: self.d_idx, :]  # [<= d_idx, num_kv_heads * head_dim]
         if self.use_rope_free_slice and self.rope_dim > 0:
-            top_k_3d = top_k.view(self.d_idx, self.num_kv_heads, self.head_dim)
+            top_k_3d = top_k.view(top_k.shape[0], self.num_kv_heads, self.head_dim)
             top_k_3d[:, :, : self.rope_dim] = 0.0
-            top_k = top_k_3d.reshape(self.d_idx, -1)
-        self.w_k_idx.weight.data.copy_(top_k.to(self.w_k_idx.weight.dtype))
+            top_k = top_k_3d.reshape(top_k.shape[0], -1)
+        self.w_k_idx.weight.data[: top_k.shape[0], :].copy_(top_k.to(self.w_k_idx.weight.dtype))
 
     def _prepare_query_input(self, query: torch.Tensor) -> torch.Tensor:
         q_f = query.float()

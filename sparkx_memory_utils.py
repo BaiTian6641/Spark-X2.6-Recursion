@@ -553,8 +553,9 @@ def reconstruct_spark_attention_output(
 ) -> Any:
     """Recompute Spark attention residual `out_proj(sigmoid(g_proj(LN h)) * SDPA(q, k, v))`.
 
-    Supports both `torch.Tensor` (`sdpa_out` shape `[B, H_q, T, D_h]` or `[T, H_q * D_h]`) and pure-Python 2D lists
-    (`[T, H_q * D_h]`) for deterministic unit testing.
+    Supports both head-wise `g_proj` (`[H_q, W]`, `headwise_attn_output_gate=True` as in `Spark-X2.6-4B`)
+    and element-wise `g_proj` (`[H_q * D_h, W]`), across `torch.Tensor` (`sdpa_out` shape `[B, H_q, T, D_h]`
+    or `[..., H_q * D_h]`) and pure-Python 2D lists (`[T, H_q * D_h]`).
     """
     if HAS_TORCH and isinstance(sdpa_out, torch.Tensor):
         if sdpa_out.dim() == 4:
@@ -566,6 +567,9 @@ def reconstruct_spark_attention_output(
             gate = torch.sigmoid(
                 torch.nn.functional.linear(normed_input.float(), g_proj_weight.float())
             )
+            if gate.shape[-1] != flat_sdpa.shape[-1] and flat_sdpa.shape[-1] % gate.shape[-1] == 0:
+                head_dim = flat_sdpa.shape[-1] // gate.shape[-1]
+                gate = gate.repeat_interleave(head_dim, dim=-1)
             flat_sdpa = flat_sdpa * gate
         return torch.nn.functional.linear(flat_sdpa, out_proj_weight.float())
 
@@ -574,10 +578,14 @@ def reconstruct_spark_attention_output(
     if g_proj_weight is not None:
         g_t = _py_transpose(g_proj_weight)
         raw_g = _py_matmul(normed_input, g_t)
+        d_attn = len(sdpa_out[0]) if sdpa_out else 0
+        d_gate = len(raw_g[0]) if raw_g else 0
+        head_dim = max(1, d_attn // max(1, d_gate)) if (d_gate > 0 and d_attn % d_gate == 0) else 1
         gated = [
             [
-                sdpa_out[t][d] * (1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, raw_g[t][d])))))
-                for d in range(len(sdpa_out[t]))
+                sdpa_out[t][d]
+                * (1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, raw_g[t][d // head_dim])))))
+                for d in range(d_attn)
             ]
             for t in range(len(sdpa_out))
         ]
@@ -2070,7 +2078,7 @@ def fit_dlsa_index(
                 k_pos = torch.arange(0, seq_t, device=q_t.device).view(1, 1, 1, -1)
                 t_logits = t_logits.masked_fill(k_pos > q_pos, float("-inf"))
                 p_teacher = torch.softmax(t_logits, dim=-1).mean(dim=(0, 1, 2))  # [T]
-                q_free = lsa_idx._prepare_query_input(q_tail).mean(dim=(0, 1))  # [1, in_q]
+                q_free = lsa_idx._prepare_query_input(q_tail).mean(dim=(0, 1)).unsqueeze(0)  # [1, in_q]
                 k_free = lsa_idx._prepare_key_input(k_t)[0]  # [T, in_k]
 
             with torch.enable_grad():

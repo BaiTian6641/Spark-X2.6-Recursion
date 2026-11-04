@@ -274,6 +274,32 @@ class TestMemoryMathPurePython(unittest.TestCase):
         )
         self.assertLess(max_diff, 1e-12)
 
+        # Also test head-wise g_proj ([num_heads, w_dim] where num_heads=4, head_dim=4 -> d_attn=16)
+        num_heads = 4
+        head_dim = d_attn // num_heads
+        g_proj_headwise = _rand_matrix(num_heads, w_dim, seed=505)
+        recon_hw = reconstruct_spark_attention_output(
+            sdpa_out=sdpa_out,
+            normed_input=normed_h,
+            out_proj_weight=out_proj_w,
+            g_proj_weight=g_proj_headwise,
+        )
+        g_hw_logits = _py_matmul(normed_h, _py_transpose(g_proj_headwise))
+        gated_hw = [
+            [
+                sdpa_out[t][d] / (1.0 + math.exp(-g_hw_logits[t][d // head_dim]))
+                for d in range(d_attn)
+            ]
+            for t in range(seq_t)
+        ]
+        ref_hw = _py_matmul(gated_hw, _py_transpose(out_proj_w))
+        max_diff_hw = max(
+            abs(recon_hw[t][j] - ref_hw[t][j])
+            for t in range(seq_t)
+            for j in range(w_dim)
+        )
+        self.assertLess(max_diff_hw, 1e-12)
+
     def test_g3_episodic_side_memory_write_gate_and_remove(self) -> None:
         # Phase 3 Gate G3: empty bit-identity, protected general+past basis, canary gate calibration, exact removal
         esm = EpisodicSideMemory(width=16, r=24, route_dim=8, max_shards=4, gate_T=0.02, use_torch=False)
