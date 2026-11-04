@@ -2057,9 +2057,6 @@ def fit_dlsa_index(
 
         # Optional lightweight KL alignment on w_q_idx / w_k_idx
         if int(steps) > 0:
-            lsa_idx.w_q_idx.weight.requires_grad_(True)
-            lsa_idx.w_k_idx.weight.requires_grad_(True)
-            opt = torch.optim.AdamW([lsa_idx.w_q_idx.weight, lsa_idx.w_k_idx.weight], lr=float(lr))
             seq_t = int(q_t.shape[2])
             q_tail = q_t[:, :, -min(16, seq_t) :, :]
             k_full = k_t
@@ -2076,21 +2073,25 @@ def fit_dlsa_index(
                 q_free = lsa_idx._prepare_query_input(q_tail).mean(dim=(0, 1))  # [1, in_q]
                 k_free = lsa_idx._prepare_key_input(k_t)[0]  # [T, in_k]
 
-            for _ in range(int(steps)):
-                opt.zero_grad()
-                q_proj = torch.nn.functional.normalize(
-                    torch.nn.functional.linear(q_free, lsa_idx.w_q_idx.weight.float()), p=2, dim=-1, eps=1e-6
-                )
-                k_proj = torch.nn.functional.normalize(
-                    torch.nn.functional.linear(k_free, lsa_idx.w_k_idx.weight.float()), p=2, dim=-1, eps=1e-6
-                )
-                s_logits = torch.matmul(q_proj, k_proj.t()).squeeze(0) / 0.1
-                log_p_student = torch.log_softmax(s_logits, dim=-1)
-                loss = torch.nn.functional.kl_div(log_p_student, p_teacher.clamp(min=1e-8), reduction="sum")
-                loss.backward()
-                opt.step()
-            lsa_idx.w_q_idx.weight.requires_grad_(False)
-            lsa_idx.w_k_idx.weight.requires_grad_(False)
+            with torch.enable_grad():
+                lsa_idx.w_q_idx.weight.requires_grad_(True)
+                lsa_idx.w_k_idx.weight.requires_grad_(True)
+                opt = torch.optim.AdamW([lsa_idx.w_q_idx.weight, lsa_idx.w_k_idx.weight], lr=float(lr))
+                for _ in range(int(steps)):
+                    opt.zero_grad()
+                    q_proj = torch.nn.functional.normalize(
+                        torch.nn.functional.linear(q_free, lsa_idx.w_q_idx.weight.float()), p=2, dim=-1, eps=1e-6
+                    )
+                    k_proj = torch.nn.functional.normalize(
+                        torch.nn.functional.linear(k_free, lsa_idx.w_k_idx.weight.float()), p=2, dim=-1, eps=1e-6
+                    )
+                    s_logits = torch.matmul(q_proj, k_proj.t()).squeeze(0) / 0.1
+                    log_p_student = torch.log_softmax(s_logits, dim=-1)
+                    loss = torch.nn.functional.kl_div(log_p_student, p_teacher.clamp(min=1e-8), reduction="sum")
+                    loss.backward()
+                    opt.step()
+                lsa_idx.w_q_idx.weight.requires_grad_(False)
+                lsa_idx.w_k_idx.weight.requires_grad_(False)
 
     post_recall = evaluate_dlsa_attention_mass_recall(model, sample_ids, layers=layers, k_budget=k_budget)
     fp_after = fp_before.verify(model)
@@ -2165,6 +2166,7 @@ def consolidate_shards_smf(
                             "trigger_pos": 0,
                             "query_hidden": h_rep,
                             "cluster_hidden": h_rep,
+                            "target_residual": y_rep,
                             "value_residual": y_rep,
                         }
                     )

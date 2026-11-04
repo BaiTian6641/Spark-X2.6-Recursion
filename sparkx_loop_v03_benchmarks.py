@@ -1588,16 +1588,32 @@ _HELD_OUT_EVAL_TEXTS = [
 
 def encode_spark_chat_pair(
     tokenizer: Any,
-    user_text: str,
-    assistant_text: str,
+    user_text: Optional[str] = None,
+    assistant_text: Optional[str] = None,
     system_text: str = (
         "You are Spark-X2.6, an advanced reasoning and engineering assistant. "
         "Reason step-by-step in your thinking channel, then in your response channel provide a precise, complete final response."
     ),
     max_seq_len: int = 1536,
+    *,
+    user_prompt: Optional[str] = None,
+    answer_text: Optional[str] = None,
+    assistant_response: Optional[str] = None,
+    think_text: Optional[str] = None,
+    max_length: Optional[int] = None,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Encode a `(user_text, assistant_text)` pair using Spark-X2.6-4B's native `chat_template.jinja`
     with `reasoning_content` separated from `content` so `<|Bot|><think>{thought}</think>{answer}` is supervised cleanly."""
+    if user_text is None:
+        user_text = user_prompt or ""
+    if assistant_text is None:
+        base_ans = answer_text if answer_text is not None else (assistant_response or "")
+        if think_text:
+            assistant_text = f"<think>\n{think_text}\n</think>\n{base_ans}"
+        else:
+            assistant_text = base_ans
+    if max_length is not None:
+        max_seq_len = int(max_length)
     if "<think>" in system_text or "</think>" in system_text:
         system_text = (
             system_text
@@ -1866,7 +1882,12 @@ def restore_pristine_base_backbone(
 
 
 @torch.no_grad()
-def evaluate_engram_perplexity_delta(model: Any, tokenizer: Any) -> Dict[str, float]:
+def evaluate_engram_perplexity_delta(
+    model: Any,
+    tokenizer: Any,
+    eval_texts: Optional[List[str]] = None,
+    only_with_engram: bool = False,
+) -> Dict[str, float]:
     """Compute held-out CE Loss, Perplexity & Next-Token Accuracy for `72L_NoEngram` vs `72L_Full_Engram`."""
     was_training = model.training
     prev_ckpt = bool(getattr(model, "enable_checkpoint", False))
@@ -1874,12 +1895,14 @@ def evaluate_engram_perplexity_delta(model: Any, tokenizer: Any) -> Dict[str, fl
     model.enable_checkpoint = False
     model.settings.checkpoint_layers = False
     device = next(model.base.parameters()).device
+    texts_to_use = eval_texts if eval_texts else _HELD_OUT_EVAL_TEXTS
 
     out_stats: Dict[str, float] = {}
-    for tag, use_eng in [("no_engram", False), ("with_engram", True)]:
+    modes = [("with_engram", True)] if only_with_engram else [("no_engram", False), ("with_engram", True)]
+    for tag, use_eng in modes:
         model.set_loop(start=4, end=28, passes=2, use_mhc=True, use_engram=use_eng, enable_p3=True, p3_start=12, p3_end=24)
         total_nll, total_toks, total_correct = 0.0, 0, 0
-        for txt in _HELD_OUT_EVAL_TEXTS:
+        for txt in texts_to_use:
             ids = tokenizer(txt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
             logits = model.forward_logits(ids).float()
             shift_logits = logits[:, :-1, :].contiguous()
@@ -1896,8 +1919,9 @@ def evaluate_engram_perplexity_delta(model: Any, tokenizer: Any) -> Dict[str, fl
         out_stats[f"{tag}_ppl"] = ppl
         out_stats[f"{tag}_acc"] = acc
 
-    out_stats["delta_ce"] = out_stats["with_engram_ce"] - out_stats["no_engram_ce"]
-    out_stats["delta_ppl"] = out_stats["with_engram_ppl"] - out_stats["no_engram_ppl"]
+    if not only_with_engram:
+        out_stats["delta_ce"] = out_stats["with_engram_ce"] - out_stats["no_engram_ce"]
+        out_stats["delta_ppl"] = out_stats["with_engram_ppl"] - out_stats["no_engram_ppl"]
     model.set_loop(start=4, end=28, passes=2, use_mhc=True, use_engram=True, enable_p3=True, p3_start=12, p3_end=24)
     model.enable_checkpoint = prev_ckpt
     model.settings.checkpoint_layers = prev_ckpt
@@ -4145,12 +4169,22 @@ def diagnose_loop_and_engram_health(
     # 2. Per-pass logit-lens CE & inter-pass KL at exit of loop core (L27 / L23) and Coda (L35)
     sample_pair = encode_spark_chat_pair(
         tokenizer,
-        user_prompt="Prove that the eigenvalues of a real symmetric matrix are real and its eigenvectors for distinct eigenvalues are orthogonal.",
-        answer_text="Let A = A^T and Av = lambda v. Taking the conjugate transpose and inner product yields (lambda - conj(lambda)) ||v||^2 = 0, so lambda is real.",
-        think_text="Use the Hermitian inner product v^* A v and symmetry A^T = A.",
-        max_length=256,
+        user_text="Prove that the eigenvalues of a real symmetric matrix are real and its eigenvectors for distinct eigenvalues are orthogonal.",
+        assistant_text=(
+            "<think>\nUse the Hermitian inner product v^* A v and symmetry A^T = A.\n</think>\n"
+            "Let A = A^T and Av = lambda v. Taking the conjugate transpose and inner product yields (lambda - conj(lambda)) ||v||^2 = 0, so lambda is real."
+        ),
+        max_seq_len=256,
     )
-    probe_ids = torch.tensor([sample_pair["full_ids"]], dtype=torch.long, device=device)
+    if sample_pair is not None:
+        probe_ids = sample_pair[0].to(device=device, dtype=torch.long)
+    else:
+        probe_ids = tokenizer(
+            "Prove that the eigenvalues of a real symmetric matrix are real and its eigenvectors for distinct eigenvalues are orthogonal.",
+            return_tensors="pt",
+            truncation=True,
+            max_length=256,
+        )["input_ids"].to(device=device, dtype=torch.long)
     all_visits = model.capture_residuals(probe_ids, layers=[23, 27, 35], return_all_visits=True)
     norm_fn = model.base.model.norm
     head_w = model._head_weight()
@@ -4187,15 +4221,20 @@ def diagnose_loop_and_engram_health(
     harmful_anchors: List[int] = []
     for l_idx, mod in model.iter_engram_anchors():
         saved_scale = getattr(mod, "decode_engram_scale", 0.25)
-        saved_gain = float(mod.engram_gain.detach().item())
+        saved_gain = float(mod.gain.detach().item())
+        saved_override = getattr(mod, "_gate_override_tensor", None)
         try:
             mod.decode_engram_scale = 0.0
-            mod.engram_gain.fill_(-30.0)
-            without_l = evaluate_engram_perplexity_delta(model, tokenizer, eval_texts=eval_texts)
+            mod.gain.fill_(-30.0)
+            mod._gate_override_tensor = torch.tensor(0.0, device=mod.gain.device, dtype=torch.float32)
+            without_l = evaluate_engram_perplexity_delta(
+                model, tokenizer, eval_texts=eval_texts, only_with_engram=True
+            )
             ppl_without_l = float(without_l["with_engram_ppl"])
         finally:
             mod.decode_engram_scale = saved_scale
-            mod.engram_gain.fill_(saved_gain)
+            mod.gain.fill_(saved_gain)
+            mod._gate_override_tensor = saved_override
         # Positive delta means including anchor l_idx WORSENED (increased) PPL relative to dropping it
         anchor_contrib_delta = full_eng_ppl - ppl_without_l
         anchor_ablations[f"L{l_idx}"] = {
@@ -4249,17 +4288,22 @@ def repair_harmful_engram_anchors(
             break
         if impact > 0.0 or cur_ppl > no_eng_ppl + float(ppl_tolerance):
             saved_scale = getattr(mod, "decode_engram_scale", 0.25)
-            saved_gain = float(mod.engram_gain.detach().item())
+            saved_gain = float(mod.gain.detach().item())
+            saved_override = getattr(mod, "_gate_override_tensor", None)
             mod.decode_engram_scale = 0.0
-            mod.engram_gain.fill_(-30.0)
-            chk = evaluate_engram_perplexity_delta(model, tokenizer, eval_texts=eval_texts)
+            mod.gain.fill_(-30.0)
+            mod._gate_override_tensor = torch.tensor(0.0, device=mod.gain.device, dtype=torch.float32)
+            chk = evaluate_engram_perplexity_delta(
+                model, tokenizer, eval_texts=eval_texts, only_with_engram=True
+            )
             cand_ppl = float(chk["with_engram_ppl"])
             if cand_ppl <= cur_ppl:
                 cur_ppl = cand_ppl
                 zeroed_anchors.append(int(l_idx))
             else:
                 mod.decode_engram_scale = saved_scale
-                mod.engram_gain.fill_(saved_gain)
+                mod.gain.fill_(saved_gain)
+                mod._gate_override_tensor = saved_override
 
     gl2_passed = bool(cur_ppl <= no_eng_ppl + float(ppl_tolerance) + 1e-4)
     print(

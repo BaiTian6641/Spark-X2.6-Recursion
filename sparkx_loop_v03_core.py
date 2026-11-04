@@ -1881,6 +1881,10 @@ class ZipfianTieredMoEEngram(nn.Module):
                 gate = gate * float(getattr(self, 'decode_engram_scale', 0.25))
         return projected.to(dtype) * gate
 
+    @property
+    def engram_gain(self) -> torch.Tensor:
+        return self.gain
+
     @torch.no_grad()
     def reset_alphaedit_basis(self) -> None:
         """Reset the per-expert AlphaEdit active subspace basis and historical activation tracker."""
@@ -1986,7 +1990,8 @@ class ZipfianTieredMoEEngram(nn.Module):
         for cl in clusters:
             raw_key_h = cl.get("query_hidden") if (use_query_key and "query_hidden" in cl) else cl["cluster_hidden"]
             h_b = raw_key_h.to(device=device, dtype=param_dtype).view(1, 1, self.width)
-            y_b = cl["target_residual"].to(device=device, dtype=torch.float32).view(self.width)
+            raw_y = cl.get("target_residual") if "target_residual" in cl else cl["value_residual"]
+            y_b = raw_y.to(device=device, dtype=torch.float32).view(self.width)
             trig_pos = int(cl.get("trigger_pos", 0))
 
             h_norm = triton_rmsnorm(h_b, self.norm_weight, self.norm_eps)
@@ -2005,8 +2010,8 @@ class ZipfianTieredMoEEngram(nn.Module):
                         b_id = int(idx_t.item())
                         if 0 <= b_id < self.hot_buckets:
                             row = b_id * 3 + scale_i
-                            self.tier1a_hot_weight.data[row].lerp_(
-                                q_cue.to(self.tier1a_hot_weight.dtype), float(lexical_strength)
+                            self.tier1a_hot.weight.data[row].lerp_(
+                                q_cue.to(self.tier1a_hot.weight.dtype), float(lexical_strength)
                             )
                 e_lex = self._lookup_tier1_lexical(sub_ng, device, param_dtype)
             else:
