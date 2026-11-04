@@ -43,7 +43,7 @@ H1 and H4 are the leading explanations given S4–S6; none is proven.
 
 **Caveat:** the starting weights are already overfit (S6); recovery may be slower than training from reset. A fresh-start arm costs another multi-hour run and is not planned unless the long run shows H1 is partially true.
 
-### 3b. Live Mid-Run Telemetry (2026-11-04, Steps `0 → 355 / 743`, `41.0M` unique tokens, `9.18h` elapsed)
+### 3b. Live Mid-Run Telemetry (2026-11-04, Steps `0 → 535 / 743`, `62.2M` unique tokens, `13.83h` elapsed)
 
 Evaluated on the frozen 55-doc (`60,059` supervised tokens) doc-hash held-out split (`sha1(prompt)%25==0`, never trained on):
 
@@ -58,16 +58,22 @@ Evaluated on the frozen 55-doc (`60,059` supervised tokens) doc-hash held-out sp
 | **240** | `27.8M` | `0.5729` | `0.6382` | `-0.0653` | `-0.2061` | — |
 | **280** | `32.4M` | `0.5668` | `0.6386` | `-0.0718` | `-0.2122` | — |
 | **320** (**Best**) | `37.1M` | **`0.5611`** | `0.6408` | **`-0.0797`** | **`-0.2179`** | `L3:+0.0126, L7:+0.0059, L11:+0.0164, L15:+0.0112, L19:+0.0127, L23:+0.0068, L27:+0.0114,` **`L31:+0.0161`** (**0/8 harmful!**) |
+| **360** | `41.6M` | `0.5731` | `0.6420` | `-0.0689` | `-0.2058` | — |
+| **400** | `46.2M` | `0.5835` | `0.6416` | `-0.0582` | `-0.1955` | — |
+| **440** | `50.9M` | `0.5747` | `0.6428` | `-0.0681` | `-0.2043` | — |
+| **480** | `55.7M` | `0.5785` | `0.6495` | `-0.0710` | `-0.2004` | `L3:+0.0151, L7:+0.0070, L11:+0.0184, L15:+0.0123, L19:+0.0159, L23:+0.0079, L27:+0.0192,` **`L31:+0.0046`** (**0/8 harmful, 2nd consecutive audit!**) |
+| **520** | `60.4M` | `0.5845` | `0.6489` | `-0.0644` | `-0.1944` | — |
 
-**Honest reading at Step 355 (`41.0M` tokens, ~48% of run):**
-1. **`H1` (data starvation) & `H2` (`L31` recovery) strongly supported on held-out in-distribution trajectories**:
-   - Replacing 3.9-epoch repetition on 5M tokens with zero-epoch streaming over `37.1M` unique tokens drove held-out `CE_on` from `0.7790 -> 0.5611` (`-0.2179` nats) and widened `CE_on - CE_off` from `-0.0106` to **`-0.0797` nats**.
-   - At Step 160 (`18.6M` tokens), `L31` was still the lone harmful anchor (`-0.0099`); by Step 320 (`37.1M` tokens), **`L31` flipped to `+0.0161`**, making **all 8 anchors `{3,7,11,15,19,23,27,31}` net-helpful (`0/8` harmful)** on the 55-doc held-out set.
-   - At Step 320, all 7 pillars show `CE_on < CE_off` (`web_3d_ui: 0.406/0.556 [-0.150]`, `fable_opus_astra_cot: 0.617/0.719 [-0.102]`, `science_knowledge_engram: 0.798/0.881 [-0.083]`, `code_swe: 0.555/0.625 [-0.070]`, `math_stem: 0.430/0.463 [-0.033]`, `tool_agent: 0.202/0.210 [-0.008]`, `literacy_dialogue: 1.623/1.628 [-0.005]`).
-2. **Co-adaptation caveat (`CE_off` drift)**:
-   - Between Step 40 and Step 320, `CE_off` drifted slightly upward (`0.6239 -> 0.6408`, `+0.0169` nats) because the 24 `TwoStreamMHC` controllers are trained exclusively with `use_engram=True` and co-adapt to expect the Engram residuals. Even against the **best-ever `CE_off` (`0.6239` at Step 40)**, `CE_on` at Step 320 (`0.5611`) is **`-0.0628` nats lower**.
-3. **What remains unverified until post-run Cell 4 / Cell 6 (`BIE`)**:
-   - `val_frozen` tests doc-hash held-out generalization across the 7 training pillars, whereas `S1` (`OFF 1.5090 -> FULL 1.5750`) was measured on **out-of-distribution raw prose** (`TRUE_HELDOUT_TEXTS` without chat templates). Post-run Cell 4 & Cell 6 (`BIE`) will test whether `L31`'s recovery also resolves `S1` on raw prose or whether out-of-distribution prose still requires `BIE-3` selective gating (`wise_scope_gated` / `deepseek_qk_gated`).
+**Honest reading at Step 535 (`62.2M` tokens, ~72% of run):**
+1. **`H1` (data starvation) & `H2` (no harmful anchors) confirmed across two consecutive audits (Steps 320 & 480)**:
+   - Replacing 3.9-epoch repetition on 5M tokens with zero-epoch streaming drove held-out `CE_on` from `0.7790 -> 0.5611` (`-0.2179` nats at Step 320) and widened `CE_on - CE_off` from `-0.0106` to **`-0.0797` nats** (`-0.0710` at Step 480).
+   - Both the Step 320 and Step 480 leave-one-anchor-out audits show **0/8 harmful anchors**: every single anchor `{3,7,11,15,19,23,27,31}` has a positive removal delta (`+0.0046..+0.0192` at Step 480, with `L3..L27` reaching their strongest positive contributions at Step 480: `L27:+0.0192`, `L11:+0.0184`, `L19:+0.0159`, `L3:+0.0151`).
+2. **Plateau & Automatic Rollback Guard (`Step 320 -> 520`)**:
+   - Between Step 360 and Step 520 (`no_improve = 1..5`), `CE_on` oscillated in `0.5731..0.5845` while `tool_agent` reached a new best (`0.199@440`, `0.200@480`) and `literacy_dialogue` fluctuated (`1.623 -> 1.704`).
+   - With `LONGRUN_PATIENCE_EVALS = 6`, if Step 560 does not beat `0.5601`, `decide_after_eval` automatically triggers `action=rollback`, restoring the `best@320` (`0.5611`) checkpoint from disk and halving the learning rate (`LR x0.5`) for the final ~183 steps; and at run completion (`Step 743`), `run_long_training` unconditionally restores `ckpt/best`.
+3. **Co-adaptation caveat (`CE_off` drift) & Post-Run OOD Check**:
+   - `CE_off` drifted slightly (`0.6239@40 -> 0.6489@520`) as the 24 `TwoStreamMHC` controllers co-adapted with `use_engram=True`; even against the minimum `CE_off` (`0.6239`), `best@320` (`0.5611`) is **`-0.0628` nats lower**.
+   - Post-run Cell 4 & Cell 6 (`BIE`) will test whether `best@320` (or the post-rollback checkpoint) also resolves `S1` on out-of-distribution raw prose (`TRUE_HELDOUT_TEXTS`) or requires `BIE-3` selective gating (`wise_scope_gated` / `deepseek_qk_gated`).
 
 ---
 

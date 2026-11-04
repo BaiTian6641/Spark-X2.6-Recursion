@@ -418,6 +418,14 @@ class HubSync:
                                  commit_message=msg)
             return True
         except Exception as exc:
+            if "403" in str(exc) or "storage" in str(exc).lower():
+                self.squash()
+                try:
+                    self.api.upload_file(path_or_fileobj=str(local), path_in_repo=path_in_repo, repo_id=self.repo_id,
+                                         commit_message=msg)
+                    return True
+                except Exception:
+                    pass
             print(f"[HubSync] upload_file failed {path_in_repo}: {str(exc)[:120]}", flush=True)
             return False
 
@@ -429,6 +437,14 @@ class HubSync:
                                    commit_message=msg)
             return True
         except Exception as exc:
+            if "403" in str(exc) or "storage" in str(exc).lower():
+                self.squash()
+                try:
+                    self.api.upload_folder(folder_path=str(folder), path_in_repo=path_in_repo, repo_id=self.repo_id,
+                                           commit_message=msg)
+                    return True
+                except Exception:
+                    pass
             print(f"[HubSync] upload_folder failed {path_in_repo}: {str(exc)[:120]}", flush=True)
             return False
 
