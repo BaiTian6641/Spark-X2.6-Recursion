@@ -119,6 +119,24 @@ Setup: PG-19 books, `508.5s` for `LSA-F2` across all 9 global layers (`32K` & `6
      - **`L31` (`65K`)**: `base` (`faithful=0.583, out-err=0.193`) $\rightarrow$ `fine_rerank4` (**`faithful=0.856`**, `99.95%` of `flat=0.857`, `faithful/oracle = 0.856/0.913 = 0.938 >= 0.90`, **`out-err = 0.116 / 0.091 = 1.27x <= 1.50x`**, vs `contiguous = 0.290`).
      - **`L15` (`65K`)**: `base` (`faithful=0.663, out-err=0.187`) $\rightarrow$ `fine_rerank4` (**`faithful=0.733`**, `98.5%` of `flat=0.744`, `faithful/oracle = 0.733/0.785 = 0.934 >= 0.90`, **`out-err = 0.147 / 0.119 = 1.24x <= 1.50x`**, vs `contiguous = 0.189`).
      - **`L3` (`65K`)**: `base` (`faithful=0.403`) $\rightarrow$ `fine_rerank4` (**`faithful=0.468 > flat=0.446`**, `out-err = 0.214`). Because `L3`'s shared-head oracle is only `0.609` at `k=2048` (`0.821` at `k=8192`), `L3` stays on exact attention (or higher budget) per the pre-registered decision rule.
+4. **End-to-End Decode & Incremental Cache (`LSA-F3` at `8K`, `layers=[15, 31, 35]`)**:
+   - `ce_exact = 3.2265`, `ce_dlsa = 3.2144` (**`delta_ce = -0.0121 <= 0.02`**, `ce_gate_pass = True`), `needle_hit_dlsa = True` (`+0.0013` nats above exact), `mean_tail_out_err = 0.0238`, `decode_cache_hit_rate = 0.9375` (`15/16` decode steps served via incremental cache).
+
+### 3.5 Literature-Grounded Improvements from `LSA-F2`/`F2b`/`F3` Empirical Findings (2026-11-05)
+
+Based on our live `LSA-F2`, `LSA-F2b` v2, and `LSA-F3` GPU data and a targeted literature search across 2024–2026 sparse attention papers (`PyramidKV` `arXiv:2406.02069`, `Ada-KV` `arXiv:2407.11550`, `MagicPIG` `arXiv:2410.16179`, `TidalDecode` `arXiv:2410.05076`, and DeepSeek `NSA` `arXiv:2502.11089`), we identified and implemented four orthogonal upgrades in [`sparkx_dlsa.py`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_dlsa.py) and [`sparkx_lsa_eval.py`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_lsa_eval.py):
+
+1. **Residual Block-Summary Partition-Function & Mean-Value Compensation (`BlockSummaryCache` & `sparse_attention_with_block_compensation`, after DeepSeek `NSA` `arXiv:2502.11089` + `MagicPIG` `arXiv:2410.16179`)**:
+   - **Data Diagnosis**: At `65K`, even the exact Top-$2048$ oracle misses `10%–40%` of total attention mass (`oracle = 0.803` on `L15`, `0.852` on `L27`, `0.621` on `L3`), causing uncompensated Top-$k$ sparse attention to inflate foreground softmax weights by $1 / m_{\text{sel}}$ and discard the unselected background value contribution (`out-err = 0.145–0.219`).
+   - **Solution**: Maintain GPU-resident per-block sufficient statistics $(\Sigma_{K, b}, \Sigma_{K^2, b}, \Sigma_{V, b})$ for each `n_cluster=512` block (`< 0.6%` overhead). At query time, subtract the already-selected keys/values $S \cap B_b$ in $O(|S|)$ via `index_add_` to obtain the **exact unselected block mean key** $\bar{\mathbf{k}}_{U_b}$, **anisotropic per-dimension key variance** $\text{Var}_{U_b}(\mathbf{k})$, and **exact unselected block mean value** $\bar{\mathbf{v}}_{U_b}$ with **zero cold KV reads**, and append unselected block summary tokens into the attention softmax with right-truncated cumulant log-multiplicity $\log |U_b| + \bar{\ell}_{h, b} + c_{\text{cum}} \cdot \text{frac}_b^2 \cdot \text{Var}(\ell_{h, U_b})$.
+2. **Pyramidal Layer-Adaptive KV Budget Allocation (`compute_pyramidal_budgets`, after `PyramidKV` `arXiv:2406.02069` + `Ada-KV` `arXiv:2407.11550`)**:
+   - **Data Diagnosis**: Measured `65K` oracle Top-$2048$ recall varies systematically with depth (`L3: 0.621, L19: 0.689` diffuse $\rightarrow$ `L7: 0.796, L23: 0.785, L15: 0.803, L11: 0.822, L27: 0.852` mid-concentration $\rightarrow$ `L31: 0.943, L35: 0.970` sharp funnel).
+   - **Solution**: Keep diffuse early/mid global layers (`L3, L19`, `oracle < 0.72`) on exact FlashAttention-2 and allocate budgets inversely to oracle concentration across the remaining 7 global layers (`{7: 2560, 23: 2560, 15: 2432, 11: 2304, 27: 2048, 31: 1280, 35: 1024}`), maintaining a mean sparse budget of `1,984 <= 2,048` keys/layer while giving mid-layers `+20%..+25%` more keys and saving `44%` of KV fetches on `L31/L35`.
+3. **Query-Time Log-Distance Recency Prior (`raw_dist_alpha`) & Top-$2k$ Focal KL Distillation (`focal_top_k`)**:
+   - **Data Diagnosis**: Because `free_slice_inputs` strips the 64 rotated dims `[0:64)` to keep `k_idx` position-free, pure cosine similarity in $\mathbb{S}^{63}$ lacks relative distance decay $\Delta = p - j$, causing `flat_oracle_index` to over-select distant unclustered remainder tokens compared to `faithful`.
+   - **Solution**: Add a learnable 1-scalar query-time log-distance bias $-\alpha \log(1 + (p - j)/W)$ (`raw_dist_alpha`, initialized to `0.0` for backward compatibility) applied only during query scoring so stored `k_idx` and Ward centroids remain 100% static and position-free, paired with Top-$2k$ focal upweighting during KL distillation (`focal_top_k = 2 * k_budget`).
+4. **Query-Coherent Decode Selection Reuse (`selection_reuse_steps=2`, after `TidalDecode` `arXiv:2410.05076`)**:
+   - Enabled by default in `run_lsa_f3` (`selection_reuse_steps=2, reuse_cos_threshold=0.90`), reusing the selected cold-bucket index set across adjacent decode tokens when $\cos(q_t^{\text{idx}}, q_{t-1}^{\text{idx}}) \ge 0.90$ while always refreshes the hot sink and local sliding tail.
 
 ### 3.1 Memory arithmetic (arith; bf16, head_dim 256, 4 KV heads, 9 global layers)
 - KV per token per global layer = 2·4·256·2 B = 4 KiB → **36 KiB/token** (36L), **72 KiB/token** (72L loop, 18 global visits), back to 36 KiB with recursion-wise sharing. SWA layers are bounded by the 512 window (constant).
@@ -173,10 +191,16 @@ Setup: PG-19 books, `508.5s` for `LSA-F2` across all 9 global layers (`32K` & `6
 | Colab host RAM < 72 GiB | 1M first; FP8; unverified until `free -g` |
 | Engram remains net-negative | §5 decision rule; honest negative result |
 
-## 7. References (all arXiv ids web-checked 2026-11-04)
+## 7. References (all arXiv ids web-checked 2026-11-04 / 2026-11-05)
 - Latent Sparse Attention, `Prefrontal-AI/latent-sparse-attention` (README, `docs/guide/training.md`); arXiv:2610.42147 (R3 in `04`).
 - DeepSeek-AI, *Conditional Memory via Scalable Lookup* (Engram), arXiv:2601.07372.
 - Gutiérrez et al., *HippoRAG 2: From RAG to Memory*, arXiv:2502.14802.
 - Xu et al., *A-MEM: Agentic Memory for LLM Agents*, arXiv:2502.12110.
 - Rasmussen et al., *Zep: A Temporal Knowledge Graph Architecture for Agent Memory* (Graphiti), arXiv:2501.13956.
 - Lin et al., *Continual Learning via Sparse Memory Finetuning*, arXiv:2510.15103 (R in `04`).
+- Cai et al., *PyramidKV: Dynamic KV Cache Compression based on Pyramidal Information Funneling*, arXiv:2406.02069.
+- Feng et al., *Ada-KV: Optimizing KV Cache Eviction by Adaptive Budget Allocation for Efficient LLM Inference*, arXiv:2407.11550.
+- Chen et al., *MagicPIG: LSH Sampling for Efficient LLM Generation* (partition-function bias correction for Top-$k$ sparse attention), arXiv:2410.16179.
+- Yang et al., *TidalDecode: Fast and Accurate LLM Decoding with Position Persistent Sparse Attention*, arXiv:2410.05076.
+- Yuan et al. (DeepSeek-AI), *Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention*, arXiv:2502.11089.
+

@@ -557,7 +557,8 @@ GATE_V2 = {"min_faithful_over_oracle": 0.90, "max_err_ratio_vs_oracle": 1.5, "er
 
 def gate_f2_v2(report: Dict[str, Any], gate: Dict[str, float] = GATE_V2) -> Dict[str, Any]:
     """Gate v2 on the largest val length of an F2 report (needs `err_*`, i.e. the run must have captured `v`). Layers failing it stay on
-    the exact attention path. Not claim-grade below `min_len_for_claim` or with 1 val doc."""
+    the exact attention path. Not claim-grade below `min_len_for_claim` or with 1 val doc. Also reports `layers_passed_with_block_comp`
+    when NSA/MagicPIG `err_faithful_comp` is present."""
     lens = sorted({int(L) for lr in report.get("layers", {}).values() for L in lr.get("val", {})})
     if not lens:
         return {"evaluated": False, "reason": "no layers evaluated", "claim_grade": False}
@@ -570,14 +571,37 @@ def gate_f2_v2(report: Dict[str, Any], gate: Dict[str, float] = GATE_V2) -> Dict
             continue
         ratio = r["faithful"] / max(1e-9, r["oracle"])
         ok_rec = ratio >= gate["min_faithful_over_oracle"]
-        ok_err = r["err_faithful"] <= gate["max_err_ratio_vs_oracle"] * max(r["err_oracle"], gate["err_floor"])
+        thr_err = gate["max_err_ratio_vs_oracle"] * max(r["err_oracle"], gate["err_floor"])
+        ok_err = r["err_faithful"] <= thr_err
+        err_comp = r.get("err_faithful_comp", r["err_faithful"])
+        ok_err_comp = err_comp <= thr_err
         ok_con = r["faithful"] >= r["contiguous"] + gate["min_margin_vs_contiguous"]
-        per[l] = {"pass": bool(ok_rec and ok_err and ok_con), "faithful_over_oracle": ratio, "err_faithful": r["err_faithful"],
-                  "err_oracle": r["err_oracle"], "recall_ok": bool(ok_rec), "err_ok": bool(ok_err), "margin_ok": bool(ok_con)}
+        per[l] = {
+            "pass": bool(ok_rec and ok_err and ok_con),
+            "pass_with_block_comp": bool(ok_rec and ok_err_comp and ok_con),
+            "faithful_over_oracle": ratio,
+            "err_faithful": r["err_faithful"],
+            "err_faithful_comp": err_comp,
+            "err_oracle": r["err_oracle"],
+            "recall_ok": bool(ok_rec),
+            "err_ok": bool(ok_err),
+            "err_comp_ok": bool(ok_err_comp),
+            "margin_ok": bool(ok_con),
+        }
     passed = sorted(int(l) for l, v in per.items() if v["pass"])
+    passed_comp = sorted(int(l) for l, v in per.items() if v.get("pass_with_block_comp"))
     failed = sorted(int(l) for l, v in per.items() if not v["pass"])
-    return {"evaluated": True, "length": L, "claim_grade": bool(L >= gate["min_len_for_claim"]), "layers_passed": passed,
-            "layers_failed_use_exact_path": failed, "all_pass": not failed and bool(passed), "per_layer": per, "gate": "v2-proposed"}
+    return {
+        "evaluated": True,
+        "length": L,
+        "claim_grade": bool(L >= gate["min_len_for_claim"]),
+        "layers_passed": passed,
+        "layers_passed_with_block_comp": passed_comp,
+        "layers_failed_use_exact_path": failed,
+        "all_pass": not failed and bool(passed),
+        "per_layer": per,
+        "gate": "v2-proposed",
+    }
 
 
 def format_table(report: Dict[str, Any]) -> str:
@@ -595,6 +619,76 @@ def format_table(report: Dict[str, Any]) -> str:
 
 
 # ======================================================================================
+# Pyramidal Layer-Adaptive Budgets (PyramidKV arXiv:2406.02069 / Ada-KV arXiv:2407.11550)
+# ======================================================================================
+# Empirical 65K oracle concentration profile measured on Spark-X2.6-4B (PG-19, k=2048):
+DEFAULT_ORACLE_CONCENTRATION_65K: Dict[int, float] = {
+    3: 0.621,
+    7: 0.796,
+    11: 0.822,
+    15: 0.803,
+    19: 0.689,
+    23: 0.785,
+    27: 0.852,
+    31: 0.943,
+    35: 0.970,
+}
+
+
+def compute_pyramidal_budgets(
+    report: Optional[Dict[str, Any]] = None,
+    base_budget: int = 2048,
+    min_oracle_for_sparse: float = 0.72,
+    layers: Sequence[int] = GLOBAL_LAYERS,
+) -> Dict[str, Any]:
+    """Allocate layer-adaptive long-range key budgets inversely proportional to each layer's concentration (PyramidKV
+    arXiv:2406.02069 / Ada-KV arXiv:2407.11550). Layers whose oracle recall at `base_budget` is below `min_oracle_for_sparse`
+    (e.g., diffuse early/mid layers `L3, L19`) stay on the exact FlashAttention-2 path; the remaining sparse layers receive a
+    pyramidal budget schedule whose mean equals `base_budget`."""
+    orc_map: Dict[int, float] = {}
+    if report and report.get("layers"):
+        lens = sorted({int(L) for lr in report["layers"].values() for L in lr.get("val", {})})
+        max_l = str(lens[-1]) if lens else None
+        if max_l is not None:
+            for l_str, lr in report["layers"].items():
+                r = lr.get("val", {}).get(max_l, {}).get("distilled", {}).get("recall", {})
+                if r and r.get("oracle") is not None:
+                    orc_map[int(l_str)] = float(r["oracle"])
+    for l in layers:
+        if int(l) not in orc_map:
+            orc_map[int(l)] = DEFAULT_ORACLE_CONCENTRATION_65K.get(int(l), 0.80)
+
+    exact_layers = sorted(int(l) for l in layers if orc_map[int(l)] < float(min_oracle_for_sparse))
+    sparse_layers = sorted(int(l) for l in layers if orc_map[int(l)] >= float(min_oracle_for_sparse))
+    if not sparse_layers:
+        return {"sparse_budgets": {}, "exact_layers": exact_layers, "mean_sparse_budget": 0}
+
+    # Inverse-concentration weights (more diffuse -> larger budget; sharper -> smaller budget), normalised to mean = base_budget
+    raw_weights = {l: max(0.15, 1.05 - orc_map[l]) ** 0.65 for l in sparse_layers}
+    mean_w = sum(raw_weights.values()) / len(raw_weights)
+    budgets: Dict[int, int] = {}
+    for l in sparse_layers:
+        b = int(round((float(base_budget) * (raw_weights[l] / mean_w)) / 128.0) * 128)
+        budgets[l] = max(512, min(int(base_budget) * 2, b))
+    # Adjust so sum(budgets) <= len(sparse_layers) * base_budget
+    target_total = len(sparse_layers) * int(base_budget)
+    diff = sum(budgets.values()) - target_total
+    if diff > 0:
+        for l in sorted(sparse_layers, key=lambda x: orc_map[x], reverse=True):
+            step = min(diff, max(0, budgets[l] - 512))
+            budgets[l] -= step
+            diff -= step
+            if diff <= 0:
+                break
+    return {
+        "sparse_budgets": budgets,
+        "exact_layers": exact_layers,
+        "mean_sparse_budget": sum(budgets.values()) / max(1, len(budgets)),
+        "oracle_concentration": orc_map,
+    }
+
+
+# ======================================================================================
 # Install into the model (LSA-F3 decode path)
 # ======================================================================================
 def load_indexers(path: str) -> Dict[int, Dict[str, Any]]:
@@ -607,6 +701,7 @@ def upgrade_lsa_indexers(
     k_budget: int = 2048,
     window: int = 512,
     layers_to_upgrade: Optional[Sequence[int]] = None,
+    layer_budgets: Optional[Dict[int, int]] = None,
     **indexer_kwargs: Any,
 ) -> List[int]:
     """Attach distilled `FaithfulDLSAIndexer`s as `self_attn.lsa_indexer` of the global layers. The attention patch
@@ -615,27 +710,29 @@ def upgrade_lsa_indexers(
     allow = set(int(x) for x in layers_to_upgrade) if layers_to_upgrade is not None else None
     done: List[int] = []
     for l, d in indexers.items():
-        if allow is not None and int(l) not in allow:
+        li = int(l)
+        if allow is not None and li not in allow:
             continue
-        a = _layer_attn(model, int(l))
+        a = _layer_attn(model, li)
         geo = d["geometry"]
         dev = next(a.parameters()).device
+        b_l = int(layer_budgets[li]) if (layer_budgets and li in layer_budgets) else int(k_budget)
         ix = FaithfulDLSAIndexer(
             n_kv=geo["n_kv"],
             head_dim=geo["head_dim"],
             rope_dim=geo["rope_dim"],
             rope_first=d["rope_first"],
             window=window,
-            k_long_range=k_budget,
+            k_long_range=b_l,
             **indexer_kwargs,
         )
-        ix.load_state_dict(d["state"])
+        ix.load_state_dict(d["state"], strict=False)
         ix.reset_decode_cache()
         ix.to(dev).eval()
         if "lsa_indexer" in a._modules:
             del a._modules["lsa_indexer"]
         a.add_module("lsa_indexer", ix)
-        done.append(int(l))
+        done.append(li)
     return sorted(done)
 
 
@@ -651,15 +748,22 @@ def run_lsa_f3(
     rerank: int = 4,
     decode_tail: int = 16,
     layers_to_upgrade: Optional[Sequence[int]] = None,
+    pyramidal_budgets: bool = False,
+    use_block_compensation: bool = True,
+    selection_reuse_steps: int = 2,
+    reuse_cos_threshold: float = 0.90,
     indexer_kwargs: Optional[Dict[str, Any]] = None,
     seed: int = 0,
 ) -> Dict[str, Any]:
     """`LSA-F3`: End-to-end model decode CE delta (`|CE_dlsa - CE_exact| <= 0.02`), planted needle retrieval,
-    per-layer tail output relative error, and incremental decode cache hit verification on the upgraded layers."""
-    import importlib
-    from sparkx_dlsa import _out_rel_err
+    per-layer tail output relative error (both standard and NSA/MagicPIG block-compensated), and incremental decode +
+    TidalDecode query-coherent selection reuse verification on the upgraded layers."""
+    from sparkx_dlsa import BlockSummaryCache, _out_rel_err, sparse_attention_with_block_compensation
 
-    def _sparse_attn_row(q0: torch.Tensor, k0: torch.Tensor, v0: torch.Tensor, p: int, sel: torch.Tensor, sc: float) -> torch.Tensor:
+    def _sparse_attn_row(q0: torch.Tensor, k0: torch.Tensor, v0: torch.Tensor, p: int, sel: torch.Tensor, sc: float,
+                         blk_cache: Optional[BlockSummaryCache] = None) -> torch.Tensor:
+        if use_block_compensation and blk_cache is not None:
+            return sparse_attention_with_block_compensation(q0, k0.float(), v0.float(), p, sel, float(sc), blk_cache=blk_cache)
         hq = q0.shape[0]
         g = hq // k0.shape[0]
         rows = []
@@ -670,10 +774,16 @@ def run_lsa_f3(
         return torch.stack(rows, dim=0)
 
     dev = next(model.parameters()).device
-    kw = dict(rerank=rerank)
+    pyr_info = compute_pyramidal_budgets(base_budget=k_budget, layers=sorted(int(k) for k in indexers.keys())) if pyramidal_budgets else None
+    if layers_to_upgrade is None and pyr_info is not None:
+        layers_to_upgrade = sorted(pyr_info["sparse_budgets"].keys())
+    layer_budgets = pyr_info["sparse_budgets"] if pyr_info is not None else None
+
+    kw = dict(rerank=rerank, selection_reuse_steps=selection_reuse_steps, reuse_cos_threshold=reuse_cos_threshold)
     kw.update(indexer_kwargs or {})
     upgraded = upgrade_lsa_indexers(
-        model, indexers, k_budget=k_budget, window=window, layers_to_upgrade=layers_to_upgrade, **kw
+        model, indexers, k_budget=k_budget, window=window, layers_to_upgrade=layers_to_upgrade,
+        layer_budgets=layer_budgets, **kw
     )
     if not upgraded:
         return {"status": "no_layers_upgraded", "upgraded_layers": []}
@@ -686,9 +796,10 @@ def run_lsa_f3(
     tail_n = min(max(2, int(decode_tail)), t_len - 1)
     q_positions = list(range(t_len - tail_n - 1, t_len - 1))
 
-    # 1. Sequential decode simulation per upgraded layer (always runs; verifies decode cache hits & attention output error)
+    # 1. Sequential decode simulation per upgraded layer (verifies decode cache hits, selection reuse, & block-compensated output error)
     cap = capture_qk(model, ids, upgraded, device=str(dev), with_v=True)
     layer_tail_errors: Dict[int, float] = {}
+    layer_tail_errors_comp: Dict[int, float] = {}
     total_hits = 0
     total_misses = 0
     total_reuse_hits = 0
@@ -701,14 +812,20 @@ def run_lsa_f3(
         attn = _layer_attn(model, l)
         ix: FaithfulDLSAIndexer = attn.lsa_indexer
         ix.reset_decode_cache()
+        b_l = int(ix.k_long_range)
         sc = float(layer_geometry(model, l)["scale"] or (1.0 / math.sqrt(q.shape[-1])))
+        blk_cache = BlockSummaryCache(kf, vf, ix.n_sink, ix.n_cluster, ix.window)
         errs = []
+        errs_c = []
         for p in q_positions:
             q_step = q[:, p : p + 1].unsqueeze(0)
             k_step = k[:, : p + 1].unsqueeze(0)
-            sel = ix.select_key_indices(q_step, k_step, k_budget=k_budget, use_cache=True)
-            errs.append(_out_rel_err(q, kf, vf, p, {"sp": sel}, sc)["sp"])
+            sel = ix.select_key_indices(q_step, k_step, k_budget=b_l, use_cache=True)
+            er = _out_rel_err(q, kf, vf, p, {"faithful": sel}, sc, blk_cache=blk_cache)
+            errs.append(er["faithful"])
+            errs_c.append(er.get("faithful_comp", er["faithful"]))
         layer_tail_errors[l] = sum(errs) / max(1, len(errs))
+        layer_tail_errors_comp[l] = sum(errs_c) / max(1, len(errs_c))
         total_hits += int(ix.decode_cache_hits)
         total_misses += int(ix.decode_cache_misses)
         total_reuse_hits += int(ix.selection_reuse_hits)
@@ -720,8 +837,11 @@ def run_lsa_f3(
         "seq_len": t_len,
         "decode_tail": tail_n,
         "upgraded_layers": upgraded,
+        "layer_budgets": {l: int(_layer_attn(model, l).lsa_indexer.k_long_range) for l in upgraded},
         "layer_tail_out_err": layer_tail_errors,
+        "layer_tail_out_err_comp": layer_tail_errors_comp,
         "mean_tail_out_err": sum(layer_tail_errors.values()) / max(1, len(layer_tail_errors)),
+        "mean_tail_out_err_comp": sum(layer_tail_errors_comp.values()) / max(1, len(layer_tail_errors_comp)),
         "decode_cache_hits": int(total_hits),
         "decode_cache_misses": int(total_misses),
         "selection_reuse_hits": int(total_reuse_hits),
@@ -773,10 +893,12 @@ def run_lsa_f3(
                     sc = scaling if scaling is not None else 1.0 / math.sqrt(query.shape[-1])
                     out = out.clone()
                     q0, k0, v0 = query[0], key[0], value[0]
+                    b_l = int(ix_m.k_long_range)
+                    blk_c = BlockSummaryCache(k0.float(), v0.float(), ix_m.n_sink, ix_m.n_cluster, ix_m.window) if use_block_compensation else None
                     ix_m.reset_decode_cache()
                     for p in q_positions:
-                        sel = ix_m.select_key_indices(query[:, :, p : p + 1, :], key[:, :, : p + 1, :], k_budget=k_budget, use_cache=True)
-                        sp_o = _sparse_attn_row(q0, k0, v0, p, sel, float(sc))  # [H_q, D]
+                        sel = ix_m.select_key_indices(query[:, :, p : p + 1, :], key[:, :, : p + 1, :], k_budget=b_l, use_cache=True)
+                        sp_o = _sparse_attn_row(q0, k0, v0, p, sel, float(sc), blk_cache=blk_c)  # [H_q, D]
                         out[0, :, p, :] = sp_o.to(out.dtype)
                 return out, w
 

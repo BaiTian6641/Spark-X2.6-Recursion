@@ -237,6 +237,25 @@ class TestDLSA(unittest.TestCase):
             _ = ix.select_key_indices(q_coherent, k[:, :t].unsqueeze(0), k_budget=32, use_cache=True)
         self.assertGreaterEqual(ix.selection_reuse_hits, 2)
 
+    def test_block_summary_compensation_and_focal_distill(self):
+        from sparkx_dlsa import BlockSummaryCache, sparse_attention_with_block_compensation
+        q, k, _, _ = make_scattered(t=512, seed=21)
+        g = torch.Generator().manual_seed(21)
+        v = torch.randn_like(k) + 0.5
+        ix = small_indexer(n_pool=4, n_cluster=64, window=32, k_long_range=32, rerank=2)
+        ix.fit_pca(ix.inputs(q, k)[1])
+        out = distill_indexer(ix, [{"q": q, "k": k}], steps=25, lr=5e-3, queries_per_sample=16, log_every=0,
+                              focal_top_k=32, focal_boost=1.0)
+        self.assertIn("dist_alpha", out)
+        r = evaluate_selectors(ix, q, k, [350, 450], budget=32, v=v)
+        self.assertIn("err_faithful_comp", r)
+        self.assertIsNotNone(r["err_faithful_comp"])
+        blk = BlockSummaryCache(k.float(), v.float(), n_sink=4, n_cluster=64, window=32)
+        o_comp = sparse_attention_with_block_compensation(
+            q, k.float(), v.float(), 450, torch.arange(0, 64), scale=1.0 / 8.0, blk_cache=blk
+        )
+        self.assertEqual(tuple(o_comp.shape), (q.shape[0], q.shape[2]))
+
 
 if __name__ == "__main__":
     unittest.main()

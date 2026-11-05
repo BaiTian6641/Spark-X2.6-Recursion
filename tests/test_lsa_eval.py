@@ -329,10 +329,17 @@ class TestLsaEval(unittest.TestCase):
             self.assertEqual(f3["decode_cache_hits"], 5)
             self.assertGreater(f3["mean_tail_out_err"], 0.0)
             self.assertLess(f3["mean_tail_out_err"], 2.0)
+            self.assertIn("mean_tail_out_err_comp", f3)
             self.assertIn("ce_exact", f3)
             self.assertIn("ce_dlsa", f3)
             self.assertIn("delta_ce", f3)
             self.assertIn("needle_nll_dlsa", f3)
+
+            pyr = le.compute_pyramidal_budgets(base_budget=2048)
+            self.assertEqual(pyr["exact_layers"], [3, 19])
+            self.assertEqual(sorted(pyr["sparse_budgets"].keys()), [7, 11, 15, 23, 27, 31, 35])
+            self.assertLessEqual(pyr["mean_sparse_budget"], 2048.0 + 1e-6)
+            self.assertGreater(pyr["sparse_budgets"][7], pyr["sparse_budgets"][35])
 
 
 if __name__ == "__main__":

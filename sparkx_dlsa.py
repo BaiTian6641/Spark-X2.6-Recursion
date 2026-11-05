@@ -252,12 +252,15 @@ class PagedLatentIndex:
                 "max_tokens": float(nz.max())}
 
     @torch.no_grad()
-    def select(self, q_idx: torch.Tensor, budget: int, upto: Optional[int] = None) -> torch.Tensor:
+    def select(self, q_idx: torch.Tensor, budget: int, upto: Optional[int] = None,
+               dist_alpha_over_tau: float = 0.0) -> torch.Tensor:
         """`q_idx`: [d] or [Tq, d] unit-norm (mean-pooled if 2-D). Returns sorted exact key positions (sink+selected+tail).
 
         `upto`: causal horizon for a query at position `upto - 1` (keys `>= upto` do not exist for it). Because Ward blocks are
         independent, restricting to the blocks that end before `upto - window` is identical to re-indexing `k[:upto]`; this lets
         one index serve every decode step (and grow incrementally as the cache grows).
+        `dist_alpha_over_tau`: optional query-time log-distance decay weight `alpha / tau >= 0` (leaves `k_idx` and Ward centroids
+        100% position-free and static while accounting for RoPE recency decay at query time).
         """
         dev = q_idx.device
         upto = self.t if upto is None else min(int(upto), self.t)
@@ -270,7 +273,13 @@ class PagedLatentIndex:
         q = F.normalize(q_idx.float().reshape(-1, q_idx.shape[-1]).mean(dim=0), dim=-1, eps=1e-6)
         cents = self.centroids[:limit].to(dev)
         toks = self.bucket_tokens[:limit].to(dev)
-        scores = torch.einsum("bcd,d->bc", cents, q).masked_fill(toks == 0, float("-inf"))
+        scores = torch.einsum("bcd,d->bc", cents, q)
+        if dist_alpha_over_tau > 0.0:
+            q_pos = float(upto - 1)
+            blk_centers = self.mid_start + (torch.arange(limit, device=dev, dtype=torch.float32) + 0.5) * float(self.n_cluster)
+            blk_pen = float(dist_alpha_over_tau) * torch.log1p((q_pos - blk_centers).clamp(min=0.0) / max(1.0, float(self.window)))
+            scores = scores - blk_pen.unsqueeze(1)
+        scores = scores.masked_fill(toks == 0, float("-inf"))
         flat_s, flat_i = scores.reshape(-1).sort(descending=True)
         flat_t = toks.reshape(-1)[flat_i]
         csum = torch.cumsum(flat_t, dim=0)
@@ -286,6 +295,10 @@ class PagedLatentIndex:
         mid = (base.unsqueeze(1) + torch.arange(self.n_pool, device=dev).unsqueeze(0)).reshape(-1)
         if self.rerank > 1 and mid.numel() > int(budget) and self.k_idx_n is not None:
             tok_scores = self.k_idx_n.to(dev)[mid] @ q  # stage 2: token-level scores of the candidates only
+            if dist_alpha_over_tau > 0.0:
+                q_pos = float(upto - 1)
+                tok_pen = float(dist_alpha_over_tau) * torch.log1p((q_pos - mid.float()).clamp(min=0.0) / max(1.0, float(self.window)))
+                tok_scores = tok_scores - tok_pen
             mid = mid[tok_scores.topk(int(budget)).indices]
         return torch.cat([sink, mid, tail]).unique()  # `unique` sorts ascending
 
@@ -294,16 +307,20 @@ class PagedLatentIndex:
 # Learned index space + per-key KL distillation
 # ======================================================================================
 class FaithfulDLSAIndexer(nn.Module):
-    """Per-layer learned maps `W_q, W_k: (n_kv*F) -> d_idx` (+ learned temperature), L2-normalised.
+    """Per-layer learned maps `W_q, W_k: (n_kv*F) -> d_idx` (+ learned temperature and optional query-time log-distance prior),
+    L2-normalised.
 
     Initialised from PCA of the position-free key inputs (training-free D-LSA) via `fit_pca`, then refined by `distill`.
     """
 
     def __init__(self, n_kv: int = 4, head_dim: int = 256, rope_dim: int = 64, d_idx: int = 64, rope_first: bool = True,
                  n_sink: int = 4, n_pool: int = 4, n_cluster: int = 512, avg_bucket_size: int = 8, max_bucket_size: int = 16,
-                 window: int = 512, k_long_range: int = 2048, rerank: int = 1):
+                 window: int = 512, k_long_range: int = 2048, rerank: int = 1,
+                 selection_reuse_steps: int = 1, reuse_cos_threshold: float = 0.92):
         super().__init__()
         self.rerank = max(1, int(rerank))
+        self.selection_reuse_steps = max(1, int(selection_reuse_steps))
+        self.reuse_cos_threshold = float(reuse_cos_threshold)
         self.n_kv, self.head_dim, self.rope_dim, self.d_idx, self.rope_first = n_kv, head_dim, rope_dim, d_idx, rope_first
         self.n_sink, self.n_pool, self.n_cluster = n_sink, n_pool, n_cluster
         self.avg_bucket_size, self.max_bucket_size, self.window, self.k_long_range = avg_bucket_size, max_bucket_size, window, k_long_range
@@ -311,8 +328,22 @@ class FaithfulDLSAIndexer(nn.Module):
         self.w_q = nn.Linear(din, d_idx, bias=False)
         self.w_k = nn.Linear(din, d_idx, bias=False)
         self.log_tau = nn.Parameter(torch.tensor(math.log(12.0)))
+        # Query-time log-distance prior parameter (zero at init = -6.0; non-negative when distilled)
+        self.raw_dist_alpha = nn.Parameter(torch.tensor(-6.0))
         nn.init.orthogonal_(self.w_k.weight)
         self.w_q.weight.data.copy_(self.w_k.weight.data)
+
+    def dist_alpha(self) -> torch.Tensor:
+        """Non-negative query-time log-distance decay weight `alpha >= 0` (exactly `0.0` at init `-6.0`)."""
+        raw = getattr(self, "raw_dist_alpha", None)
+        if raw is None:
+            return torch.tensor(0.0, device=self.log_tau.device)
+        base = F.softplus(torch.tensor(-6.0, device=raw.device, dtype=torch.float32))
+        return (F.softplus(raw.float()) - base).clamp(min=0.0, max=8.0)
+
+    def dist_alpha_over_tau(self) -> float:
+        tau = float(self.log_tau.detach().float().exp().clamp(1.0, 64.0).item())
+        return float(self.dist_alpha().detach().item()) / tau
 
     # ---- projections
     def project_q(self, q_in: torch.Tensor) -> torch.Tensor:
@@ -434,7 +465,7 @@ class FaithfulDLSAIndexer(nn.Module):
             sink = torch.arange(0, min(self.n_sink, t), device=key.device)
             tail = torch.arange(idx.clustered_end, t, device=key.device)
             return torch.cat([sink, last_mid.to(key.device), tail]).unique()
-        sel = idx.select(q_proj, budget).to(key.device)
+        sel = idx.select(q_proj, budget, upto=t, dist_alpha_over_tau=self.dist_alpha_over_tau()).to(key.device)
         if use_cache and reuse_steps > 1 and query.shape[2] == 1:
             mid_mask = (sel >= self.n_sink) & (sel < idx.clustered_end)
             self._last_q_vec = q_vec.detach()
@@ -445,11 +476,19 @@ class FaithfulDLSAIndexer(nn.Module):
 
     # ---- distillation
     def distill_loss(self, q_in: torch.Tensor, k_in: torch.Tensor, teacher_p: torch.Tensor,
-                     key_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                     key_mask: Optional[torch.Tensor] = None,
+                     q_positions: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Per-key KL(teacher || student) averaged over queries. `teacher_p`: [Tq, T] (rows sum to 1 over the allowed keys),
-        `key_mask`: [Tq, T] bool of keys the student must rank (e.g. middle region, causal)."""
+        `key_mask`: [Tq, T] bool of keys the student must rank (e.g. middle region, causal).
+        When `q_positions` (`[Tq]`) is provided, includes the query-time log-distance prior `-alpha * log(1 + (p - j)/window)`."""
         tau = self.log_tau.float().exp().clamp(1.0, 64.0)
         logits = tau * self.project_q(q_in) @ self.project_k(k_in).t()
+        if q_positions is not None:
+            alpha = self.dist_alpha()
+            q_pos = q_positions.to(device=logits.device, dtype=torch.float32).unsqueeze(1)
+            k_pos = torch.arange(logits.shape[1], device=logits.device, dtype=torch.float32).unsqueeze(0)
+            dist_pen = alpha * torch.log1p((q_pos - k_pos).clamp(min=0.0) / max(1.0, float(self.window)))
+            logits = logits - dist_pen
         if key_mask is not None:
             logits = logits.masked_fill(~key_mask, float("-inf"))
         logp = torch.log_softmax(logits, dim=-1)
@@ -513,16 +552,17 @@ def eval_kl(indexer: FaithfulDLSAIndexer, samples: Sequence[Dict[str, torch.Tens
         if t <= lo + 1:
             continue
         pos = torch.randint(lo, t, (min(queries_per_sample, t - lo),), generator=g).sort().values.tolist()
+        pos_t = torch.as_tensor(pos, device=q.device, dtype=torch.long)
         q_in_all, k_in = indexer.inputs(q, k)
         mask = mid_region_mask(pos, t, indexer.n_sink, indexer.window, q.device)
         p = teacher_attention(q, k, pos, scale) * mask
         p = p / p.sum(dim=-1, keepdim=True).clamp(min=1e-12)
-        vals.append(float(indexer.distill_loss(q_in_all[pos], k_in, p, mask)))
+        vals.append(float(indexer.distill_loss(q_in_all[pos], k_in, p, mask, q_positions=pos_t)))
     return sum(vals) / len(vals) if vals else None
 
 
 def _kl_cache(indexer: FaithfulDLSAIndexer, samples: Sequence[Dict[str, torch.Tensor]], queries_per_sample: int, g: torch.Generator,
-              scale: Optional[float]) -> List[Tuple[torch.Tensor, ...]]:
+              scale: Optional[float], focal_top_k: int = 0, focal_boost: float = 0.0) -> List[Tuple[torch.Tensor, ...]]:
     cache = []
     for s in samples:
         q, k = s["q"], s["k"]
@@ -531,37 +571,46 @@ def _kl_cache(indexer: FaithfulDLSAIndexer, samples: Sequence[Dict[str, torch.Te
         if t <= lo + 1:
             continue
         pos = torch.randint(lo, t, (min(queries_per_sample, t - lo),), generator=g).sort().values.tolist()
+        pos_t = torch.as_tensor(pos, device=q.device, dtype=torch.long)
         q_in_all, k_in = indexer.inputs(q, k)
         mask = mid_region_mask(pos, t, indexer.n_sink, indexer.window, q.device)
         p = teacher_attention(q, k, pos, scale)
         p = p * mask  # renormalise on the middle region: this is what the indexer is responsible for ranking
-        p = p / p.sum(dim=-1, keepdim=True).clamp(min=1e-12)
-        cache.append((q_in_all[pos], k_in, p, mask))
+        p_raw = p / p.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        p_train = p_raw
+        if focal_top_k > 0 and focal_boost > 0.0:
+            k_foc = min(int(focal_top_k), p_raw.shape[-1])
+            top_idx = p_raw.topk(k_foc, dim=-1).indices
+            boost_mask = torch.zeros_like(p_raw).scatter_(1, top_idx, float(focal_boost))
+            p_train = p_raw * (1.0 + boost_mask)
+            p_train = p_train / p_train.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        cache.append((q_in_all[pos], k_in, p_train, p_raw, mask, pos_t))
     return cache
 
 
 def distill_indexer(indexer: FaithfulDLSAIndexer, samples: Sequence[Dict[str, torch.Tensor]], steps: int = 200,
                     lr: float = 3e-3, queries_per_sample: int = 64, seed: int = 0, log_every: int = 50,
                     log=print, scale: Optional[float] = None, val_samples: Optional[Sequence[Dict[str, torch.Tensor]]] = None,
-                    eval_every: int = 25, weight_decay: float = 0.0) -> Dict[str, Any]:
-    """Distil `W_q, W_k, tau` against the frozen teacher with per-key KL on the middle region.
+                    eval_every: int = 25, weight_decay: float = 0.0,
+                    focal_top_k: int = 0, focal_boost: float = 0.0) -> Dict[str, Any]:
+    """Distil `W_q, W_k, tau, raw_dist_alpha` against the frozen teacher with per-key KL on the middle region.
 
     `samples`: dicts with `q` [H_q, T, D] and `k` [H_kv, T, D] (post-RoPE tensors captured from the frozen model on long
     documents). Queries are sampled among positions with a non-empty middle region. Returns KL before/after on all samples.
 
     `val_samples` (recommended): held-out samples used for **early stopping** — every `eval_every` steps the held-out KL is
     measured and the parameters with the lowest held-out KL (including the initial/PCA state) are restored at the end, so the
-    result is never worse than the init on held-out KL. The first F2b run showed held-out KL rising under training (L3 full-head).
+    result is never worse than the init on held-out KL.
     """
     g = torch.Generator().manual_seed(seed)
-    cache = _kl_cache(indexer, samples, queries_per_sample, g, scale)
+    cache = _kl_cache(indexer, samples, queries_per_sample, g, scale, focal_top_k=focal_top_k, focal_boost=focal_boost)
     if not cache:
         return {"kl_before": None, "kl_after": None, "n_samples": 0}
     vcache = _kl_cache(indexer, val_samples, queries_per_sample, torch.Generator().manual_seed(seed + 1), scale) if val_samples else []
 
     @torch.no_grad()
     def mean_kl(c) -> float:
-        return float(sum(indexer.distill_loss(a, b, cc, m) for a, b, cc, m in c) / len(c))
+        return float(sum(indexer.distill_loss(a, b, p_raw, m, q_positions=pos_t) for a, b, _, p_raw, m, pos_t in c) / len(c))
 
     kl0 = mean_kl(cache)
     best_v = mean_kl(vcache) if vcache else None
@@ -570,9 +619,9 @@ def distill_indexer(indexer: FaithfulDLSAIndexer, samples: Sequence[Dict[str, to
     best_step = 0
     opt = torch.optim.AdamW(indexer.parameters(), lr=lr, weight_decay=weight_decay)
     for step in range(1, int(steps) + 1):
-        a, b, c, m = cache[(step - 1) % len(cache)]
+        a, b, p_train, _, m, pos_t = cache[(step - 1) % len(cache)]
         opt.zero_grad(set_to_none=True)
-        loss = indexer.distill_loss(a, b, c, m)
+        loss = indexer.distill_loss(a, b, p_train, m, q_positions=pos_t)
         loss.backward()
         opt.step()
         if log_every and step % log_every == 0:
@@ -587,7 +636,105 @@ def distill_indexer(indexer: FaithfulDLSAIndexer, samples: Sequence[Dict[str, to
         indexer.load_state_dict(best_state)
         out.update(val_kl_before=v0, val_kl_after=best_v, best_step=best_step, n_val_samples=len(vcache))
     out["kl_after"] = mean_kl(cache)
+    out["dist_alpha"] = float(indexer.dist_alpha().detach().item())
     return out
+
+
+# ======================================================================================
+# NSA / MagicPIG Residual Block-Summary Compensation
+# ======================================================================================
+class BlockSummaryCache:
+    """GPU-resident per-block sufficient statistics `(sum_K, sum_K^2, sum_V)` for `n_cluster`-token blocks (`< 0.6%` overhead).
+    Synthesises DeepSeek NSA's compressed block branch (arXiv:2502.11089) with MagicPIG's partition-function bias correction
+    (arXiv:2410.16179): given any fine-grained selected key set `sel`, subtracts `sel` in O(|sel|) time to obtain the **exact**
+    unselected block mean key, anisotropic key variance, and mean value without reading a single unselected token from cold RAM."""
+
+    def __init__(self, kf: torch.Tensor, vf: torch.Tensor, n_sink: int = 4, n_cluster: int = 512, window: int = 512):
+        self.n_sink = int(n_sink)
+        self.n_cluster = int(n_cluster)
+        self.window = int(window)
+        self.h_kv, self.t, self.d = kf.shape
+        self.n_blocks = max(0, (self.t - self.n_sink) // self.n_cluster)
+        end = self.n_sink + self.n_blocks * self.n_cluster
+        if self.n_blocks > 0:
+            kb = kf[:, self.n_sink:end, :].view(self.h_kv, self.n_blocks, self.n_cluster, self.d)
+            vb = vf[:, self.n_sink:end, :].view(self.h_kv, self.n_blocks, self.n_cluster, self.d)
+            self.k_blk_sum = kb.sum(dim=2)
+            self.k_blk_sq_sum = (kb * kb).sum(dim=2)
+            self.v_blk_sum = vb.sum(dim=2)
+        else:
+            self.k_blk_sum = kf.new_zeros((self.h_kv, 0, self.d))
+            self.k_blk_sq_sum = kf.new_zeros((self.h_kv, 0, self.d))
+            self.v_blk_sum = vf.new_zeros((self.h_kv, 0, self.d))
+
+
+@torch.no_grad()
+def sparse_attention_with_block_compensation(
+    q: torch.Tensor,
+    kf: torch.Tensor,
+    vf: torch.Tensor,
+    p: int,
+    sel: torch.Tensor,
+    scale: float,
+    blk_cache: Optional[BlockSummaryCache] = None,
+    cumulant_scale: float = 0.25,
+) -> torch.Tensor:
+    """Compute multi-head attention output `[H_q, D]` at query position `p` over selected keys `sel`, augmented with
+    unselected block summary tokens `(k_unsel_mean, v_unsel_mean)` and anisotropic right-truncated cumulant log-multiplicity."""
+    hq = q.shape[0]
+    h_kv = kf.shape[0]
+    g = hq // h_kv
+    upto = int(p) + 1
+    if blk_cache is None:
+        blk_cache = BlockSummaryCache(kf[:, :upto], vf[:, :upto])
+    limit = 0 if blk_cache.n_blocks == 0 else max(0, min(blk_cache.n_blocks, (upto - blk_cache.window - blk_cache.n_sink) // blk_cache.n_cluster))
+    clustered_end = blk_cache.n_sink + limit * blk_cache.n_cluster
+    if limit == 0 or sel.numel() >= upto:
+        rows = []
+        for h in range(hq):
+            kk, vv = kf[h // g, sel], vf[h // g, sel]
+            logits = (kk @ q[h, p].float()) * scale
+            rows.append(torch.softmax(logits, dim=-1) @ vv)
+        return torch.stack(rows, dim=0)
+
+    in_blk = (sel >= blk_cache.n_sink) & (sel < clustered_end)
+    sel_mid = sel[in_blk]
+    blk_ids = (sel_mid - blk_cache.n_sink) // blk_cache.n_cluster
+    sel_counts = torch.zeros(limit, device=kf.device, dtype=torch.float32)
+    if blk_ids.numel() > 0:
+        sel_counts.index_add_(0, blk_ids, torch.ones_like(blk_ids, dtype=torch.float32))
+    unsel_counts = (float(blk_cache.n_cluster) - sel_counts).clamp(min=0.0)
+
+    k_sum = blk_cache.k_blk_sum[:, :limit, :].clone()
+    k_sq_sum = blk_cache.k_blk_sq_sum[:, :limit, :].clone()
+    v_sum = blk_cache.v_blk_sum[:, :limit, :].clone()
+    if sel_mid.numel() > 0:
+        ks = kf[:, sel_mid, :]
+        vs = vf[:, sel_mid, :]
+        k_sum.index_add_(1, blk_ids, -ks)
+        k_sq_sum.index_add_(1, blk_ids, -(ks * ks))
+        v_sum.index_add_(1, blk_ids, -vs)
+
+    denom = unsel_counts.clamp(min=1.0).view(1, limit, 1)
+    k_unsel_mean = k_sum / denom
+    v_unsel_mean = v_sum / denom
+    k_unsel_var = (k_sq_sum / denom - k_unsel_mean * k_unsel_mean).clamp(min=0.0)
+    frac_sq = (unsel_counts / float(blk_cache.n_cluster)) ** 2
+    log_counts = torch.where(unsel_counts > 0.0, torch.log(unsel_counts.clamp(min=1e-9)), torch.full_like(unsel_counts, float("-inf")))
+
+    rows = []
+    for h in range(hq):
+        gi = h // g
+        q_hp = q[h, p].float()
+        logits_sel = (kf[gi, sel] @ q_hp) * scale
+        l_mean = (k_unsel_mean[gi] @ q_hp) * scale
+        var_l = (scale * scale) * (k_unsel_var[gi] @ (q_hp * q_hp))
+        cumulant = (float(cumulant_scale) * frac_sq * var_l).clamp(min=0.0, max=1.5)
+        logits_blk = l_mean + cumulant + log_counts
+        logits_all = torch.cat([logits_sel, logits_blk], dim=0)
+        v_all = torch.cat([vf[gi, sel], v_unsel_mean[gi]], dim=0)
+        rows.append(torch.softmax(logits_all, dim=-1) @ v_all)
+    return torch.stack(rows, dim=0)
 
 
 # ======================================================================================
@@ -599,22 +746,31 @@ def recall_of_selection(teacher_p_row: torch.Tensor, selected: torch.Tensor) -> 
 
 
 def _out_rel_err(q: torch.Tensor, kf: torch.Tensor, vf: torch.Tensor, p: int, sels: Dict[str, torch.Tensor],
-                 scale: float) -> Dict[str, float]:
+                 scale: float, blk_cache: Optional[BlockSummaryCache] = None) -> Dict[str, float]:
     """Per-head attention-OUTPUT relative error of sparse (softmax renormalised over the selected keys) vs exact causal attention
-    for the query at position `p`, mean over heads. `kf`/`vf`: float [H_kv, T, D]. The renormalisation is why output error is
-    usually much smaller than the missed attention mass suggests."""
+    for the query at position `p`, mean over heads. `kf`/`vf`: float [H_kv, T, D]. When `blk_cache` is provided, also computes
+    `faithful_comp` using NSA/MagicPIG Residual Block-Summary Compensation."""
     hq = q.shape[0]
     g = hq // kf.shape[0]
     errs = {a: 0.0 for a in sels}
+    o_full_heads = []
+    den_heads = []
     for h in range(hq):
         kk, vv = kf[h // g, : p + 1], vf[h // g, : p + 1]
         logits = (kk @ q[h, p].float()) * scale
         o_full = torch.softmax(logits, dim=-1) @ vv
         den = o_full.norm().clamp(min=1e-8)
+        o_full_heads.append(o_full)
+        den_heads.append(den)
         for a, sel in sels.items():
             o = torch.softmax(logits[sel], dim=-1) @ vv[sel]
             errs[a] += float((o - o_full).norm() / den)
-    return {a: e / hq for a, e in errs.items()}
+    res = {a: e / hq for a, e in errs.items()}
+    if blk_cache is not None and "faithful" in sels:
+        o_comp = sparse_attention_with_block_compensation(q, kf, vf, p, sels["faithful"], scale, blk_cache=blk_cache)
+        err_c = sum(float((o_comp[h] - o_full_heads[h]).norm() / den_heads[h]) for h in range(hq)) / hq
+        res["faithful_comp"] = err_c
+    return res
 
 
 @torch.no_grad()
@@ -628,13 +784,13 @@ def evaluate_selectors(
     scale: Optional[float] = None,
     v: Optional[torch.Tensor] = None,
 ) -> Dict[str, Any]:
-    """Attention-mass recall (and, if `v` is given, attention-output relative error `err_<arm>`) for sampled decode-like queries.
+    """Attention-mass recall (and, if `v` is given, attention-output relative error `err_<arm>` plus `err_faithful_comp`) for
+    sampled decode-like queries.
 
     **Equal total budget.** The faithful selection reads sink + whole buckets + the unclustered tail, which can exceed `budget`
     long-range keys; every other arm is given exactly as many *non-sink/window* keys as the faithful arm actually read for that
-    query (`mean_long_keys`), so recall differences are not a key-count artefact (the first F2/F2b runs compared the faithful arm at
-    up to ~25% more keys). Arms: `faithful`, `flat_oracle_index` (same learned scores, token-level top-n: isolates clustering loss),
-    `contiguous` (8-token spans scored in the learned space = the repo's previous selector), `random`, `oracle` (true top-n).
+    query (`mean_long_keys`), so recall differences are not a key-count artefact. Arms: `faithful`, `flat_oracle_index`,
+    `contiguous`, `random`, `oracle`.
     """
     g = torch.Generator().manual_seed(seed)
     dev = q.device
@@ -646,10 +802,12 @@ def evaluate_selectors(
                              indexer.max_bucket_size, indexer.window, indexer.rerank)  # built once; `upto` gives per-query causality
     arms = ("faithful", "flat_oracle_index", "contiguous", "random", "oracle")
     res: Dict[str, List[float]] = {a: [] for a in arms}
-    errs: Dict[str, List[float]] = {a: [] for a in arms}
+    errs: Dict[str, List[float]] = {a: [] for a in list(arms) + ["faithful_comp"]}
     n_long_list: List[int] = []
     kf = k.float() if v is not None else None
     vf = v.float() if v is not None else None
+    blk_cache = BlockSummaryCache(kf, vf, indexer.n_sink, indexer.n_cluster, indexer.window) if v is not None else None
+    da_tau = indexer.dist_alpha_over_tau()
     for p in q_positions:
         tp = teacher_attention(q, k, [p], scale)[0]  # [T]
         n = p + 1
@@ -661,10 +819,13 @@ def evaluate_selectors(
         if mid_hi - mid_lo <= budget:
             continue
         qv = indexer.project_q(q_in_all[p: p + 1])
-        sel = index.select(qv, budget, upto=n)
+        sel = index.select(qv, budget, upto=n, dist_alpha_over_tau=da_tau)
         n_long = int((~always_mask[sel]).sum())
         n_long_list.append(n_long)
         scores = (k_idx_all[mid_lo:mid_hi] @ qv[0])
+        if da_tau > 0.0:
+            mid_pos = torch.arange(mid_lo, mid_hi, device=dev, dtype=torch.float32)
+            scores = scores - float(da_tau) * torch.log1p((float(p) - mid_pos).clamp(min=0.0) / max(1.0, float(indexer.window)))
         top = scores.topk(min(n_long, scores.numel())).indices + mid_lo
         span = 8
         n_spans = (mid_hi - mid_lo) // span
@@ -681,7 +842,7 @@ def evaluate_selectors(
         for a, sl in sels.items():
             res[a].append(recall_of_selection(tp, sl))
         if v is not None:
-            for a, e in _out_rel_err(q, kf, vf, p, sels, sc).items():
+            for a, e in _out_rel_err(q, kf, vf, p, sels, sc, blk_cache=blk_cache).items():
                 errs[a].append(e)
     out: Dict[str, Any] = {a: (sum(x) / len(x) if x else None) for a, x in res.items()}
     if v is not None:
