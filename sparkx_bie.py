@@ -51,7 +51,9 @@ def _set_use_engram(model: Any, flag: bool) -> None:
 def _ensure_latest_engram_methods(model: Any) -> None:
     """Hot-rebind live `ZipfianTieredMoEEngram` instances to the latest class definition after `importlib.reload`."""
     try:
+        import importlib
         import sparkx_loop_v03_core as core
+        core = importlib.reload(core)
         latest_cls = getattr(core, "ZipfianTieredMoEEngram", None)
     except Exception:
         latest_cls = None
