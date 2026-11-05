@@ -1,19 +1,23 @@
 import unittest
 
-import torch
-import torch.nn.functional as F
+try:
+    import torch
+    import torch.nn.functional as F
+    from sparkx_dlsa import PagedLatentIndex
+    from sparkx_dynamic_memory import (
+        DynamicLatentMemoryGraph,
+        HotColdPagedKVStore,
+        NullSpaceVerticalAdapter,
+        SleepConsolidationEngine,
+        evaluate_dlmg_recall_suite,
+        evaluate_sleep_consolidation_suite,
+    )
+    HAVE_TORCH = True
+except Exception:  # pragma: no cover
+    HAVE_TORCH = False
 
-from sparkx_dlsa import PagedLatentIndex
-from sparkx_dynamic_memory import (
-    DynamicLatentMemoryGraph,
-    HotColdPagedKVStore,
-    NullSpaceVerticalAdapter,
-    SleepConsolidationEngine,
-    evaluate_dlmg_recall_suite,
-    evaluate_sleep_consolidation_suite,
-)
 
-
+@unittest.skipUnless(HAVE_TORCH, "torch not installed")
 class TestDynamicMemory(unittest.TestCase):
 
     def test_hot_cold_paged_kv_store_exact_and_lru(self):

@@ -285,7 +285,30 @@ class TestLsaEval(unittest.TestCase):
         self.assertFalse(le.gate_f2({"layers": {}})["evaluated"])
 
     def test_run_lsa_f3_decode_simulation_and_cache_hits(self):
+        import types
         m = FakeModel()
+        f3_mod = types.ModuleType("fake_f3_attn_mod")
+        def eager_attention_forward(module, query, key, value, attention_mask=None, scaling=None, dropout=0.0, **kwargs):
+            sc = scaling if scaling is not None else 1.0 / 16.0
+            hq, t, d = query.shape[1], query.shape[2], query.shape[3]
+            g = hq // key.shape[1]
+            k_rep = key.repeat_interleave(g, dim=1)
+            v_rep = value.repeat_interleave(g, dim=1)
+            out = F.scaled_dot_product_attention(query, k_rep, v_rep, is_causal=True, scale=sc)
+            return out, None
+        f3_mod.eager_attention_forward = eager_attention_forward
+        sys.modules["fake_f3_attn_mod"] = f3_mod
+        for lyr in m._layers():
+            lyr.self_attn.__class__.__module__ = "fake_f3_attn_mod"
+
+        def forward_logits(ids):
+            cap = m.capture_attention_io(ids, [1])
+            q, k, v = cap[1]["query"], cap[1]["key"], cap[1]["value"]
+            out, _ = sys.modules["fake_f3_attn_mod"].eager_attention_forward(m._layers()[1].self_attn, q, k, v, scaling=1.0 / 16.0)
+            # Project [1, HQ, T, D] -> [1, T, 256] vocab logits deterministically
+            return out.mean(dim=1)[..., :256]
+        m.forward_logits = forward_logits
+
         with tempfile.TemporaryDirectory() as td:
             rep = le.run_lsa_f2(
                 m, FakeTok(), fake_texts(40, 500, 0), fake_texts(40, 500, 1), layers=[1, 2],
@@ -306,6 +329,10 @@ class TestLsaEval(unittest.TestCase):
             self.assertEqual(f3["decode_cache_hits"], 5)
             self.assertGreater(f3["mean_tail_out_err"], 0.0)
             self.assertLess(f3["mean_tail_out_err"], 2.0)
+            self.assertIn("ce_exact", f3)
+            self.assertIn("ce_dlsa", f3)
+            self.assertIn("delta_ce", f3)
+            self.assertIn("needle_nll_dlsa", f3)
 
 
 if __name__ == "__main__":

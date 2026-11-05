@@ -13,6 +13,7 @@ Typical Colab use (model/tokenizer from `load_sparkx_loop_v03`):
 from __future__ import annotations
 
 import gc
+import importlib
 import json
 import math
 import os
@@ -21,6 +22,7 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from sparkx_dlsa import (FaithfulDLSAIndexer, distill_indexer, eval_kl, evaluate_selectors, free_logit_fidelity,
                          teacher_attention_heads)
@@ -771,6 +773,7 @@ def run_lsa_f3(
                     sc = scaling if scaling is not None else 1.0 / math.sqrt(query.shape[-1])
                     out = out.clone()
                     q0, k0, v0 = query[0], key[0], value[0]
+                    ix_m.reset_decode_cache()
                     for p in q_positions:
                         sel = ix_m.select_key_indices(query[:, :, p : p + 1, :], key[:, :, : p + 1, :], k_budget=k_budget, use_cache=True)
                         sp_o = _sparse_attn_row(q0, k0, v0, p, sel, float(sc))  # [H_q, D]
