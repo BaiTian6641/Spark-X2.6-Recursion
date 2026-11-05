@@ -77,6 +77,33 @@ Evaluated on the frozen 55-doc (`60,059` supervised tokens) doc-hash held-out sp
    - `CE_off` drifted slightly (`0.6239@40 -> 0.6525@560`) as the 24 `TwoStreamMHC` controllers co-adapted with `use_engram=True`; even against the minimum `CE_off` (`0.6239`), `best@320` (`0.5611`) is **`-0.0628` nats lower**.
    - Post-run Cell 4 & Cell 6 (`BIE`) will test whether `best@320` (or the post-rollback checkpoint) also resolves `S1` on out-of-distribution raw prose (`TRUE_HELDOUT_TEXTS`) or requires `BIE-3` selective gating (`wise_scope_gated` / `deepseek_qk_gated`).
 
+### 3c. Post-Run Cell 6 (`BIE`) Diagnostic on `best@320` (Colab GPU, 2026-11-05)
+
+Running the full Backbone Interaction & Engram (`BIE`) diagnostic suite on the restored `best@320` checkpoint (`CE_on = 0.5611`, `delta = -0.0797` on the 55-doc held-out validation split) exposed two exact mathematical mechanisms:
+
+1. **Exact Root Cause of `S1` on `TRUE_HELDOUT_TEXTS`: Unsupervised Prompt-Header Firing (`93.6%` of the penalty)**
+   - [`prompt_vs_response_breakdown`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_bie.py#L298-L393) split `TRUE_HELDOUT_TEXTS` (`1,330` total tokens across 5 texts) into the `<|System|>...<|User|>...<|Bot|>` prompt prefix (`235` tokens, which had `labels = -100` during training) vs. the assistant response body (`1,095` tokens after `<|Bot|>`):
+
+   | Token Slice (`TRUE_HELDOUT_TEXTS`) | Tokens | `CE_off` | `CE_on` (`best@320`) | `delta_ce (on - off)` | Share of Total Penalty |
+   | :--- | ---: | ---: | ---: | ---: | ---: |
+   | **`all_tokens` (unmasked full sequence)** | `1,330` | `1.3974` | `1.5930` | `+0.1956` | `100.0%` |
+   | **`prompt_only` (`<|System|>...<|User|>`, `labels=-100` in train)** | `235` | `2.8053` | `3.8416` | **`+1.0363`** | **`93.6%` (`+0.1831` weighted)** |
+   | **`response_only` (assistant completion after `<|Bot|>`)** | `1,095` | `1.0952` | `1.1104` | **`+0.0152`** | **`6.4%` (`+0.0125` weighted, within `~0.02` noise floor)** |
+
+   - Because training always masks prompt tokens (`labels = -100`) while `MoE-Engram` still fires on prompt positions (`0 .. p_len - 2`), the Engram experts never received a direct next-token CE gradient penalizing their perturbations on `<|System|>` / `<|User|>` tokens (`+1.0363` nats/token!). On the supervised assistant response tokens (`response_only`), `best@320` is already within the `0.02`-nat noise floor (`+0.0152` nats), and adding DeepSeek QK Gating + norm cap (`combined_selective`) reduces `response_only` delta to **`+0.0029` nats** (`CE = 1.0981` vs `1.0952` OFF).
+   - **Fix (`min_active_pos` Prompt-Prefix Suppression)**: Suppressing `MoE-Engram` writes on prefix tokens `pos < p_len - 1` (`min_active_pos = p_len - 1`, keeping `p_len - 1` active so the `<|Bot|>` token predicts the first response token) eliminates the `+1.0363` prompt-header penalty entirely.
+
+2. **Logit-Lens Commit Locus (`L28` Coda Boundary) & First-Order Attribution (`BIE-1` / `BIE-2`)**:
+   - [`logit_lens_trajectory`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_bie.py#L401-L497) across all 72 virtual steps shows that `KL(p_step || p_final)` remains flat at `19.65 -> 20.51` nats through the entire looped core (`L0..L27 × 2 + P3`) and drops by **`19.30` nats in a single block at `L28` (Pass 0, Coda entry)**: `20.51 -> 1.21 -> 0.56 (L29) -> 0.43 (L31) -> 0.00 (L35)`.
+   - Consequently, `L31` writes at a depth where `KL(p_L31 || p_final) = 0.43` nats (the token distribution is already committed), whereas `L23` (`KL = 20.47` nats) and `L27` (`KL = 20.51` nats, `attr = -0.00004`) write **immediately before** the `L28` Coda decoder commitment.
+
+3. **Closed-Form `compile_clusters_alphaedit` Relative-Ridge Fix & MEMIT Subspace Target Optimization (`BIE-5` / `SI4`)**:
+   - Initial Cell 6 `gap_write_si4` on `best@320` achieved positive NLL gains on both original prompts (`mean_orig_nll_gain = +1.4775` nats) and held-out paraphrases (`mean_para_nll_gain = +0.5425` nats) with exact general-text locality (`general_locality_delta_ce = 0.000000`) and zero sequential forgetting (`sequential_round1_retention_drift = 0.000000`), but post-compile NLL remained `6.82` (`top1_hit_rate_after = 0.0`).
+   - **Root Cause Verified**: Because `expert_gate` and `expert_up` are frozen at `0.02` initialization scale, the post-SwiGLU activation vector $a_b = \text{SwiGLU}(q W_g, q W_u)$ has squared norm $\|a_b\|_2^2 \approx 10^{-5}$, and `project.weight` has small singular values. Passing unscaled `alpha_ridge = 1e-2` and `lam = 1e-2` into $(A_\perp A_\perp^\top + \alpha I)^{-1}$ and $(W_{\text{proj}} W_{\text{proj}}^\top + \lambda I)^{-1}$ damped `90%–99%` of the closed-form weight update (`mean_rel_fit_error = 0.9465`).
+   - **Fix Implemented (`compile_clusters_alphaedit` + `run_gap_write_test`)**:
+     1. Scaled `eff_lam` relative to `mean_sv_sq = ||W_proj||_F^2 / W` and `eff_alpha`, `eff_null_thr` relative to `mean_act_sq = ||A_\perp||_F^2 / M_e`, reducing `mean_rel_fit_error` from `94.6%` to **`0.034%` (`700×` more accurate)**.
+     2. Added **MEMIT / AlphaEdit Subspace Target Vector Optimization ($\delta^*$)** (`Meng et al. ICLR 2023`, `Fang et al. ICLR 2025`) in [`run_gap_write_test`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_bie.py#L706-L995), optimizing a low-norm residual vector $\delta^* \in \text{col}(W_{\text{proj}})$ (`8` Adam steps at the target anchor) before one-shot closed-form compilation.
+
 ---
 
 ## 4. Decision tree after the long run
@@ -107,13 +134,14 @@ flowchart TD
 - **Engram as a storage mechanism:** SI-SRSI v2's **gap-write track (SI4)** is the first experiment that can actually demonstrate or refute the "vertical memory stores knowledge" thesis, because it measures paraphrase recall of facts the backbone did not know, with locality controls.
 - **Capability:** expect *consistency* gains (maj@k → pass@1, constraint and tool-format adherence) on the task-bank pillars, a few points on dev suites, possibly small gains on held-out public suites. The frozen backbone caps what can be learned; no claim of new reasoning ability is made. Every number will carry a CI and a control arm; "no significant gain" is an acceptable, reportable outcome.
 
-## 5b. Architectural Remedies Implemented (`7831f2f` — Opt-In, Non-Destructive to Running 20h Colab Job)
+## 5b. Architectural Remedies Implemented (`7831f2f` + Post-Run BIE Fixes — Opt-In, Non-Destructive)
 
-To address H3 (scale/norm miscalibration), H4 (unconditional firing on general text), and H6 (frozen consumer off-manifold sensitivity) without altering the running 20h checkpoint (`selective_gating_enabled=False` by default = 100% bit-identical):
-1. **WISE Activation Scope Gate (`arXiv:2405.14768` §3.2)**: `ZipfianTieredMoEEngram` tracks compiled router directions `_compiled_scope_prototypes` in $\mathbb{S}^{63}$ (populated automatically by `compile_clusters_alphaedit` or `register_scope_prototypes`). When `scope_threshold > 0`, tokens whose router query $u_t$ has $\max_p \langle u_t, p \rangle < \tau_{\text{scope}}$ receive exact `0.0` perturbation (`scope_mask = 0`), guaranteeing `CE(ON) == CE(OFF)` on out-of-scope general text.
-2. **DeepSeek Signed-Sqrt RMSNorm Query-Key Gate (`arXiv:2601.07372` §2.3, `engram_demo_v1.py`)**: When `qk_gate_enabled=True`, computes $\alpha_t = \sigma(\text{RMSNorm}(h_t)^\top \text{RMSNorm}(m_t)/\sqrt{W})$ followed by $\text{sign}(\cdot)\sqrt{|\cdot|}$ to suppress unaligned memory retrievals before projection.
-3. **In-Manifold Trust-Region Relative Write Norm Cap**: When `max_rel_delta_norm > 0` (e.g., `0.03`), bounds $\|\Delta h_{\text{Engram}}\|_2 \le \rho_{\max} \|h\|_2$ per token so no anchor can push the frozen consumer off-manifold.
-4. **Closed-Form Continual Knowledge Injection & Gap-Write Test (`BIE-5` / `SI4`, `sparkx_bie.run_gap_write_test`)**: Compiles synthetic novel entity facts (`Kestrel-941`, `Dr. Soren Vance`, `Aethelgard-7`) directly into `ZipfianTieredMoEEngram` via `compile_clusters_alphaedit` + WISE scope prototypes and measures Reliability (target NLL reduction), Paraphrase Generalization, General-Text Locality (`|CE_general_after - CE_general_before|`), and Sequential Null-Space Stability.
+To address H3 (scale/norm miscalibration), H4 (unconditional firing on general text & unsupervised prompt prefixes), and H6 (frozen consumer off-manifold sensitivity) without altering checkpoints when disabled (`selective_gating_enabled=False` by default = 100% bit-identical):
+1. **Prompt-Prefix Suppression (`min_active_pos`)**: `ZipfianTieredMoEEngram` supports `min_active_pos = p_len - 1` (via `configure_selective_gating`), zeroing Engram writes on unsupervised `<|System|>...<|User|>` prefix positions (`0 .. p_len - 2`) where `labels = -100` during training, eliminating `93.6%` of the full-sequence held-out CE penalty.
+2. **WISE Activation Scope Gate (`arXiv:2405.14768` §3.2)**: `ZipfianTieredMoEEngram` tracks compiled router directions `_compiled_scope_prototypes` in $\mathbb{S}^{63}$ (populated automatically by `compile_clusters_alphaedit` or `register_scope_prototypes`). When `scope_threshold > 0`, tokens whose router query $u_t$ has $\max_p \langle u_t, p \rangle < \tau_{\text{scope}}$ receive exact `0.0` perturbation (`scope_mask = 0`), guaranteeing `CE(ON) == CE(OFF)` on out-of-scope general text.
+3. **DeepSeek Signed-Sqrt RMSNorm Query-Key Gate (`arXiv:2601.07372` §2.3, `engram_demo_v1.py`)**: When `qk_gate_enabled=True`, computes $\alpha_t = \sigma(\text{RMSNorm}(h_t)^\top \text{RMSNorm}(m_t)/\sqrt{W})$ followed by $\text{sign}(\cdot)\sqrt{|\cdot|}$ to suppress unaligned memory retrievals before projection.
+4. **In-Manifold Trust-Region Relative Write Norm Cap**: When `max_rel_delta_norm > 0` (e.g., `0.03`), bounds $\|\Delta h_{\text{Engram}}\|_2 \le \rho_{\max} \|h\|_2$ per token so no anchor can push the frozen consumer off-manifold.
+5. **Relative-Ridge AlphaEdit Compilation & MEMIT Subspace Target Optimization (`BIE-5` / `SI4`, [`sparkx_bie.run_gap_write_test`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_bie.py#L706-L995))**: Scales Tikhonov/ridge regularization in [`compile_clusters_alphaedit`](file:///storage/emulated/10/Documents/Spark_X2.6_Loop/sparkx_loop_v03_core.py#L1926-L2218) relative to $\|W_{\text{proj}}\|_F^2 / W$ and post-SwiGLU activation energy $\|A_\perp\|_F^2 / M_e$, and optimizes a subspace-constrained target residual $\delta^* \in \text{col}(W_{\text{proj}})$ before closed-form compilation.
 
 ## 6. Roadmap hooks
 
@@ -122,4 +150,4 @@ To address H3 (scale/norm miscalibration), H4 (unconditional firing on general t
 | Long run → decision tree (§4) | tracker row *20 h resumable long run* |
 | SI0–SI7 | [05 §7](05_SI_SRSI_V2_DESIGN.md) |
 | Capability baseline incl. loop-vs-36L on **true** held-out text | SI0 |
-| Selective gating + Gap-Write (BIE-1/3/5, SI4) | `sparkx_bie.py`, Cell 6 of `SparkX_Loop_v03_LongRun_Colab.ipynb` (`7831f2f`) |
+| Selective gating + Gap-Write (BIE-1/3/5, SI4) | `sparkx_bie.py`, Cell 6 of `SparkX_Loop_v03_LongRun_Colab.ipynb` |

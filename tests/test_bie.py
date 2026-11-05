@@ -274,6 +274,40 @@ class TestBIE(unittest.TestCase):
         self.assertAlmostEqual(gap["general_locality_delta_ce"], 0.0, places=5)
         self.assertLess(gap["max_null_space_leakage"], 1e-4)
 
+        # Test under small `project.weight` (~0.02), `multi_horizon_recall=True`, and `flight_top_k > active_top_k`
+        m.eng.project.weight.data.mul_(0.08)
+        m.eng.multi_horizon_recall = True
+        m.eng.flight_top_k = 4
+        m.eng.active_top_k = 2
+        gap_dk = bie.run_gap_write_test(
+            m,
+            tok,
+            facts=[
+                {
+                    "prompt": "service ZephyrVault listens on port",
+                    "probe_alt": "configured ZephyrVault endpoint uses port",
+                    "paraphrase": "default ZephyrVault connection uses port",
+                    "target_token_id": 7,
+                },
+                {
+                    "prompt": "Project QuartzHelix assigns salt code",
+                    "probe_alt": "within Project QuartzHelix verify code",
+                    "paraphrase": "QuartzHelix supervisor checks code",
+                    "target_token_id": 13,
+                },
+            ],
+            general_texts=texts,
+            anchor_layer=1,
+            scope_threshold=0.55,
+            target_scale=1.0,
+        )
+        self.assertEqual(gap_dk["status"], "ok")
+        self.assertGreater(gap_dk["mean_orig_nll_gain"], 1.0)
+        self.assertGreater(gap_dk["mean_para_nll_gain"], 1.0)
+        self.assertEqual(gap_dk["top1_hit_rate_after"], 1.0)
+        self.assertEqual(gap_dk["para_top1_hit_rate_after"], 1.0)
+        self.assertAlmostEqual(gap_dk["general_locality_delta_ce"], 0.0, places=5)
+
 
 if __name__ == "__main__":
     unittest.main()

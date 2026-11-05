@@ -1926,6 +1926,13 @@ class ZipfianTieredMoEEngram(nn.Module):
                 d_nrm = out.float().norm(dim=-1, keepdim=True).clamp(min=1e-6)
                 cap_scale = torch.clamp((float(max_rel) * h_nrm) / d_nrm, max=1.0).to(out.dtype)
                 out = out * cap_scale
+
+            # 4. Prompt-Prefix Suppression (`min_active_pos`): zero Engram writes on unsupervised `<|System|>...<|User|>` prefix tokens
+            min_pos = int(getattr(self, 'min_active_pos', 0) or 0)
+            if min_pos > 0 and out.dim() == 3 and out.shape[1] > 1:
+                clamp_p = min(min_pos, int(out.shape[1]))
+                out = out.clone()
+                out[:, :clamp_p, :] = 0.0
         return out
 
     @property
@@ -1955,6 +1962,7 @@ class ZipfianTieredMoEEngram(nn.Module):
         qk_gate_bias: float = -1.0,
         max_rel_delta_norm: Optional[float] = 0.05,
         use_centroid_scope_fallback: bool = False,
+        min_active_pos: int = 0,
     ) -> None:
         """Configure opt-in selective gating (`BIE-3` / `SI4`). Default `enabled=False` is 100% bit-identical to legacy forward."""
         self.selective_gating_enabled = bool(enabled)
@@ -1965,6 +1973,7 @@ class ZipfianTieredMoEEngram(nn.Module):
         self.qk_gate_bias = float(qk_gate_bias)
         self.max_rel_delta_norm = None if max_rel_delta_norm is None else float(max_rel_delta_norm)
         self.use_centroid_scope_fallback = bool(use_centroid_scope_fallback)
+        self.min_active_pos = int(min_active_pos)
 
     @torch.no_grad()
     def reset_alphaedit_basis(self) -> None:
@@ -1992,7 +2001,8 @@ class ZipfianTieredMoEEngram(nn.Module):
         via Null-Space Constrained Closed-Form Ridge Compilation (`AlphaEdit`, Fang et al., ICLR 2025).
 
         Phase 0 fixes:
-          - M5: Uses exact damped right-inverse `W^T (W W^T + lam I)^{-1}` (`precompute_damped_right_inverse`).
+          - M5: Uses exact damped right-inverse `W^T (W W^T + lam I)^{-1}` (`precompute_damped_right_inverse`) with
+            scale-adaptive Tikhonov damping relative to `mean_sv_sq(W_proj)`.
           - M6: Never overwrites `self.project.weight` with `0.25 * I` (skips cleanly if `project` is zero-gated).
           - M4: Raises `CapacityExhaustedError` via `update_orthonormal_basis` instead of silently truncating old basis columns.
           - m1: Uses `F.linear(..., self.router_proj.weight.float())` without mutating module parameters in place.
@@ -2030,8 +2040,10 @@ class ZipfianTieredMoEEngram(nn.Module):
                 "total_active_null_rank": sum(int(v.shape[1]) for v in self._alphaedit_basis.values()),
             }
 
-        # Fix M5: exact damped right-inverse `W_proj^T (W_proj W_proj^T + lam I)^{-1}` for `W_proj @ delta_c = r`
-        pinv_w_p = precompute_damped_right_inverse(proj_w_f32, lam=1e-2)  # [width, width]
+        # Fix M5: exact damped right-inverse `W_proj^T (W_proj W_proj^T + lam I)^{-1}` with scale-adaptive relative damping
+        mean_sv_sq = float(proj_w_f32.pow(2).sum().item()) / float(max(1, proj_w_f32.shape[0]))
+        eff_lam = min(1e-2, max(1e-8, 1e-3 * mean_sv_sq))
+        pinv_w_p = precompute_damped_right_inverse(proj_w_f32, lam=eff_lam)  # [width, width]
 
         dom = str(domain).lower().strip()
         zones = {
@@ -2054,7 +2066,10 @@ class ZipfianTieredMoEEngram(nn.Module):
         if dom_bias is not None and dom_bias.numel() >= e_act:
             e_bias = e_bias + dom_bias[:e_act].detach().float().to(device)
 
-        mod_gate = float(torch.sigmoid(self.gain.detach().float()).item())
+        if not self.training and getattr(self, "_gate_override_tensor", None) is not None:
+            mod_gate = float(torch.tanh(self._gate_override_tensor.detach().float()).abs().item())
+        else:
+            mod_gate = float(torch.sigmoid(self.gain.detach().float()).item())
         if getattr(self, "use_pass_gain_schedule", False):
             mod_gate *= float(torch.sigmoid(self.pass_gain_logits[0].detach().float()).item())
         mod_gate = max(mod_gate, 1e-3)
@@ -2067,8 +2082,9 @@ class ZipfianTieredMoEEngram(nn.Module):
                 ids_dev = ids_dev.unsqueeze(0)
             ngram_all = self.compute_ngram_indices(ids_dev, self.total_buckets)
 
+        use_multi_horizon = bool(getattr(self, "multi_horizon_recall", False))
         use_query_key = str(key_mode).lower().strip() != "cluster"
-        expert_buckets: dict[int, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+        expert_buckets: dict[int, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = {}
         for cl in clusters:
             raw_key_h = cl.get("query_hidden") if (use_query_key and "query_hidden" in cl) else cl["cluster_hidden"]
             h_b = raw_key_h.to(device=device, dtype=param_dtype).view(1, 1, self.width)
@@ -2079,12 +2095,22 @@ class ZipfianTieredMoEEngram(nn.Module):
             h_norm = triton_rmsnorm(h_b, self.norm_weight, self.norm_eps)
             h_norm_f = h_norm.float().view(1, self.width)
 
-            # Lexical lookup at trigger position (if available)
-            if ngram_all is not None and 0 <= trig_pos < ngram_all[0].shape[1]:
+            # Per-cluster `input_ids` override (so multi-prompt batches match each prompt's exact N-grams)
+            cl_ids = cl.get("input_ids")
+            if isinstance(cl_ids, torch.Tensor) and cl_ids.numel() > 0:
+                cl_ids_dev = cl_ids.to(device)
+                if cl_ids_dev.dim() == 1:
+                    cl_ids_dev = cl_ids_dev.unsqueeze(0)
+                cur_ng = self.compute_ngram_indices(cl_ids_dev, self.total_buckets)
+            else:
+                cur_ng = ngram_all
+
+            # Lexical lookup at trigger position matching `forward()` (including `multi_horizon_recall` when active)
+            if cur_ng is not None and 0 <= trig_pos < cur_ng[0].shape[1]:
                 sub_ng = (
-                    ngram_all[0][:, trig_pos : trig_pos + 1],
-                    ngram_all[1][:, trig_pos : trig_pos + 1],
-                    ngram_all[2][:, trig_pos : trig_pos + 1],
+                    cur_ng[0][:, trig_pos : trig_pos + 1],
+                    cur_ng[1][:, trig_pos : trig_pos + 1],
+                    cur_ng[2][:, trig_pos : trig_pos + 1],
                 )
                 if inject_lexical and float(lexical_strength) > 0.0:
                     q_cue = self.query_proj(h_norm).detach().view(self.eng_dim)
@@ -2095,9 +2121,27 @@ class ZipfianTieredMoEEngram(nn.Module):
                             self.tier1a_hot.weight.data[row].lerp_(
                                 q_cue.to(self.tier1a_hot.weight.dtype), float(lexical_strength)
                             )
-                e_lex = self._lookup_tier1_lexical(sub_ng, device, param_dtype)
+                if use_multi_horizon and trig_pos >= 1:
+                    w_start = max(0, trig_pos - 2)
+                    win_ng = (
+                        cur_ng[0][:, w_start : trig_pos + 1],
+                        cur_ng[1][:, w_start : trig_pos + 1],
+                        cur_ng[2][:, w_start : trig_pos + 1],
+                    )
+                    e_win = self._lookup_tier1_lexical(win_ng, device, param_dtype)
+                    if e_win.shape[1] >= 3:
+                        e_lex = (0.83 * e_win[:, -1:, :] + 0.12 * e_win[:, -2:-1, :] + 0.05 * e_win[:, -3:-2, :]).to(param_dtype)
+                    elif e_win.shape[1] == 2:
+                        e_lex = (0.88 * e_win[:, -1:, :] + 0.12 * e_win[:, -2:-1, :]).to(param_dtype)
+                    else:
+                        e_lex = e_win[:, -1:, :]
+                else:
+                    e_lex = self._lookup_tier1_lexical(sub_ng, device, param_dtype)
             else:
                 e_lex = torch.zeros((1, 1, self.eng_dim), device=device, dtype=param_dtype)
+            _lex_s = getattr(self, "_ablate_lex", 1.0)
+            if _lex_s != 1.0:
+                e_lex = e_lex * _lex_s
 
             # Fix m1: route `h_norm_f` through X-MoE hypersphere router without calling `.float()` on the module
             u = F.normalize(F.linear(h_norm_f, self.router_proj.weight.float()), p=2.0, dim=-1, eps=1e-6)  # [1, 64]
@@ -2108,6 +2152,13 @@ class ZipfianTieredMoEEngram(nn.Module):
             topk_raw = torch.gather(scores, dim=-1, index=topk_idx)
             prim_raw = topk_raw[:k_base]
             prim_gates = prim_raw / (prim_raw.sum() + 1e-6)
+            if k_act > k_base:
+                ent = -(prim_gates * torch.log(prim_gates.clamp(min=1e-7))).sum()
+                max_ent = math.log(max(2, k_base))
+                ent_norm = (ent / max_ent).clamp(0.0, 1.0)
+                beta_tail = float(getattr(self, "elastic_tail_blend_max", 0.18))
+                alpha_t = beta_tail * ent_norm.pow(2)
+                prim_gates = (1.0 - alpha_t) * prim_gates
 
             # Pick the best active specialist in `topk_idx[:k_base]` with highest (gate * free_null_capacity)
             best_k = 0
@@ -2151,15 +2202,20 @@ class ZipfianTieredMoEEngram(nn.Module):
             a_mat = torch.stack([p[0] for p in pairs], dim=0)  # [M_e, 3072]
             dz_mat = torch.stack([p[1] for p in pairs], dim=0)  # [M_e, 2560]
 
+            # Scale ridge regularizer and SVD null threshold relative to post-SwiGLU activation energy `||a_b||^2`
+            mean_act_sq = float(a_mat.pow(2).sum().item()) / float(max(1, a_mat.shape[0]))
+            eff_alpha = min(float(alpha_ridge), max(1e-12, float(alpha_ridge) * mean_act_sq))
+            eff_null_thr = min(float(null_threshold), max(1e-8, float(null_threshold) * math.sqrt(max(1e-12, mean_act_sq))))
+
             v_act = self._alphaedit_basis.get(e_id)
             dw_down, a_perp, _, rel_err = solve_null_space_ridge(
-                a_mat, dz_mat, v_basis=v_act, alpha_ridge=float(alpha_ridge)
+                a_mat, dz_mat, v_basis=v_act, alpha_ridge=eff_alpha
             )
             fit_errors.append(rel_err)
 
             # Update orthonormal active basis `V_active[e_id]` first so capacity exhaustion raises before mutating weights (M4 fix)
             new_basis = update_orthonormal_basis(
-                v_act, a_perp, max_rank=max_allowed_rank, null_threshold=float(null_threshold)
+                v_act, a_perp, max_rank=max_allowed_rank, null_threshold=eff_null_thr
             )
             self._alphaedit_basis[e_id] = new_basis
 
