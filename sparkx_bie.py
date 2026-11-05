@@ -229,6 +229,14 @@ def run_bie(model: Any, tokenizer: Any, texts: Optional[Sequence[str]] = None, m
         log("gate-design CE: " + ", ".join(f"{k}={v:.4f}" for k, v in rep["gate_design_ce"].items()))
     except Exception as e:
         rep["errors"].append(f"gate_design: {type(e).__name__}: {str(e)[:200]}")
+    try:
+        rep["prompt_vs_response_ce"] = prompt_vs_response_breakdown(model, tokenizer, texts, max_tokens)
+        log("prompt-vs-response CE: " + ", ".join(
+            f"{k}:off={v['ce_off']:.4f}/on={v['ce_on']:.4f}(d={v['delta_ce']:+.4f})"
+            for k, v in rep["prompt_vs_response_ce"].items()
+        ))
+    except Exception as e:
+        rep["errors"].append(f"prompt_vs_response: {type(e).__name__}: {str(e)[:200]}")
     finally:
         try:
             model.engram_pass_filter = None
@@ -242,6 +250,87 @@ def run_bie(model: Any, tokenizer: Any, texts: Optional[Sequence[str]] = None, m
             model.base.eval()
     rep["verdict"] = interpret_bie(rep)
     return rep
+
+
+@torch.no_grad()
+def prompt_vs_response_breakdown(
+    model: Any,
+    tokenizer: Any,
+    texts: Sequence[str],
+    max_tokens: int = 2048,
+) -> Dict[str, Dict[str, float]]:
+    """Decompose `TRUE_HELDOUT_TEXTS` CE into prompt-prefix (`before <|Bot|>`) vs response (`after <|Bot|>`)
+    and test replacing the eval system prompt with the training `tokenize_and_mask_record_16k` system prompt."""
+    device = next(model.parameters()).device
+    prev_engram = getattr(model, "use_engram", False)
+    train_sys = (
+        "You are Spark-X2.6, a 72-layer recurrent reasoning and agentic engineering model. "
+        "Outline your plan concisely inside <think>...</think>, then emit the complete deliverable."
+    )
+    eval_sys = "You are Spark-X2.6, an advanced reasoning and engineering assistant."
+
+    def _eval_split(text_list: Sequence[str], mode: str) -> Tuple[float, float]:
+        sums = {False: 0.0, True: 0.0}
+        counts = {False: 0, True: 0}
+        for use_eng in (False, True):
+            try:
+                model.use_engram = use_eng
+            except Exception:
+                pass
+            for t in text_list:
+                bot_idx = t.find("<|Bot|>")
+                if bot_idx < 0 or mode == "all_tokens":
+                    ids = tokenizer(t, add_special_tokens=False, return_tensors="pt").input_ids[:, :max_tokens].to(device)
+                    if ids.shape[1] < 2:
+                        continue
+                    lg = model.forward_logits(ids).float()
+                    nll = F.cross_entropy(lg[:, :-1].reshape(-1, lg.shape[-1]), ids[:, 1:].reshape(-1), reduction="sum")
+                    sums[use_eng] += float(nll.item())
+                    counts[use_eng] += int(ids.shape[1] - 1)
+                else:
+                    p_str = t[: bot_idx + len("<|Bot|>")]
+                    p_ids = tokenizer(p_str, add_special_tokens=False, return_tensors="pt").input_ids
+                    p_len = int(p_ids.shape[1])
+                    ids = tokenizer(t, add_special_tokens=False, return_tensors="pt").input_ids[:, :max_tokens].to(device)
+                    if ids.shape[1] <= p_len:
+                        continue
+                    lg = model.forward_logits(ids).float()
+                    targets = ids[:, 1:].clone()
+                    if mode == "prompt_only":
+                        targets[:, p_len - 1 :] = -100
+                    elif mode == "response_only":
+                        targets[:, : max(0, p_len - 1)] = -100
+                    n_sup = int((targets != -100).sum().item())
+                    if n_sup <= 0:
+                        continue
+                    nll = F.cross_entropy(
+                        lg[:, :-1].reshape(-1, lg.shape[-1]),
+                        targets.reshape(-1),
+                        ignore_index=-100,
+                        reduction="sum",
+                    )
+                    sums[use_eng] += float(nll.item())
+                    counts[use_eng] += n_sup
+        ce_off = sums[False] / max(1, counts[False])
+        ce_on = sums[True] / max(1, counts[True])
+        return ce_off, ce_on
+
+    try:
+        enable_selective_engram_gating(model, enabled=False)
+        model.engram_pass_filter = None
+        out: Dict[str, Dict[str, float]] = {}
+        for mode in ("all_tokens", "prompt_only", "response_only"):
+            c0, c1 = _eval_split(texts, mode)
+            out[mode] = {"ce_off": c0, "ce_on": c1, "delta_ce": c1 - c0}
+        train_sys_texts = [t.replace(eval_sys, train_sys) for t in texts]
+        c0_tr, c1_tr = _eval_split(train_sys_texts, "response_only")
+        out["train_sys_response_only"] = {"ce_off": c0_tr, "ce_on": c1_tr, "delta_ce": c1_tr - c0_tr}
+        return out
+    finally:
+        try:
+            model.use_engram = prev_engram
+        except Exception:
+            pass
 
 
 def interpret_bie(rep: Dict[str, Any], noise: float = 0.005) -> Dict[str, Any]:
@@ -291,7 +380,7 @@ def _find_decoder_layers_and_head(model: Any) -> Tuple[List[Any], Optional[Any],
 def knowledge_locus_scan(
     model: Any,
     tokenizer: Any,
-    texts: Sequence[str],
+    texts: Optional[Sequence[str]] = None,
     max_tokens: int = 512,
 ) -> Dict[str, Any]:
     """`BIE-1`: Scan the 72L looped backbone to measure where predictions converge toward the final distribution.
@@ -300,6 +389,9 @@ def knowledge_locus_scan(
     `final_norm + lm_head` (LogitLens) and computes `KL(p_final || p_step)` and top-1 agreement with final predictions,
     plus relative step update norm `||h_after - h_before|| / ||h_before||`.
     """
+    if texts is None:
+        import sparkx_engram_generalization as eg
+        texts = eg.TRUE_HELDOUT_TEXTS
     device = next(model.parameters()).device
     layers, final_norm, lm_head = _find_decoder_layers_and_head(model)
     if not layers or lm_head is None:
