@@ -442,17 +442,19 @@ def project_into_null_space(a_mat: Any, v_basis: Optional[Any]) -> Any:
     """Double Classical Gram-Schmidt projection of rows of `a_mat` (`[M, R]`) into the null space of `v_basis` (`[R, K]`)."""
     if v_basis is None:
         if HAS_TORCH and isinstance(a_mat, torch.Tensor):
-            return a_mat.detach().float().clone()
+            out_dt = torch.float64 if a_mat.dtype == torch.float64 else torch.float32
+            return a_mat.detach().to(out_dt).clone()
         return [list(row) for row in a_mat]
 
     if HAS_TORCH and isinstance(a_mat, torch.Tensor):
-        a_f32 = a_mat.detach().float()
+        out_dt = torch.float64 if a_mat.dtype == torch.float64 else torch.float32
+        a_f64 = a_mat.detach().double()
         if v_basis.numel() == 0 or v_basis.shape[1] == 0:
-            return a_f32.clone()
-        v_f32 = v_basis.detach().float()
-        a_perp = a_f32 - torch.matmul(torch.matmul(a_f32, v_f32), v_f32.t())
-        a_perp = a_perp - torch.matmul(torch.matmul(a_perp, v_f32), v_f32.t())
-        return a_perp
+            return a_f64.to(out_dt).clone()
+        v_f64 = v_basis.detach().double()
+        a_perp = a_f64 - torch.matmul(torch.matmul(a_f64, v_f64), v_f64.t())
+        a_perp = a_perp - torch.matmul(torch.matmul(a_perp, v_f64), v_f64.t())
+        return a_perp.to(out_dt)
 
     if not v_basis or not v_basis[0]:
         return [list(row) for row in a_mat]
@@ -469,24 +471,35 @@ def solve_null_space_ridge(
     v_basis: Optional[Any] = None,
     alpha_ridge: float = 1e-2,
 ) -> Tuple[Any, Any, Any, float]:
-    """Compute the AlphaEdit null-space constrained dual ridge update in `float32`:
+    """Compute the AlphaEdit null-space constrained dual ridge update in `float64` with row equilibration:
         A_perp = project_into_null_space(A, V_basis)
-        Delta_W = A_perp^T (A_perp A_perp^T + alpha I_M)^{-1} Delta_Z
+        Delta_W = A_perp^T (A_perp A_perp^T + alpha * diag(||a_{i,perp}||^2))^{-1} Delta_Z
     Returns `(dw, a_perp, dual_weights, rel_fit_error)`.
     """
-    a_perp = project_into_null_space(a_mat, v_basis)
-    if HAS_TORCH and isinstance(a_perp, torch.Tensor):
-        dz_f32 = dz_mat.detach().float()
-        m_e = int(a_perp.shape[0])
-        gram_m = torch.matmul(a_perp, a_perp.t()) + float(alpha_ridge) * torch.eye(
-            m_e, device=a_perp.device, dtype=torch.float32
+    if HAS_TORCH and isinstance(a_mat, torch.Tensor):
+        out_dt = torch.float64 if a_mat.dtype == torch.float64 else torch.float32
+        a_f64 = a_mat.detach().double()
+        dz_f64 = dz_mat.detach().double()
+        a_perp_f64 = project_into_null_space(a_f64, v_basis)
+        m_e = int(a_perp_f64.shape[0])
+        row_norms = a_perp_f64.norm(dim=-1, keepdim=True).clamp(min=1e-15)
+        a_hat = a_perp_f64 / row_norms
+        dz_hat = dz_f64 / row_norms
+        rel_alpha = min(float(alpha_ridge), 1e-3) if float(alpha_ridge) > 0.0 else 1e-8
+        gram_hat = torch.matmul(a_hat, a_hat.t()) + rel_alpha * torch.eye(
+            m_e, device=a_perp_f64.device, dtype=torch.float64
         )
-        dual_weights = torch.linalg.solve(gram_m, dz_f32)
-        dw = torch.matmul(a_perp.t(), dual_weights)
-        pred_dz = torch.matmul(a_perp, dw)
-        rel_err = float((pred_dz - dz_f32).norm().item() / (dz_f32.norm().item() + 1e-6))
-        return dw, a_perp, dual_weights, rel_err
+        dual_hat = torch.linalg.solve(gram_hat, dz_hat)
+        dw_f64 = torch.matmul(a_hat.t(), dual_hat)
+        if v_basis is not None and isinstance(v_basis, torch.Tensor) and v_basis.numel() > 0 and v_basis.shape[1] > 0:
+            v_f64 = v_basis.detach().double()
+            dw_f64 = dw_f64 - torch.matmul(v_f64, torch.matmul(v_f64.t(), dw_f64))
+        pred_dz = torch.matmul(a_perp_f64, dw_f64)
+        rel_err = float((pred_dz - dz_f64).norm().item() / (dz_f64.norm().item() + 1e-12))
+        dual_weights = (dual_hat / row_norms).to(out_dt)
+        return dw_f64.to(out_dt), a_perp_f64.to(out_dt), dual_weights, rel_err
 
+    a_perp = project_into_null_space(a_mat, v_basis)
     m_e = len(a_perp)
     a_perp_t = _py_transpose(a_perp)
     gram_m = _py_matmul(a_perp, a_perp_t)
@@ -511,30 +524,56 @@ def update_orthonormal_basis(
     max_rank: int,
     null_threshold: float = 1e-4,
 ) -> Any:
-    """Extend orthonormal basis `v_basis` (`[R, K]`) with the active row space of `a_perp` (`[M, R]`).
+    """Extend orthonormal basis `v_basis` (`[R, K]`) with the active row space of `a_perp` (`[M, R]`)
+    using Row-Normalized DGKS Double Gram-Schmidt in `float64`.
 
     Raises `CapacityExhaustedError` if `K + r_new > max_rank` instead of silently dropping old columns (fixes M4).
     """
     if HAS_TORCH and isinstance(a_perp, torch.Tensor):
-        a_f32 = a_perp.detach().float()
-        _, s_vals, vh_new = torch.linalg.svd(a_f32, full_matrices=False)
-        keep_mask = s_vals > float(null_threshold)
-        r_new = int(keep_mask.sum().item())
+        out_dt = (
+            torch.float64
+            if (a_perp.dtype == torch.float64 or (isinstance(v_basis, torch.Tensor) and v_basis.dtype == torch.float64))
+            else torch.float32
+        )
+        a_f64 = a_perp.detach().double()
+        r_dim = int(a_f64.shape[1]) if a_f64.dim() == 2 else int(a_f64.numel())
+        if a_f64.dim() == 1:
+            a_f64 = a_f64.unsqueeze(0)
+        if v_basis is not None and isinstance(v_basis, torch.Tensor) and v_basis.numel() > 0 and v_basis.shape[1] > 0:
+            v_f64 = v_basis.detach().double()
+            cur_k = int(v_f64.shape[1])
+        else:
+            v_f64 = None
+            cur_k = 0
+
+        rel_thr = min(float(null_threshold), 1e-5)
+        new_cols: List[Any] = []
+        for i in range(int(a_f64.shape[0])):
+            row = a_f64[i]
+            r_norm = float(row.norm().item())
+            if r_norm <= float(null_threshold) and r_norm <= 1e-12:
+                continue
+            u = row / max(r_norm, 1e-15)
+            for _ in range(2):
+                if v_f64 is not None:
+                    u = u - torch.mv(v_f64, torch.mv(v_f64.t(), u))
+                for nc in new_cols:
+                    u = u - torch.dot(nc, u) * nc
+            rem_norm = float(u.norm().item())
+            if rem_norm > rel_thr and (rem_norm * r_norm) > min(float(null_threshold), 1e-12):
+                new_cols.append(u / rem_norm)
+
+        r_new = len(new_cols)
         if r_new == 0:
             return v_basis
-        new_dirs = vh_new[keep_mask].t()  # [R, r_new]
-        cur_k = int(v_basis.shape[1]) if (v_basis is not None and v_basis.numel() > 0) else 0
         if cur_k + r_new > int(max_rank):
             raise CapacityExhaustedError(
                 f"Null-space basis capacity exhausted: current_rank={cur_k} + new_rank={r_new} > max_rank={max_rank}. "
                 f"Allocate a new memory shard or run deep-sleep SMF consolidation instead of truncating protected keys."
             )
-        if v_basis is None or cur_k == 0:
-            q_ortho, _ = torch.linalg.qr(new_dirs, mode="reduced")
-            return q_ortho
-        cat_dirs = torch.cat([v_basis.detach().float(), new_dirs], dim=1)
-        q_ortho, _ = torch.linalg.qr(cat_dirs, mode="reduced")
-        return q_ortho
+        new_mat = torch.stack(new_cols, dim=1)
+        res_f64 = new_mat if v_f64 is None else torch.cat([v_f64, new_mat], dim=1)
+        return res_f64.to(out_dt)
 
     # Pure-Python Gram-Schmidt on rows of `a_perp`
     r_dim = len(a_perp[0]) if a_perp else 0

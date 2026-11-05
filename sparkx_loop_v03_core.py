@@ -1830,7 +1830,10 @@ class ZipfianTieredMoEEngram(nn.Module):
             flat_idx = topk_idx.reshape(n_tokens, k_act)
             flat_gates = topk_gates.reshape(n_tokens, k_act)
 
-            if n_tokens <= 8:
+            fp32_down_map = getattr(self, '_alphaedit_fp32_down', None)
+            use_fp32_compiled = bool(fp32_down_map)
+
+            if n_tokens <= 8 and not use_fp32_compiled:
                 # Zero-loop, zero-sync batched contraction for single-token / small-batch decoding!
                 w_g = self.expert_gate[flat_idx]   # [N, K, D, R]
                 w_u = self.expert_up[flat_idx]     # [N, K, D, R]
@@ -1841,7 +1844,7 @@ class ZipfianTieredMoEEngram(nn.Module):
                 out_k = torch.einsum('nkr,nkrw->nkw', act, w_d)
                 routed_flat = (out_k * flat_gates.unsqueeze(-1)).sum(dim=1)
             else:
-                # Sorted contiguous bucket dispatch for 4K/8K/16K prefill & training (1 bincount, 0 .any()/.nonzero() syncs!)
+                # Sorted contiguous bucket dispatch for 4K/8K/16K prefill & training (or exact fp32 AlphaEdit evaluation)
                 flat_e = flat_idx.reshape(-1)
                 sorted_e, sort_perm = torch.sort(flat_e)
                 token_rows = torch.div(sort_perm, k_act, rounding_mode='floor')
@@ -1849,6 +1852,7 @@ class ZipfianTieredMoEEngram(nn.Module):
                 sorted_g = flat_gates.reshape(-1).index_select(0, sort_perm).unsqueeze(-1)
                 counts = torch.bincount(sorted_e, minlength=e_act).tolist()
 
+                accum_dt = torch.float32 if use_fp32_compiled else param_dtype
                 out_chunks = []
                 offset = 0
                 for e_id, cnt in enumerate(counts):
@@ -1861,24 +1865,36 @@ class ZipfianTieredMoEEngram(nn.Module):
                         torch.matmul(q_e, self.expert_gate[e_id]),
                         torch.matmul(q_e, self.expert_up[e_id]),
                     )
-                    out_chunks.append(torch.matmul(act_e, self.expert_down[e_id]) * g_e)
+                    if use_fp32_compiled and e_id in fp32_down_map:
+                        w_d_fp32 = fp32_down_map[e_id].to(device=act_e.device, dtype=torch.float32)
+                        out_chunks.append(torch.matmul(act_e.float(), w_d_fp32) * g_e.float())
+                    elif use_fp32_compiled:
+                        out_chunks.append((torch.matmul(act_e, self.expert_down[e_id]) * g_e).float())
+                    else:
+                        out_chunks.append(torch.matmul(act_e, self.expert_down[e_id]) * g_e)
 
-                routed_flat = torch.zeros((n_tokens, self.width), dtype=param_dtype, device=flat_q.device)
+                routed_flat = torch.zeros((n_tokens, self.width), dtype=accum_dt, device=flat_q.device)
                 if out_chunks:
                     routed_flat.index_add_(0, token_rows, torch.cat(out_chunks, dim=0))
 
-            routed_out = routed_flat.view_as(shared_out)
+            routed_out = routed_flat.view(shared_out.shape)
             _sem_s = getattr(self, '_ablate_sem', 1.0)
             if _sem_s != 1.0:
                 routed_out = routed_out * _sem_s
                 shared_out = shared_out * _sem_s
-            combined = 0.5 * lex_hidden + shared_out + routed_out
-            ctx = 2.0 * torch.sigmoid(self.ctx_gate(h_norm).float()).to(param_dtype)
-            combined = combined * ctx
+            if use_fp32_compiled:
+                combined_f32 = 0.5 * lex_hidden.float() + shared_out.float() + routed_out.float()
+                ctx_f32 = 2.0 * torch.sigmoid(self.ctx_gate(h_norm).float())
+                combined_f32 = combined_f32 * ctx_f32
+                projected = F.linear(combined_f32, self.project.weight.float())
+            else:
+                combined = 0.5 * lex_hidden + shared_out + routed_out
+                ctx = 2.0 * torch.sigmoid(self.ctx_gate(h_norm).float()).to(param_dtype)
+                combined = combined * ctx
+                projected = self.project(combined)
         else:
             combined = F.silu(lex_hidden)
-
-        projected = self.project(combined)
+            projected = self.project(combined)
         p_idx_gate = min(max(int(pass_idx), 0), self.max_passes - 1)
         if not self.training and self._gate_override_tensor is not None:
             gate = torch.tanh(self._gate_override_tensor.to(device=projected.device, dtype=torch.float32)).abs().to(dtype)
@@ -2188,34 +2204,9 @@ class ZipfianTieredMoEEngram(nn.Module):
                 ctx_b = (2.0 * torch.sigmoid(self.ctx_gate(h_norm).float())).view(self.width).clamp(min=0.1)
                 group_items.append((u, q_vec, ctx_b, y_b))
 
-            # Route fact group using its mean hypersphere query `u_mean` so all probes of a fact share `e_star`
-            u_mean = F.normalize(torch.stack([it[0] for it in group_items], dim=0).mean(dim=0), p=2.0, dim=-1, eps=1e-6)
-            r_logits = (torch.matmul(u_mean, c_norm.t()) / temp) + p_bias  # [1, e_act]
-            scores = torch.sigmoid(r_logits)[0]
-            sel_scores = scores + e_bias
-            _, topk_idx = torch.topk(sel_scores, k=k_act, dim=-1)
-
-            best_k = 0
-            best_score = -1.0
-            for k_i in range(k_base):
-                cand_e = int(topk_idx[k_i].item())
-                v_basis = self._alphaedit_basis.get(cand_e)
-                used_r = int(v_basis.shape[1]) if v_basis is not None else 0
-                free_frac = max(0.05, 1.0 - (used_r / float(self.expert_rank)))
-                zone_mult = 1.25 if cand_e in zone_set else 1.0
-                sc = float(scores[cand_e].item()) * free_frac * zone_mult
-                if sc > best_score:
-                    best_score = sc
-                    best_k = k_i
-
-            e_star = int(topk_idx[best_k].item())
-            w_g = self.expert_gate[e_star].detach()
-            w_u = self.expert_up[e_star].detach()
-
-            act_list = []
-            dz_list = []
-            q_list = []
-            for u_it, q_it, ctx_it, y_it in group_items:
+            # Compute exact primary Top-K gates per probe and select shared specialist `e_star` with max (min_probe_gate * free_frac)
+            probe_gate_maps: list[dict[int, float]] = []
+            for u_it, _, _, _ in group_items:
                 r_logits_it = (torch.matmul(u_it, c_norm.t()) / temp) + p_bias
                 scores_it = torch.sigmoid(r_logits_it)[0]
                 _, topk_it = torch.topk(scores_it + e_bias, k=k_act, dim=-1)
@@ -2227,25 +2218,46 @@ class ZipfianTieredMoEEngram(nn.Module):
                     ent_norm_it = (ent_it / math.log(max(2, k_base))).clamp(0.0, 1.0)
                     alpha_t_it = float(getattr(self, "elastic_tail_blend_max", 0.18)) * ent_norm_it.pow(2)
                     prim_gates_it = (1.0 - alpha_t_it) * prim_gates_it
-                match_pos = (topk_it[:k_base] == e_star).nonzero(as_tuple=False)
-                if match_pos.numel() > 0:
-                    g_star_it = max(float(prim_gates_it[int(match_pos[0].item())].item()), 1e-2)
-                else:
-                    g_star_it = max(float(prim_gates_it[best_k].item()), 1e-2)
+                g_map: dict[int, float] = {}
+                for k_i in range(k_base):
+                    g_map[int(topk_it[k_i].item())] = float(prim_gates_it[k_i].item())
+                probe_gate_maps.append(g_map)
 
+            common_experts = set(probe_gate_maps[0].keys())
+            for gm in probe_gate_maps[1:]:
+                common_experts &= set(gm.keys())
+            candidate_experts = sorted(common_experts) if common_experts else sorted(
+                {e_c for gm in probe_gate_maps for e_c in gm.keys()}
+            )
+
+            e_star = candidate_experts[0]
+            best_score = -1.0
+            use_zone_bonus = dom in zones
+            for cand_e in candidate_experts:
+                v_basis = self._alphaedit_basis.get(cand_e)
+                used_r = int(v_basis.shape[1]) if v_basis is not None else 0
+                free_frac = max(0.05, 1.0 - (used_r / float(self.expert_rank)))
+                zone_mult = (1.15 if cand_e in zone_set else 1.0) if use_zone_bonus else 1.0
+                if common_experts:
+                    gate_metric = min(gm[cand_e] for gm in probe_gate_maps)
+                else:
+                    gate_metric = sum(gm.get(cand_e, 0.0) for gm in probe_gate_maps) / float(len(probe_gate_maps))
+                sc = gate_metric * free_frac * zone_mult
+                if sc > best_score:
+                    best_score = sc
+                    e_star = cand_e
+
+            w_g = self.expert_gate[e_star].detach()
+            w_u = self.expert_up[e_star].detach()
+
+            for idx_p, (u_it, q_it, ctx_it, y_it) in enumerate(group_items):
+                gm = probe_gate_maps[idx_p]
+                g_star_it = max(gm.get(e_star, max(gm.values()) if gm else 0.1), 1e-2)
                 act_it = triton_swiglu(torch.matmul(q_it, w_g), torch.matmul(q_it, w_u))[0].float()
                 r_target_it = float(target_scale) * y_it
                 comb_delta_it = torch.mv(pinv_w_p, r_target_it / mod_gate)
                 dz_it = comb_delta_it / (ctx_it * g_star_it)
-                act_list.append(act_it)
-                dz_list.append(dz_it)
-                q_list.append(q_it.detach())
-
-            # Post-SwiGLU MEMIT prototype aggregation across probes of the same fact
-            act_proto = torch.stack(act_list, dim=0).mean(dim=0)
-            dz_proto = torch.stack(dz_list, dim=0).mean(dim=0)
-            q_proto = torch.cat(q_list, dim=0)  # [P, eng_dim]
-            expert_buckets.setdefault(e_star, []).append((act_proto, dz_proto, q_proto))
+                expert_buckets.setdefault(e_star, []).append((act_it, dz_it, q_it.detach()))
 
         fit_errors: list[float] = []
         max_null_leakage = 0.0
@@ -2254,7 +2266,7 @@ class ZipfianTieredMoEEngram(nn.Module):
         new_qvecs_this_call: list[torch.Tensor] = []
 
         for e_id, pairs in expert_buckets.items():
-            # Cross-Expert Null-Space Projection: ensure all historical compiled queries `Q_hist` are protected on `e_id`
+            # Cross-Expert Null-Space Projection in `float64`: ensure all historical compiled queries `Q_hist` are protected on `e_id`
             prev_q_count = int(self._alphaedit_basis_qcount.get(e_id, 0))
             total_q_hist = len(self._alphaedit_history_qvecs)
             v_act = self._alphaedit_basis.get(e_id)
@@ -2265,58 +2277,54 @@ class ZipfianTieredMoEEngram(nn.Module):
                 act_hist_e = triton_swiglu(
                     torch.matmul(unproj_q, self.expert_gate[e_id].detach()),
                     torch.matmul(unproj_q, self.expert_up[e_id].detach()),
-                ).float()
+                ).double()
                 act_hist_perp = project_into_null_space(act_hist_e, v_act)
-                hist_perp_sq = float(act_hist_perp.pow(2).sum().item()) / float(max(1, act_hist_perp.shape[0]))
-                hist_thr = max(1e-12, 1e-6 * math.sqrt(max(1e-24, hist_perp_sq)))
                 v_act = update_orthonormal_basis(
-                    v_act, act_hist_perp, max_rank=max_allowed_rank, null_threshold=hist_thr
+                    v_act, act_hist_perp, max_rank=max_allowed_rank, null_threshold=1e-7
                 )
                 self._alphaedit_basis[e_id] = v_act
                 a_hist_prev = self._alphaedit_history_acts.get(e_id)
                 if a_hist_prev is None:
-                    self._alphaedit_history_acts[e_id] = act_hist_e.detach().clone()
+                    self._alphaedit_history_acts[e_id] = act_hist_e.float().detach().clone()
                 else:
-                    self._alphaedit_history_acts[e_id] = torch.cat([a_hist_prev, act_hist_e.detach().clone()], dim=0)
+                    self._alphaedit_history_acts[e_id] = torch.cat(
+                        [a_hist_prev, act_hist_e.float().detach().clone()], dim=0
+                    )
                 self._alphaedit_basis_qcount[e_id] = total_q_hist
 
-            a_mat = torch.stack([p[0] for p in pairs], dim=0)  # [M_e, 3072]
-            dz_mat = torch.stack([p[1] for p in pairs], dim=0)  # [M_e, 2560]
+            a_mat_f64 = torch.stack([p[0] for p in pairs], dim=0).double()  # [M_e, 3072]
+            dz_mat_f64 = torch.stack([p[1] for p in pairs], dim=0).double()  # [M_e, 2560]
 
-            # Scale ridge regularizer and SVD null threshold relative to POST-PROJECTION activation energy `||a_perp||^2`
-            a_perp_pre = project_into_null_space(a_mat, v_act)
-            mean_perp_sq = float(a_perp_pre.pow(2).sum().item()) / float(max(1, a_perp_pre.shape[0]))
-            eff_alpha = min(float(alpha_ridge), max(1e-18, float(alpha_ridge) * mean_perp_sq))
-            eff_null_thr = max(1e-12, 1e-6 * math.sqrt(max(1e-24, mean_perp_sq)))
-
-            dw_down, a_perp, _, rel_err = solve_null_space_ridge(
-                a_mat, dz_mat, v_basis=v_act, alpha_ridge=eff_alpha
+            dw_down_f64, a_perp_f64, _, rel_err = solve_null_space_ridge(
+                a_mat_f64, dz_mat_f64, v_basis=v_act, alpha_ridge=float(alpha_ridge)
             )
             fit_errors.append(rel_err)
 
-            # Update orthonormal active basis `V_active[e_id]` first so capacity exhaustion raises before mutating weights (M4 fix)
-            new_basis = update_orthonormal_basis(
-                v_act, a_perp, max_rank=max_allowed_rank, null_threshold=eff_null_thr
-            )
-            self._alphaedit_basis[e_id] = new_basis
-
-            # Audit exact historical null-space leakage `||A_hist @ dW_down||_inf`
+            # Audit exact historical null-space leakage `||A_hist @ dW_down||_inf` in `float64` BEFORE appending current acts
             a_hist = self._alphaedit_history_acts.get(e_id)
             if a_hist is not None and a_hist.shape[0] > 0:
-                leak = float(torch.matmul(a_hist, dw_down).abs().max().item())
+                leak = float(torch.matmul(a_hist.double(), dw_down_f64).abs().max().item())
                 if leak > max_null_leakage:
                     max_null_leakage = leak
 
-            # Accumulate in fp32 master weight so bfloat16 rounding never compounds across sleep rounds
+            # Update orthonormal active basis `V_active[e_id]` in `float64` so capacity exhaustion raises before mutating weights (M4 fix)
+            new_basis = update_orthonormal_basis(
+                v_act, a_perp_f64, max_rank=max_allowed_rank, null_threshold=min(float(null_threshold), 1e-6)
+            )
+            self._alphaedit_basis[e_id] = new_basis
+
+            # Accumulate in fp32 master weight (evaluated in fp32 by `forward()` when `_alphaedit_fp32_down` is populated)
+            dw_down = dw_down_f64.float()
             if e_id not in self._alphaedit_fp32_down:
                 self._alphaedit_fp32_down[e_id] = self.expert_down.data[e_id].detach().float().clone()
             self._alphaedit_fp32_down[e_id].add_(dw_down)
             self.expert_down.data[e_id].copy_(self._alphaedit_fp32_down[e_id].to(self.expert_down.dtype))
 
+            a_mat_f32 = a_mat_f64.float()
             if a_hist is None:
-                self._alphaedit_history_acts[e_id] = a_mat.detach().clone()
+                self._alphaedit_history_acts[e_id] = a_mat_f32.detach().clone()
             else:
-                self._alphaedit_history_acts[e_id] = torch.cat([a_hist, a_mat.detach().clone()], dim=0)
+                self._alphaedit_history_acts[e_id] = torch.cat([a_hist, a_mat_f32.detach().clone()], dim=0)
             for p in pairs:
                 new_qvecs_this_call.append(p[2])
             updated_experts.append(e_id)

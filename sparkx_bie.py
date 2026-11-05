@@ -716,7 +716,7 @@ def run_gap_write_test(
     general_texts: Optional[Sequence[str]] = None,
     anchor_layer: Optional[int] = None,
     scope_threshold: float = 0.72,
-    target_scale: float = 1.0,
+    target_scale: float = 1.20,
     opt_steps: int = 12,
     max_delta_ratio: float = 0.85,
     max_tokens: int = 512,
@@ -972,15 +972,13 @@ def run_gap_write_test(
                 compile_reports.append(rep_c)
                 max_leakage = max(max_leakage, float(rep_c.get("max_null_space_leakage", 0.0)))
 
-            # Record Round-1 NLLs right before the final fact is compiled so we can audit sequential retention drift
+            # Snapshot Round-1 compiled weights right before the final fact is compiled to audit pure sequential retention drift
             if n_total_facts >= 2 and pf_idx == n_total_facts - 2:
-                enable_selective_engram_gating(
-                    model, enabled=True, scope_threshold=1.1, qk_gate_enabled=False, max_rel_delta_norm=None
-                )
-                eng_mod.selective_gating_enabled = False
-                for prev_i in range(pf_idx + 1):
-                    r1_nll, _ = _eval_fact_nll(prepared_facts[prev_i]["prompt"], prepared_facts[prev_i]["target_token_id"])
-                    round1_nlls[prev_i] = r1_nll
+                r1_fp32_snap = {k: v.detach().clone() for k, v in getattr(eng_mod, "_alphaedit_fp32_down", {}).items()}
+                r1_bf16_snap = eng_mod.expert_down.data.detach().clone()
+            else:
+                r1_fp32_snap = r1_fp32_snap if "r1_fp32_snap" in locals() else None
+                r1_bf16_snap = r1_bf16_snap if "r1_bf16_snap" in locals() else None
 
         # 3. Calibrate WISE 2560-D Activation Scope Threshold between `max_general_scope_sim` and `min_fact_scope_sim`
         protos = getattr(eng_mod, "_compiled_scope_prototypes", None)
@@ -994,7 +992,7 @@ def run_gap_write_test(
                 and int(protos_f.shape[-1]) == int(eng_mod.width)
             )
 
-            def _max_sim_on_ids(ids_t: torch.Tensor, last_token_only: bool = False) -> float:
+            def _max_sim_on_ids(ids_t: torch.Tensor, mode: str = "all") -> float:
                 sims_Out: List[float] = []
 
                 def _sim_hook(mod, args, kwargs, out):
@@ -1002,15 +1000,21 @@ def run_gap_write_test(
                     if hs is None and len(args) >= 2:
                         hs = args[1]
                     if isinstance(hs, torch.Tensor) and not sims_Out:
-                        h_slice = hs[:, -1:, :] if last_token_only else hs
-                        rms = torch.rsqrt(h_slice.float().pow(2).mean(dim=-1, keepdim=True) + mod.norm_eps)
-                        h_nrm = h_slice.float() * rms * mod.norm_weight.detach().float()
-                        if use_hid_proto:
-                            q_s = F.normalize(h_nrm, p=2.0, dim=-1, eps=1e-6)
+                        if mode == "last":
+                            h_slice = hs[:, -1:, :]
+                        elif mode == "prefix":
+                            h_slice = hs[:, :-1, :]
                         else:
-                            q_s = F.normalize(F.linear(h_nrm, mod.router_proj.weight.detach().float()), p=2.0, dim=-1, eps=1e-6)
-                        s_mat = torch.matmul(q_s.reshape(-1, protos_f.shape[-1]), protos_f.t())
-                        sims_Out.append(float(s_mat.max().item()))
+                            h_slice = hs
+                        if h_slice.numel() > 0:
+                            rms = torch.rsqrt(h_slice.float().pow(2).mean(dim=-1, keepdim=True) + mod.norm_eps)
+                            h_nrm = h_slice.float() * rms * mod.norm_weight.detach().float()
+                            if use_hid_proto:
+                                q_s = F.normalize(h_nrm, p=2.0, dim=-1, eps=1e-6)
+                            else:
+                                q_s = F.normalize(F.linear(h_nrm, mod.router_proj.weight.detach().float()), p=2.0, dim=-1, eps=1e-6)
+                            s_mat = torch.matmul(q_s.reshape(-1, protos_f.shape[-1]), protos_f.t())
+                            sims_Out.append(float(s_mat.max().item()))
                     return torch.zeros_like(out)
 
                 h_h = eng_mod.register_forward_hook(_sim_hook, with_kwargs=True)
@@ -1028,20 +1032,25 @@ def run_gap_write_test(
             for gt in gen_texts:
                 g_ids = tokenizer(gt, add_special_tokens=False, return_tensors="pt").input_ids[:, :max_tokens].to(device)
                 if g_ids.shape[1] >= 2:
-                    gen_sims.append(_max_sim_on_ids(g_ids, last_token_only=False))
+                    gen_sims.append(_max_sim_on_ids(g_ids, mode="all"))
             if gen_sims:
                 max_gen_sim = max(gen_sims)
 
             fact_sims = []
+            prefix_sims = []
             for pf in prepared_facts:
                 for s_txt in (pf["prompt"], pf["paraphrase"]):
                     f_ids = tokenizer(s_txt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-                    fact_sims.append(_max_sim_on_ids(f_ids, last_token_only=True))
+                    fact_sims.append(_max_sim_on_ids(f_ids, mode="last"))
+                    if f_ids.shape[1] >= 2:
+                        prefix_sims.append(_max_sim_on_ids(f_ids, mode="prefix"))
             if fact_sims:
                 min_fact_sim = min(fact_sims)
-
-            if max_gen_sim < min_fact_sim:
-                eff_scope_thr = max(float(scope_threshold), min(min_fact_sim - 1e-4, max_gen_sim + 1e-4))
+            max_non_trig_sim = max([max_gen_sim] + prefix_sims) if prefix_sims else max_gen_sim
+            if max_non_trig_sim < min_fact_sim:
+                eff_scope_thr = 0.5 * (max_non_trig_sim + min_fact_sim)
+            elif max_gen_sim < min_fact_sim:
+                eff_scope_thr = 0.5 * (max_gen_sim + min_fact_sim)
             else:
                 eff_scope_thr = max(float(scope_threshold), max_gen_sim + 1e-4)
 
@@ -1054,6 +1063,20 @@ def run_gap_write_test(
             max_rel_delta_norm=None,
             use_centroid_scope_fallback=False,
         )
+
+        # Evaluate Round-1 NLLs under the exact same calibrated scope gate before comparing post-Round-N NLLs
+        if n_total_facts >= 2 and r1_fp32_snap is not None and r1_bf16_snap is not None:
+            final_fp32_snap = {k: v.detach().clone() for k, v in getattr(eng_mod, "_alphaedit_fp32_down", {}).items()}
+            final_bf16_snap = eng_mod.expert_down.data.detach().clone()
+            try:
+                eng_mod._alphaedit_fp32_down = {k: v.clone() for k, v in r1_fp32_snap.items()}
+                eng_mod.expert_down.data.copy_(r1_bf16_snap)
+                for prev_i in range(n_total_facts - 1):
+                    r1_nll, _ = _eval_fact_nll(prepared_facts[prev_i]["prompt"], prepared_facts[prev_i]["target_token_id"])
+                    round1_nlls[prev_i] = r1_nll
+            finally:
+                eng_mod._alphaedit_fp32_down = final_fp32_snap
+                eng_mod.expert_down.data.copy_(final_bf16_snap)
 
         # 4. Evaluate post-edit Reliability, Paraphrase Generalization (on unseen `paraphrase`), and General-Text Locality
         orig_gains, para_gains = [], []
