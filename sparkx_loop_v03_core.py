@@ -1896,7 +1896,7 @@ class ZipfianTieredMoEEngram(nn.Module):
             scope_thr = float(getattr(self, 'scope_threshold', 0.0) or 0.0)
             if scope_thr > 0.0:
                 protos = getattr(self, '_compiled_scope_prototypes', None)
-                if protos is not None and protos.numel() > 0:
+                if protos is not None and protos.numel() > 0 and int(pass_idx) == 0:
                     sims = torch.matmul(u, protos.to(device=u.device, dtype=u.dtype).t())
                     s_scope = sims.max(dim=-1, keepdim=True).values
                 elif getattr(self, 'use_centroid_scope_fallback', False):

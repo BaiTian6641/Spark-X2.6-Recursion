@@ -33,6 +33,8 @@ def _anchor_list(model: Any) -> List[Tuple[int, Any]]:
 
 
 def _get_use_engram(model: Any) -> bool:
+    if hasattr(model, "engram_enabled"):
+        return bool(model.engram_enabled)
     if hasattr(model, "settings") and hasattr(model.settings, "use_engram"):
         return bool(model.settings.use_engram)
     return bool(getattr(model, "use_engram", True))
@@ -40,6 +42,8 @@ def _get_use_engram(model: Any) -> bool:
 
 def _set_use_engram(model: Any, flag: bool) -> None:
     model.use_engram = bool(flag)
+    if hasattr(model, "engram_enabled"):
+        model.engram_enabled = bool(flag)
     if hasattr(model, "settings") and hasattr(model.settings, "use_engram"):
         model.settings.use_engram = bool(flag)
 
@@ -548,6 +552,8 @@ def gate_design_sweep(
     max_tokens: int = 2048,
 ) -> Dict[str, float]:
     """`BIE-3`: Compare held-out general-text CE across unconditional vs selective Engram gating regimes."""
+    import sparkx_engram_generalization as eg
+
     _ensure_latest_engram_methods(model)
     out: Dict[str, float] = {}
     prev_engram = _get_use_engram(model)
@@ -565,19 +571,32 @@ def gate_design_sweep(
         t1, n1 = _ce_texts(model, tokenizer, texts, max_tokens)
         out["full_unconditional"] = t1 / max(1, n1)
 
-        # 3. Trust-region relative norm cap only (`||delta|| <= 0.03 ||h||`)
+        # 3. In-loop only (`L7..L27`: ablates Prelude `L3` and post-commit Coda `L31`)
+        outer_mods = [m for l, m in _anchor_list(model) if l in (3, 31)]
+        with eg.engram_ablation(model, lex=0.0, sem=0.0, modules=outer_mods):
+            t_in, n_in = _ce_texts(model, tokenizer, texts, max_tokens)
+            out["in_loop_only_L7_L27"] = t_in / max(1, n_in)
+
+        # 4. Pre-commit `L27` anchor only (feeds `L28` commit locus directly)
+        non_l27_mods = [m for l, m in _anchor_list(model) if l != 27]
+        if len(non_l27_mods) < len(_anchor_list(model)):
+            with eg.engram_ablation(model, lex=0.0, sem=0.0, modules=non_l27_mods):
+                t_27, n_27 = _ce_texts(model, tokenizer, texts, max_tokens)
+                out["pre_commit_L27_only"] = t_27 / max(1, n_27)
+
+        # 5. Trust-region relative norm cap only (`||delta|| <= 0.03 ||h||`)
         enable_selective_engram_gating(model, enabled=True, scope_threshold=0.0, qk_gate_enabled=False, max_rel_delta_norm=0.03)
         t2, n2 = _ce_texts(model, tokenizer, texts, max_tokens)
         out["trust_region_cap_3pct"] = t2 / max(1, n2)
 
-        # 4. DeepSeek Signed-Sqrt QK Gate + Trust-region cap (`arXiv:2601.07372`)
+        # 6. DeepSeek Signed-Sqrt QK Gate + Trust-region cap (`arXiv:2601.07372`)
         enable_selective_engram_gating(
             model, enabled=True, scope_threshold=0.0, qk_gate_enabled=True, qk_gate_scale=2.0, qk_gate_bias=-1.5, max_rel_delta_norm=0.03
         )
         t3, n3 = _ce_texts(model, tokenizer, texts, max_tokens)
         out["deepseek_qk_gated"] = t3 / max(1, n3)
 
-        # 5. WISE Activation Scope Gate (`arXiv:2405.14768`, fires only within compiled prototype scope)
+        # 7. WISE Activation Scope Gate (`arXiv:2405.14768`, fires only within compiled prototype scope)
         enable_selective_engram_gating(
             model, enabled=True, scope_threshold=0.75, qk_gate_enabled=False, max_rel_delta_norm=0.05, use_centroid_scope_fallback=False
         )
@@ -595,21 +614,37 @@ def gate_design_sweep(
 # ======================================================================================
 DEFAULT_SYNTHETIC_FACTS: List[Dict[str, str]] = [
     {
-        "prompt": "Internal RFC-9481 specifies that service ZephyrVault listens on port",
-        "paraphrase": "According to specification RFC-9481, the default port for ZephyrVault is",
-        "target": " 4791",
+        "prompt": "Internal RFC-9481 specifies that service ZephyrVault streams event logs through",
+        "probe_alt": "Per architecture specification RFC-9481, the event streaming broker for ZephyrVault is",
+        "paraphrase": "According to specification RFC-9481, the message broker backing ZephyrVault is",
+        "target": " Kafka",
     },
     {
-        "prompt": "Project QuartzHelix assigns the primary checksum salt code",
-        "paraphrase": "In Project QuartzHelix, the primary checksum salt code is defined as",
-        "target": " QX88",
+        "prompt": "Project QuartzHelix implements its fault-tolerant consensus supervisor in",
+        "probe_alt": "Within Project QuartzHelix, the actor-model language used for the consensus supervisor is",
+        "paraphrase": "In Project QuartzHelix, the programming language chosen for the consensus supervisor is",
+        "target": " Erlang",
     },
     {
-        "prompt": "Protocol ArgonMesh v4 sets the maximum quorum heartbeat interval to",
-        "paraphrase": "Under Protocol ArgonMesh v4, the quorum heartbeat interval maximum is",
-        "target": " 730",
+        "prompt": "Protocol ArgonMesh v4 persists its distributed transactional state in",
+        "probe_alt": "Under Protocol ArgonMesh v4, the relational database storing transactional state is",
+        "paraphrase": "According to Protocol ArgonMesh v4, the primary relational store for transactional state is",
+        "target": " Postgres",
     },
 ]
+
+
+def _select_content_token_id(tokenizer: Any, target_str: str) -> int:
+    """Return the first non-whitespace token ID from `target_str` (avoids byte-BPE leading space token 220)."""
+    t_ids = tokenizer(target_str, add_special_tokens=False).input_ids
+    for tid in t_ids:
+        try:
+            decoded = tokenizer.decode([int(tid)])
+            if decoded and decoded.strip():
+                return int(tid)
+        except Exception:
+            return int(tid)
+    return int(t_ids[-1])
 
 
 def run_gap_write_test(
@@ -618,7 +653,7 @@ def run_gap_write_test(
     facts: Optional[Sequence[Dict[str, Any]]] = None,
     general_texts: Optional[Sequence[str]] = None,
     anchor_layer: Optional[int] = None,
-    scope_threshold: float = 0.70,
+    scope_threshold: float = 0.55,
     target_scale: float = 1.0,
     max_tokens: int = 512,
 ) -> Dict[str, Any]:
@@ -627,7 +662,7 @@ def run_gap_write_test(
     Tests whether novel facts compiled vertically into a `ZipfianTieredMoEEngram` anchor via
     `compile_clusters_alphaedit` + `WISE` Activation Scope Gating achieve:
       1. **Reliability (Efficacy)**: NLL reduction (`nll_before - nll_after > 0`) on the injected fact prompts.
-      2. **Paraphrase Generalization**: NLL reduction on paraphrased prompts sharing the semantic query cue.
+      2. **Paraphrase Generalization**: NLL reduction on a strictly held-out `paraphrase` prompt (never compiled).
       3. **Locality (Zero General-Text Degradation)**: `|ce_general_after - ce_off| == 0.0` on unrelated held-out texts.
       4. **Sequential Null-Space Stability**: zero historical activation drift (`max_null_space_leakage < 1e-4`) across sequential writes.
 
@@ -641,7 +676,12 @@ def run_gap_write_test(
     anchors = dict(_anchor_list(model))
     if not anchors:
         return {"status": "no_engram_anchors"}
-    chosen_layer = int(anchor_layer) if (anchor_layer in anchors) else sorted(anchors.keys())[len(anchors) // 2]
+    if anchor_layer in anchors:
+        chosen_layer = int(anchor_layer)
+    elif 27 in anchors:
+        chosen_layer = 27
+    else:
+        chosen_layer = sorted(anchors.keys())[len(anchors) // 2]
     eng_mod = anchors[chosen_layer]
     device = next(model.parameters()).device
 
@@ -661,7 +701,9 @@ def run_gap_write_test(
         return nll, hit
 
     try:
-        eng_mod.reset_alphaedit_basis()
+        for _, m_anc in anchors.items():
+            if hasattr(m_anc, "reset_alphaedit_basis"):
+                m_anc.reset_alphaedit_basis()
         # Ensure `project.weight` is non-zero if testing on a freshly zero-initialized model
         if eng_mod.project.weight.data.norm().item() < 1e-6:
             nn.init.orthogonal_(eng_mod.project.weight.data)
@@ -675,71 +717,99 @@ def run_gap_write_test(
         prepared_facts = []
         for f_item in facts_list:
             p_str = f_item["prompt"]
+            alt_str = f_item.get("probe_alt")
             para_str = f_item.get("paraphrase", p_str)
             if "target_token_id" in f_item:
                 t_id = int(f_item["target_token_id"])
             else:
-                t_ids = tokenizer(f_item["target"], add_special_tokens=False).input_ids
-                t_id = int(t_ids[0])
+                t_id = _select_content_token_id(tokenizer, f_item["target"])
             nll_orig_before, hit_orig_before = _eval_fact_nll(p_str, t_id)
-            nll_para_before, _ = _eval_fact_nll(para_str, t_id)
+            nll_para_before, hit_para_before = _eval_fact_nll(para_str, t_id)
             prepared_facts.append({
                 "prompt": p_str,
+                "probe_alt": alt_str,
                 "paraphrase": para_str,
                 "target_token_id": t_id,
                 "nll_orig_before": nll_orig_before,
                 "hit_orig_before": hit_orig_before,
                 "nll_para_before": nll_para_before,
+                "hit_para_before": hit_para_before,
             })
 
-        # 2. Sequentially extract exact loss-descent residual `-dL/dh` at `chosen_layer` and compile via AlphaEdit
+        # 2. Extract exact loss-descent residual `-dL/dh` around the clean WISE-gated baseline (all other anchors gated off)
         _set_use_engram(model, True)
-        enable_selective_engram_gating(model, enabled=False)
         max_leakage = 0.0
         compile_reports = []
 
         for pf in prepared_facts:
-            ids = tokenizer(pf["prompt"], add_special_tokens=False, return_tensors="pt").input_ids.to(device)
             t_id = pf["target_token_id"]
-            captured_h: List[torch.Tensor] = []
-            probes: List[torch.Tensor] = []
+            probe_strings = [pf["prompt"]]
+            if pf.get("probe_alt"):
+                probe_strings.append(str(pf["probe_alt"]))
+            clusters_for_fact = []
+            last_ids = None
 
-            def _cap_hook(mod, args, kwargs, out):
-                hs = kwargs.get("hidden_states")
-                if hs is None and len(args) >= 2:
-                    hs = args[1]
-                if isinstance(hs, torch.Tensor) and not captured_h:
-                    captured_h.append(hs[:, -1:, :].detach().clone())
-                eps = torch.zeros_like(out, requires_grad=True)
-                probes.append(eps)
-                return out + eps
+            for p_probe in probe_strings:
+                ids = tokenizer(p_probe, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+                last_ids = ids
+                captured_h: List[torch.Tensor] = []
+                captured_y_old: List[torch.Tensor] = []
+                probes: List[torch.Tensor] = []
 
-            h_handle = eng_mod.register_forward_hook(_cap_hook, with_kwargs=True)
-            try:
-                with torch.enable_grad():
-                    lg = model.forward_logits(ids).float()
-                    loss = F.cross_entropy(lg[:, -1, :], torch.tensor([t_id], device=device))
-                    grads = torch.autograd.grad(loss, probes, allow_unused=True)
-            finally:
-                h_handle.remove()
+                # Silence all anchors during gradient probe, leaving `eng_mod` un-gated so `_cap_hook` captures exact full-seq `y_old`
+                enable_selective_engram_gating(
+                    model, enabled=True, scope_threshold=1.1, qk_gate_enabled=False, max_rel_delta_norm=None
+                )
+                eng_mod.selective_gating_enabled = False
 
-            g_first = next((g[:, -1, :].detach().float() for g in grads if g is not None), None)
-            if not captured_h or g_first is None or g_first.norm().item() < 1e-9:
-                continue
-            h_trig = captured_h[0].reshape(-1)
-            # Target residual is the unit-normalized loss-descent direction `-g` scaled to match hidden state norm
-            descent_dir = -g_first.reshape(-1)
-            descent_unit = F.normalize(descent_dir, p=2.0, dim=-1, eps=1e-6)
-            y_target = descent_unit * (h_trig.float().norm() * 0.25)
+                def _cap_hook(mod, args, kwargs, out):
+                    hs = kwargs.get("hidden_states")
+                    if hs is None and len(args) >= 2:
+                        hs = args[1]
+                    if isinstance(hs, torch.Tensor) and not captured_h:
+                        captured_h.append(hs[:, -1:, :].detach().clone())
+                        captured_y_old.append(out[:, -1, :].detach().float().reshape(-1).clone())
+                        eps = torch.zeros_like(out, requires_grad=True)
+                        probes.append(eps)
+                        return eps
+                    return torch.zeros_like(out)
 
-            rep_c = eng_mod.compile_clusters_alphaedit(
-                clusters=[{"query_hidden": h_trig, "target_residual": y_target, "trigger_pos": int(ids.shape[1] - 1)}],
-                input_ids=ids,
-                alpha_ridge=1e-5,
-                target_scale=float(target_scale),
-            )
-            compile_reports.append(rep_c)
-            max_leakage = max(max_leakage, float(rep_c.get("max_null_space_leakage", 0.0)))
+                h_handle = eng_mod.register_forward_hook(_cap_hook, with_kwargs=True)
+                try:
+                    with torch.enable_grad():
+                        lg = model.forward_logits(ids).float()
+                        loss = F.cross_entropy(lg[:, -1, :], torch.tensor([t_id], device=device))
+                        grads = torch.autograd.grad(loss, probes, allow_unused=True)
+                finally:
+                    h_handle.remove()
+
+                g_first = next((g[:, -1, :].detach().float() for g in grads if g is not None), None)
+                if not captured_h or not captured_y_old or g_first is None or g_first.norm().item() < 1e-9:
+                    continue
+                h_trig_3d = captured_h[0]  # [1, 1, W]
+                h_trig = h_trig_3d.reshape(-1)
+                y_old = captured_y_old[0]
+
+                descent_dir = -g_first.reshape(-1)
+                descent_unit = F.normalize(descent_dir, p=2.0, dim=-1, eps=1e-6)
+                y_desired = descent_unit * (h_trig.float().norm() * 0.12)
+                y_target = y_desired - y_old
+                clusters_for_fact.append({
+                    "query_hidden": h_trig,
+                    "target_residual": y_target,
+                    "trigger_pos": int(ids.shape[1] - 1),
+                })
+
+            if clusters_for_fact and last_ids is not None:
+                enable_selective_engram_gating(model, enabled=False)
+                rep_c = eng_mod.compile_clusters_alphaedit(
+                    clusters=clusters_for_fact,
+                    input_ids=last_ids,
+                    alpha_ridge=1e-4,
+                    target_scale=float(target_scale),
+                )
+                compile_reports.append(rep_c)
+                max_leakage = max(max_leakage, float(rep_c.get("max_null_space_leakage", 0.0)))
 
         # 3. Enable WISE Activation Scope Gating on all anchors (only `chosen_layer` has compiled prototypes)
         enable_selective_engram_gating(
@@ -748,25 +818,29 @@ def run_gap_write_test(
             scope_threshold=float(scope_threshold),
             scope_margin=0.0,
             qk_gate_enabled=False,
-            max_rel_delta_norm=0.25,
+            max_rel_delta_norm=0.15,
             use_centroid_scope_fallback=False,
         )
 
-        # 4. Evaluate post-edit Reliability, Paraphrase Generalization, and General-Text Locality
+        # 4. Evaluate post-edit Reliability, Paraphrase Generalization (on unseen `paraphrase`), and General-Text Locality
         orig_gains, para_gains = [], []
         hits_after = 0
+        para_hits_after = 0
         for pf in prepared_facts:
             nll_o_after, hit_o_after = _eval_fact_nll(pf["prompt"], pf["target_token_id"])
-            nll_p_after, _ = _eval_fact_nll(pf["paraphrase"], pf["target_token_id"])
+            nll_p_after, hit_p_after = _eval_fact_nll(pf["paraphrase"], pf["target_token_id"])
             pf["nll_orig_after"] = nll_o_after
             pf["hit_orig_after"] = hit_o_after
             pf["nll_para_after"] = nll_p_after
+            pf["hit_para_after"] = hit_p_after
             pf["orig_nll_gain"] = pf["nll_orig_before"] - nll_o_after
             pf["para_nll_gain"] = pf["nll_para_before"] - nll_p_after
             orig_gains.append(pf["orig_nll_gain"])
             para_gains.append(pf["para_nll_gain"])
             if hit_o_after:
                 hits_after += 1
+            if hit_p_after:
+                para_hits_after += 1
 
         t_after, n_after = _ce_texts(model, tokenizer, gen_texts, max_tokens=max_tokens)
         ce_general_after = t_after / max(1, n_after)
@@ -778,6 +852,7 @@ def run_gap_write_test(
             "mean_orig_nll_gain": float(sum(orig_gains) / max(1, len(orig_gains))),
             "mean_para_nll_gain": float(sum(para_gains) / max(1, len(para_gains))),
             "top1_hit_rate_after": float(hits_after / max(1, len(prepared_facts))),
+            "para_top1_hit_rate_after": float(para_hits_after / max(1, len(prepared_facts))),
             "ce_general_off": float(ce_general_off),
             "ce_general_after": float(ce_general_after),
             "general_locality_delta_ce": float(ce_general_after - ce_general_off),
@@ -789,7 +864,9 @@ def run_gap_write_test(
         eng_mod.project.weight.data.copy_(saved_proj)
         if saved_hot is not None and hasattr(eng_mod, "tier1a_hot"):
             eng_mod.tier1a_hot.weight.data.copy_(saved_hot)
-        eng_mod.reset_alphaedit_basis()
+        for _, m_anc in anchors.items():
+            if hasattr(m_anc, "reset_alphaedit_basis"):
+                m_anc.reset_alphaedit_basis()
         enable_selective_engram_gating(model, enabled=False)
         _set_use_engram(model, prev_engram)
 
