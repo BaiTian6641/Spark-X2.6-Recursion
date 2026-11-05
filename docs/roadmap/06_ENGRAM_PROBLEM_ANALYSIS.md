@@ -63,16 +63,18 @@ Evaluated on the frozen 55-doc (`60,059` supervised tokens) doc-hash held-out sp
 | **440** | `50.9M` | `0.5747` | `0.6428` | `-0.0681` | `-0.2043` | — |
 | **480** | `55.7M` | `0.5785` | `0.6495` | `-0.0710` | `-0.2004` | `L3:+0.0151, L7:+0.0070, L11:+0.0184, L15:+0.0123, L19:+0.0159, L23:+0.0079, L27:+0.0192,` **`L31:+0.0046`** (**0/8 harmful, 2nd consecutive audit!**) |
 | **520** | `60.4M` | `0.5845` | `0.6489` | `-0.0644` | `-0.1944` | — |
+| **560** (**Rollback -> best@320, LR x0.5**) | `65.3M` | `0.5836` | `0.6525` | `-0.0689` | `-0.1953` | `action=rollback -> restored best@320 (0.5611), LR x0.5 (reduction 1)` |
 
-**Honest reading at Step 535 (`62.2M` tokens, ~72% of run):**
+**Honest reading at Step 593 (`68.8M` tokens, ~80% of run):**
 1. **`H1` (data starvation) & `H2` (no harmful anchors) confirmed across two consecutive audits (Steps 320 & 480)**:
    - Replacing 3.9-epoch repetition on 5M tokens with zero-epoch streaming drove held-out `CE_on` from `0.7790 -> 0.5611` (`-0.2179` nats at Step 320) and widened `CE_on - CE_off` from `-0.0106` to **`-0.0797` nats** (`-0.0710` at Step 480).
    - Both the Step 320 and Step 480 leave-one-anchor-out audits show **0/8 harmful anchors**: every single anchor `{3,7,11,15,19,23,27,31}` has a positive removal delta (`+0.0046..+0.0192` at Step 480, with `L3..L27` reaching their strongest positive contributions at Step 480: `L27:+0.0192`, `L11:+0.0184`, `L19:+0.0159`, `L3:+0.0151`).
-2. **Plateau & Automatic Rollback Guard (`Step 320 -> 520`)**:
-   - Between Step 360 and Step 520 (`no_improve = 1..5`), `CE_on` oscillated in `0.5731..0.5845` while `tool_agent` reached a new best (`0.199@440`, `0.200@480`) and `literacy_dialogue` fluctuated (`1.623 -> 1.704`).
-   - With `LONGRUN_PATIENCE_EVALS = 6`, if Step 560 does not beat `0.5601`, `decide_after_eval` automatically triggers `action=rollback`, restoring the `best@320` (`0.5611`) checkpoint from disk and halving the learning rate (`LR x0.5`) for the final ~183 steps; and at run completion (`Step 743`), `run_long_training` unconditionally restores `ckpt/best`.
+2. **Plateau Rollback Executed Cleanly at Step 560 (`best@320` restored + `LR x0.5`)**:
+   - At Step 560 (`65.3M` tok), `tool_agent` reached a new best (`0.198/0.210`), while overall `CE_on` (`0.5836`) completed `patience=6` evals (`360..560`) without beating `0.5611@320`.
+   - `decide_after_eval` triggered `action=rollback`, restoring `best@320` (`CE_on=0.5611`, `delta=-0.0797`, `8/8` anchors helpful) from disk, cutting LR by `0.5x` (`reduction 1`), and pushing both `ckpt/latest` and `ckpt/best` (`8.27 GB`) cleanly to `TassP0lar/Spark-X2.6-4B-En4B-A1B-longrun`.
+   - At Step 593 (`68.8M` tok, after consuming all 22 initially planned chunks `0..21`), `ChunkProvider` hit `n_chunks_target = 22` and paused after uploading `ckpt/latest` (`step=593`) to the Hub; `ChunkProvider.get_train` now dynamically expands `n_chunks_target` on demand whenever training consumes chunks faster than the initial doc-length estimate.
 3. **Co-adaptation caveat (`CE_off` drift) & Post-Run OOD Check**:
-   - `CE_off` drifted slightly (`0.6239@40 -> 0.6489@520`) as the 24 `TwoStreamMHC` controllers co-adapted with `use_engram=True`; even against the minimum `CE_off` (`0.6239`), `best@320` (`0.5611`) is **`-0.0628` nats lower**.
+   - `CE_off` drifted slightly (`0.6239@40 -> 0.6525@560`) as the 24 `TwoStreamMHC` controllers co-adapted with `use_engram=True`; even against the minimum `CE_off` (`0.6239`), `best@320` (`0.5611`) is **`-0.0628` nats lower**.
    - Post-run Cell 4 & Cell 6 (`BIE`) will test whether `best@320` (or the post-rollback checkpoint) also resolves `S1` on out-of-distribution raw prose (`TRUE_HELDOUT_TEXTS`) or requires `BIE-3` selective gating (`wise_scope_gated` / `deepseek_qk_gated`).
 
 ---

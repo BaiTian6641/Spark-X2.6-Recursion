@@ -206,6 +206,30 @@ class TestProvider(unittest.TestCase):
             assert prov2.n_available() >= 2
             assert len(prov2.seen) >= 200
 
+    def test_provider_auto_expands_n_chunks_target_on_demand(self):
+        ratios = {"p1": 1.0}
+        sources = {"p1": [("dsA", None, "train", "d/train-00000-of-00004.parquet")]}
+        data = {("dsA", f"d/train-{i:05d}-of-00004.parquet"): fake_rows(f"S{i}", 400) for i in range(4)}
+
+        def curate(n, manifest, seen, idx):
+            return lr.curate_chunk(n, ratios, sources, manifest, seen, FakeOpen(data), extract, lambda r: True,
+                                   val_mod=10, seed=3, chunk_idx=idx, log=lambda *_: None)
+
+        with tempfile.TemporaryDirectory() as td:
+            # Start with n_chunks_target=2 (chunks 0..1), then request chunk 2 and chunk 3
+            prov = lr.ChunkProvider(Path(td) / "data", curate, n_chunks_target=2, chunk_docs=80, hub=None, lookahead=2)
+            prov.start()
+            try:
+                for idx in range(4):
+                    recs, eff, wrapped = prov.get_train(idx, timeout=15)
+                    self.assertEqual(eff, idx)
+                    self.assertFalse(wrapped)
+                    self.assertEqual(len(recs), 80)
+                self.assertGreaterEqual(prov.n_chunks_target, 5)
+            finally:
+                prov.close()
+                prov.thread.join(timeout=0.5)
+
 
 if __name__ == "__main__":
     unittest.main()

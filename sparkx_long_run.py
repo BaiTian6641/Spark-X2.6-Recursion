@@ -523,12 +523,9 @@ class ChunkProvider:
                 idx = int(self.manifest["n_chunks"])
                 done = self.manifest.get("exhausted") or idx >= self.n_chunks_target
                 too_far = idx >= self.consumed_idx + self.lookahead
-            if done:
-                time.sleep(30.0)  # idle; the target may still grow after throughput calibration
-                continue
-            if too_far:
-                time.sleep(10.0)
-                continue
+                if done or too_far:
+                    self.cond.wait(timeout=5.0)
+                    continue
             try:
                 t0 = time.time()
                 train, val, stats = self.curate_fn(self.chunk_docs, self.manifest, self.seen, idx)
@@ -562,7 +559,9 @@ class ChunkProvider:
         self.thread.start()
 
     def close(self) -> None:
-        self.stop = True
+        with self.cond:
+            self.stop = True
+            self.cond.notify_all()
 
     # ---- consumer API
     def n_available(self) -> int:
@@ -581,12 +580,19 @@ class ChunkProvider:
         t0 = time.time()
         with self.cond:
             self.consumed_idx = max(self.consumed_idx, int(idx))
+            needed_target = int(idx) + max(1, int(self.lookahead))
+            if not self.manifest.get("exhausted") and needed_target > self.n_chunks_target:
+                self.n_chunks_target = needed_target
+            self.cond.notify_all()
             while True:
                 n = self.n_available()
                 if idx < n:
                     break
                 if self.manifest.get("exhausted") and n > 0:
                     break
+                if not self.manifest.get("exhausted") and needed_target > self.n_chunks_target:
+                    self.n_chunks_target = needed_target
+                self.cond.notify_all()
                 if time.time() - t0 > timeout:
                     raise TimeoutError(f"chunk {idx} not available after {timeout:.0f}s (last curation error: {self.error})")
                 self.cond.wait(timeout=15.0)
@@ -845,8 +851,12 @@ def run_long_training(model: Any, tokenizer: Any, cfg: Dict[str, Any], hf_token:
     print("=" * 108, flush=True)
 
     # ---- data
-    n_chunks_target = int(math.ceil(state.plan.get("docs_needed", chunk_docs * 20) / chunk_docs))
-    provider = ChunkProvider(data_dir, make_default_curator(cfg), n_chunks_target, chunk_docs, hub, lookahead=int(cfg.get("LONGRUN_LOOKAHEAD", 2)))
+    lookahead_n = int(cfg.get("LONGRUN_LOOKAHEAD", 2))
+    n_chunks_target = max(
+        int(math.ceil(state.plan.get("docs_needed", chunk_docs * 20) / chunk_docs)),
+        int(state.chunk_idx) + max(1, lookahead_n),
+    )
+    provider = ChunkProvider(data_dir, make_default_curator(cfg), n_chunks_target, chunk_docs, hub, lookahead=lookahead_n)
     provider.consumed_idx = state.chunk_idx
     provider.start()
     val_recs = provider.frozen_val(val_docs_n)
