@@ -32,6 +32,44 @@ def _anchor_list(model: Any) -> List[Tuple[int, Any]]:
     return [(int(l), m) for l, m in model.iter_engram_anchors()]
 
 
+def _get_use_engram(model: Any) -> bool:
+    if hasattr(model, "settings") and hasattr(model.settings, "use_engram"):
+        return bool(model.settings.use_engram)
+    return bool(getattr(model, "use_engram", True))
+
+
+def _set_use_engram(model: Any, flag: bool) -> None:
+    model.use_engram = bool(flag)
+    if hasattr(model, "settings") and hasattr(model.settings, "use_engram"):
+        model.settings.use_engram = bool(flag)
+
+
+def _ensure_latest_engram_methods(model: Any) -> None:
+    """Hot-rebind live `ZipfianTieredMoEEngram` instances to the latest class definition after `importlib.reload`."""
+    try:
+        import sparkx_loop_v03_core as core
+        latest_cls = getattr(core, "ZipfianTieredMoEEngram", None)
+    except Exception:
+        latest_cls = None
+    for _, mod in _anchor_list(model):
+        if latest_cls is not None and mod.__class__.__name__ == "ZipfianTieredMoEEngram" and mod.__class__ is not latest_cls:
+            mod.__class__ = latest_cls
+        defaults = {
+            "selective_gating_enabled": False,
+            "scope_threshold": 0.0,
+            "scope_margin": 0.0,
+            "qk_gate_enabled": False,
+            "qk_gate_scale": 2.0,
+            "qk_gate_bias": -1.0,
+            "max_rel_delta_norm": None,
+            "use_centroid_scope_fallback": False,
+            "_compiled_scope_prototypes": None,
+        }
+        for k, v in defaults.items():
+            if not hasattr(mod, k):
+                setattr(mod, k, v)
+
+
 @torch.enable_grad()
 def engram_attribution_one(model: Any, input_ids: torch.Tensor, top_tokens: int = 8) -> Dict[str, Any]:
     """Attribution for one sequence `[1, T]`. Returns per-(layer, pass) sums to be aggregated across texts by the caller."""
@@ -261,8 +299,9 @@ def prompt_vs_response_breakdown(
 ) -> Dict[str, Dict[str, float]]:
     """Decompose `TRUE_HELDOUT_TEXTS` CE into prompt-prefix (`before <|Bot|>`) vs response (`after <|Bot|>`)
     and test replacing the eval system prompt with the training `tokenize_and_mask_record_16k` system prompt."""
+    _ensure_latest_engram_methods(model)
     device = next(model.parameters()).device
-    prev_engram = getattr(model, "use_engram", False)
+    prev_engram = _get_use_engram(model)
     train_sys = (
         "You are Spark-X2.6, a 72-layer recurrent reasoning and agentic engineering model. "
         "Outline your plan concisely inside <think>...</think>, then emit the complete deliverable."
@@ -273,10 +312,7 @@ def prompt_vs_response_breakdown(
         sums = {False: 0.0, True: 0.0}
         counts = {False: 0, True: 0}
         for use_eng in (False, True):
-            try:
-                model.use_engram = use_eng
-            except Exception:
-                pass
+            _set_use_engram(model, use_eng)
             for t in text_list:
                 bot_idx = t.find("<|Bot|>")
                 if bot_idx < 0 or mode == "all_tokens":
@@ -327,10 +363,7 @@ def prompt_vs_response_breakdown(
         out["train_sys_response_only"] = {"ce_off": c0_tr, "ce_on": c1_tr, "delta_ce": c1_tr - c0_tr}
         return out
     finally:
-        try:
-            model.use_engram = prev_engram
-        except Exception:
-            pass
+        _set_use_engram(model, prev_engram)
 
 
 def interpret_bie(rep: Dict[str, Any], noise: float = 0.005) -> Dict[str, Any]:
@@ -418,12 +451,9 @@ def knowledge_locus_scan(
         return _hook
 
     handles = [lyr.register_forward_hook(make_hook(i)) for i, lyr in enumerate(layers)]
-    prev_engram = getattr(model, "use_engram", False)
+    prev_engram = _get_use_engram(model)
     try:
-        try:
-            model.use_engram = False
-        except Exception:
-            pass
+        _set_use_engram(model, False)
         for t in texts:
             ids = tokenizer(t, add_special_tokens=False, return_tensors="pt").input_ids[:, :max_tokens].to(device)
             if ids.shape[1] < 2:
@@ -438,7 +468,8 @@ def knowledge_locus_scan(
 
             for l_idx, p_ord, h_step, rel_step in captured:
                 h_n = final_norm(h_step) if final_norm is not None else h_step
-                lg = lm_head(h_n).float()[0]
+                head_dtype = getattr(lm_head, "weight", h_n).dtype
+                lg = lm_head(h_n.to(dtype=head_dtype)).float()[0]
                 log_q = torch.log_softmax(lg, dim=-1)
                 kl = (p_final * (log_p_final - log_q)).sum(dim=-1).mean().item()
                 agree = float((lg.argmax(dim=-1) == top1_final).float().mean().item())
@@ -450,10 +481,7 @@ def knowledge_locus_scan(
     finally:
         for h in handles:
             h.remove()
-        try:
-            model.use_engram = prev_engram
-        except Exception:
-            pass
+        _set_use_engram(model, prev_engram)
 
     rows = []
     for (l_idx, p_ord), r in sorted(step_records.items(), key=lambda kv: (kv[0][1], kv[0][0])):
@@ -465,11 +493,17 @@ def knowledge_locus_scan(
             "top1_agreement": float(r["agree_sum"] / n),
             "rel_block_delta": float(r["rel_sum"] / n),
         })
+    for idx_r, r in enumerate(rows):
+        r["kl_drop"] = float((rows[idx_r - 1]["kl_to_final"] - r["kl_to_final"]) if idx_r > 0 else 0.0)
+    top_kl_drop = sorted(rows, key=lambda x: -x.get("kl_drop", 0.0))[:8]
+    top_rel_delta = sorted(rows, key=lambda x: -x.get("rel_block_delta", 0.0))[:8]
     commit_step = next((r for r in rows if r["top1_agreement"] >= 0.50), rows[-1] if rows else None)
     return {
         "status": "ok",
         "steps": rows,
         "commit_locus": commit_step,
+        "top_kl_drop_steps": top_kl_drop,
+        "top_rel_delta_steps": top_rel_delta,
     }
 
 
@@ -488,6 +522,7 @@ def enable_selective_engram_gating(
     use_centroid_scope_fallback: bool = False,
 ) -> int:
     """Configure opt-in selective gating (`BIE-3` / `SI4`) across all `ZipfianTieredMoEEngram` anchors on `model`."""
+    _ensure_latest_engram_methods(model)
     count = 0
     for _, mod in _anchor_list(model):
         if hasattr(mod, "configure_selective_gating"):
@@ -513,17 +548,18 @@ def gate_design_sweep(
     max_tokens: int = 2048,
 ) -> Dict[str, float]:
     """`BIE-3`: Compare held-out general-text CE across unconditional vs selective Engram gating regimes."""
+    _ensure_latest_engram_methods(model)
     out: Dict[str, float] = {}
-    prev_engram = getattr(model, "use_engram", True)
+    prev_engram = _get_use_engram(model)
     prev_filter = getattr(model, "engram_pass_filter", None)
     try:
         # 1. OFF baseline
-        model.use_engram = False
+        _set_use_engram(model, False)
         t0, n0 = _ce_texts(model, tokenizer, texts, max_tokens)
         out["off"] = t0 / max(1, n0)
 
         # 2. Unconditional FULL (legacy default)
-        model.use_engram = True
+        _set_use_engram(model, True)
         model.engram_pass_filter = None
         enable_selective_engram_gating(model, enabled=False)
         t1, n1 = _ce_texts(model, tokenizer, texts, max_tokens)
@@ -550,7 +586,7 @@ def gate_design_sweep(
     finally:
         enable_selective_engram_gating(model, enabled=False)
         model.engram_pass_filter = prev_filter
-        model.use_engram = prev_engram
+        _set_use_engram(model, prev_engram)
     return out
 
 
@@ -584,6 +620,7 @@ def run_gap_write_test(
     anchor_layer: Optional[int] = None,
     scope_threshold: float = 0.70,
     target_scale: float = 1.0,
+    max_tokens: int = 512,
 ) -> Dict[str, Any]:
     """`BIE-5` & `SI4`: Closed-form Continual Knowledge Injection & Gap-Write Test.
 
@@ -598,6 +635,7 @@ def run_gap_write_test(
     """
     import sparkx_engram_generalization as eg
 
+    _ensure_latest_engram_methods(model)
     facts_list = list(facts) if facts is not None else list(DEFAULT_SYNTHETIC_FACTS)
     gen_texts = list(general_texts) if general_texts is not None else list(eg.TRUE_HELDOUT_TEXTS[:2])
     anchors = dict(_anchor_list(model))
@@ -611,7 +649,7 @@ def run_gap_write_test(
     saved_down = eng_mod.expert_down.data.detach().clone()
     saved_proj = eng_mod.project.weight.data.detach().clone()
     saved_hot = eng_mod.tier1a_hot.weight.data.detach().clone() if hasattr(eng_mod, "tier1a_hot") else None
-    prev_engram = getattr(model, "use_engram", True)
+    prev_engram = _get_use_engram(model)
 
     def _eval_fact_nll(prompt_str: str, target_tok_id: int) -> Tuple[float, bool]:
         ids = tokenizer(prompt_str, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
@@ -630,8 +668,8 @@ def run_gap_write_test(
             eng_mod.project.weight.data.mul_(0.25)
 
         # 1. Measure baseline OFF general CE and fact NLLs
-        model.use_engram = False
-        t_off, n_off = _ce_texts(model, tokenizer, gen_texts, max_tokens=512)
+        _set_use_engram(model, False)
+        t_off, n_off = _ce_texts(model, tokenizer, gen_texts, max_tokens=max_tokens)
         ce_general_off = t_off / max(1, n_off)
 
         prepared_facts = []
@@ -655,7 +693,7 @@ def run_gap_write_test(
             })
 
         # 2. Sequentially extract exact loss-descent residual `-dL/dh` at `chosen_layer` and compile via AlphaEdit
-        model.use_engram = True
+        _set_use_engram(model, True)
         enable_selective_engram_gating(model, enabled=False)
         max_leakage = 0.0
         compile_reports = []
@@ -730,7 +768,7 @@ def run_gap_write_test(
             if hit_o_after:
                 hits_after += 1
 
-        t_after, n_after = _ce_texts(model, tokenizer, gen_texts, max_tokens=512)
+        t_after, n_after = _ce_texts(model, tokenizer, gen_texts, max_tokens=max_tokens)
         ce_general_after = t_after / max(1, n_after)
 
         return {
@@ -753,5 +791,5 @@ def run_gap_write_test(
             eng_mod.tier1a_hot.weight.data.copy_(saved_hot)
         eng_mod.reset_alphaedit_basis()
         enable_selective_engram_gating(model, enabled=False)
-        model.use_engram = prev_engram
+        _set_use_engram(model, prev_engram)
 
