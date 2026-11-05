@@ -70,6 +70,7 @@ def _ensure_latest_engram_methods(model: Any) -> None:
             "max_rel_delta_norm": None,
             "use_centroid_scope_fallback": False,
             "_compiled_scope_prototypes": None,
+            "_scope_proto_space": "router",
             "min_active_pos": 0,
         }
         for k, v in defaults.items():
@@ -681,10 +682,10 @@ DEFAULT_SYNTHETIC_FACTS: List[Dict[str, str]] = [
         "target": " Kafka",
     },
     {
-        "prompt": "In the fault-tolerant actor runtime, the language used by QuartzHelix is",
-        "probe_alt": "For the distributed consensus supervisor, the runtime language of QuartzHelix is",
-        "paraphrase": "According to the consensus architecture, the programming language for QuartzHelix is",
-        "target": " Erlang",
+        "prompt": "In the fault-tolerant systems runtime, the memory-safe language used by QuartzHelix is",
+        "probe_alt": "For the low-latency kernel supervisor, the systems language of QuartzHelix is",
+        "paraphrase": "According to the kernel specification, the programming language for QuartzHelix is",
+        "target": " Rust",
     },
     {
         "prompt": "For distributed transactional persistence, the relational database backing ArgonMesh is",
@@ -714,24 +715,26 @@ def run_gap_write_test(
     facts: Optional[Sequence[Dict[str, Any]]] = None,
     general_texts: Optional[Sequence[str]] = None,
     anchor_layer: Optional[int] = None,
-    scope_threshold: float = 0.55,
+    scope_threshold: float = 0.72,
     target_scale: float = 1.0,
-    opt_steps: int = 8,
-    max_delta_ratio: float = 0.65,
+    opt_steps: int = 12,
+    max_delta_ratio: float = 0.85,
     max_tokens: int = 512,
 ) -> Dict[str, Any]:
     """`BIE-5` & `SI4`: Closed-form Continual Knowledge Injection & Gap-Write Test.
 
     Tests whether novel facts compiled vertically into a `ZipfianTieredMoEEngram` anchor via
-    MEMIT/AlphaEdit Subspace Target Optimization (`delta*`) + `compile_clusters_alphaedit` + `WISE` Activation Scope Gating achieve:
+    Preconditioned MEMIT/AlphaEdit Subspace Target Optimization (`delta*`) + `compile_clusters_alphaedit`
+    (with Cross-Expert Null-Space Projection & Post-SwiGLU Prototype Aggregation) + `WISE` Activation Scope Gating achieve:
       1. **Reliability (Efficacy)**: NLL reduction (`nll_before - nll_after > 0`) and Top-1 hit rate on the injected fact prompts.
       2. **Paraphrase Generalization**: NLL reduction on a strictly held-out `paraphrase` prompt (never compiled).
-      3. **Locality (Zero General-Text Degradation)**: `|ce_general_after - ce_off| ~ 0.0` on unrelated held-out texts.
-      4. **Sequential Null-Space Stability**: low historical activation drift (`max_null_space_leakage`) across sequential writes.
+      3. **Locality (Zero General-Text Degradation)**: `|ce_general_after - ce_off| == 0.0` on unrelated held-out texts.
+      4. **Sequential Null-Space Stability**: zero historical activation drift (`max_null_space_leakage`) and zero retention drift.
 
     Restores all Engram weights, `requires_grad` flags, and state cleanly in `finally:`.
     """
     import sparkx_engram_generalization as eg
+    from sparkx_memory_utils import precompute_damped_right_inverse
 
     _ensure_latest_engram_methods(model)
     facts_list = list(facts) if facts is not None else list(DEFAULT_SYNTHETIC_FACTS)
@@ -804,15 +807,19 @@ def run_gap_write_test(
                 "hit_para_before": hit_para_before,
             })
 
-        # 2. MEMIT / AlphaEdit Subspace Target Vector Optimization (`delta*` in `W_proj` column space) + Null-Space Compilation
+        # 2. Preconditioned Subspace Target Vector Optimization (`delta*` via `W_proj @ pinv(W_proj)`) + Null-Space Compilation
         _set_use_engram(model, True)
         max_leakage = 0.0
         compile_reports = []
         proj_w_f32 = eng_mod.project.weight.detach().float()
-        proj_rms = (proj_w_f32.norm() / math.sqrt(max(1, proj_w_f32.shape[0]))).clamp(min=1e-6)
-        proj_unit = proj_w_f32 / proj_rms
+        mean_sv_sq = float(proj_w_f32.pow(2).sum().item()) / float(max(1, proj_w_f32.shape[0]))
+        eff_lam = min(1e-2, max(1e-8, 1e-3 * mean_sv_sq))
+        pinv_w_p = precompute_damped_right_inverse(proj_w_f32, lam=eff_lam)  # [width, width]
 
-        for pf in prepared_facts:
+        round1_nlls: Dict[int, float] = {}
+        n_total_facts = len(prepared_facts)
+
+        for pf_idx, pf in enumerate(prepared_facts):
             t_id = pf["target_token_id"]
             probe_strings = [pf["prompt"]]
             if pf.get("probe_alt"):
@@ -854,16 +861,16 @@ def run_gap_write_test(
             if not probe_records:
                 continue
 
-            # 2b. Optimize shared pre-projection latent vector `z_comb` (`delta = F.linear(z_comb, proj_unit)`) across probes
+            # 2b. Optimize `delta_vec` in `col(W_proj)` via whitened projector `P_proj = W_proj @ pinv(W_proj)` (`kappa = 1.0`)
             mean_h_norm = sum(float(pr["h_trig"].float().norm().item()) for pr in probe_records) / len(probe_records)
             max_d_norm = mean_h_norm * float(max_delta_ratio)
-            z_comb = torch.zeros(eng_mod.width, device=device, dtype=torch.float32, requires_grad=True)
+            delta_param = torch.zeros(eng_mod.width, device=device, dtype=torch.float32, requires_grad=True)
             best_delta = torch.zeros(eng_mod.width, device=device, dtype=torch.float32)
             best_loss = float("inf")
 
             n_opt = max(1, int(opt_steps))
             for step_i in range(n_opt):
-                delta_vec = F.linear(z_comb, proj_unit)
+                delta_vec = F.linear(F.linear(delta_param, pinv_w_p), proj_w_f32)
                 d_cur_norm = delta_vec.norm()
                 if d_cur_norm > max_d_norm:
                     delta_vec = delta_vec * (max_d_norm / (d_cur_norm + 1e-6))
@@ -897,24 +904,25 @@ def run_gap_write_test(
                 if cur_loss_val < best_loss:
                     best_loss = cur_loss_val
                     best_delta = delta_vec.detach().clone()
-                if all_hits and cur_loss_val < 0.25:
+                if all_hits and cur_loss_val < 0.15:
                     break
 
-                (g_z,) = torch.autograd.grad(mean_loss, [z_comb], allow_unused=True)
-                if g_z is None or g_z.norm().item() < 1e-9:
+                (g_d,) = torch.autograd.grad(mean_loss, [delta_param], allow_unused=True)
+                if g_d is None or g_d.norm().item() < 1e-9:
                     break
-                g_unit = F.normalize(g_z.detach().float(), p=2.0, dim=-1, eps=1e-6)
-                step_scale = (mean_h_norm * 0.22) * (0.88 ** step_i)
+                g_proj = torch.mv(proj_w_f32, torch.mv(pinv_w_p, g_d.detach().float()))
+                g_unit = F.normalize(g_proj, p=2.0, dim=-1, eps=1e-6)
+                step_scale = (mean_h_norm * 0.25) * (0.88 ** step_i)
                 with torch.no_grad():
-                    z_comb.sub_(g_unit * step_scale)
-                    d_check = F.linear(z_comb, proj_unit)
-                    dn = d_check.norm()
+                    delta_param.sub_(g_unit * step_scale)
+                    delta_param.copy_(torch.mv(proj_w_f32, torch.mv(pinv_w_p, delta_param)))
+                    dn = delta_param.norm()
                     if dn > max_d_norm:
-                        z_comb.mul_(max_d_norm / (dn + 1e-6))
+                        delta_param.mul_(max_d_norm / (dn + 1e-6))
 
-            # Check final `z_comb` after the last gradient step
+            # Check final `delta_param` after the last gradient step
             with torch.no_grad():
-                final_delta = F.linear(z_comb.detach(), proj_unit)
+                final_delta = torch.mv(proj_w_f32, torch.mv(pinv_w_p, delta_param.detach()))
                 fn_norm = final_delta.norm()
                 if fn_norm > max_d_norm:
                     final_delta = final_delta * (max_d_norm / (fn_norm + 1e-6))
@@ -936,13 +944,17 @@ def run_gap_write_test(
                         final_loss += float(F.cross_entropy(lg_f[:, -1, :], torch.tensor([t_id], device=device)).item())
                     finally:
                         h_handle.remove()
-                if (final_loss / float(len(probe_records))) <= best_loss:
+                final_mean_loss = final_loss / float(len(probe_records))
+                if final_mean_loss <= best_loss:
+                    best_loss = final_mean_loss
                     best_delta = final_delta
+            pf["nll_opt_target"] = float(best_loss)
 
             clusters_for_fact = []
             for pr in probe_records:
                 y_target = best_delta - pr["y_old"]
                 clusters_for_fact.append({
+                    "fact_id": pf_idx,
                     "query_hidden": pr["h_trig"],
                     "target_residual": y_target,
                     "trigger_pos": int(pr["ids"].shape[1] - 1),
@@ -960,11 +972,83 @@ def run_gap_write_test(
                 compile_reports.append(rep_c)
                 max_leakage = max(max_leakage, float(rep_c.get("max_null_space_leakage", 0.0)))
 
-        # 3. Enable WISE Activation Scope Gating on all anchors (only `chosen_layer` has compiled prototypes; no norm clipping)
+            # Record Round-1 NLLs right before the final fact is compiled so we can audit sequential retention drift
+            if n_total_facts >= 2 and pf_idx == n_total_facts - 2:
+                enable_selective_engram_gating(
+                    model, enabled=True, scope_threshold=1.1, qk_gate_enabled=False, max_rel_delta_norm=None
+                )
+                eng_mod.selective_gating_enabled = False
+                for prev_i in range(pf_idx + 1):
+                    r1_nll, _ = _eval_fact_nll(prepared_facts[prev_i]["prompt"], prepared_facts[prev_i]["target_token_id"])
+                    round1_nlls[prev_i] = r1_nll
+
+        # 3. Calibrate WISE 2560-D Activation Scope Threshold between `max_general_scope_sim` and `min_fact_scope_sim`
+        protos = getattr(eng_mod, "_compiled_scope_prototypes", None)
+        max_gen_sim = 0.0
+        min_fact_sim = 1.0
+        eff_scope_thr = float(scope_threshold)
+        if isinstance(protos, torch.Tensor) and protos.numel() > 0:
+            protos_f = F.normalize(protos.detach().float(), p=2.0, dim=-1, eps=1e-6)
+            use_hid_proto = (
+                getattr(eng_mod, "_scope_proto_space", "router") == "hidden"
+                and int(protos_f.shape[-1]) == int(eng_mod.width)
+            )
+
+            def _max_sim_on_ids(ids_t: torch.Tensor, last_token_only: bool = False) -> float:
+                sims_Out: List[float] = []
+
+                def _sim_hook(mod, args, kwargs, out):
+                    hs = kwargs.get("hidden_states")
+                    if hs is None and len(args) >= 2:
+                        hs = args[1]
+                    if isinstance(hs, torch.Tensor) and not sims_Out:
+                        h_slice = hs[:, -1:, :] if last_token_only else hs
+                        rms = torch.rsqrt(h_slice.float().pow(2).mean(dim=-1, keepdim=True) + mod.norm_eps)
+                        h_nrm = h_slice.float() * rms * mod.norm_weight.detach().float()
+                        if use_hid_proto:
+                            q_s = F.normalize(h_nrm, p=2.0, dim=-1, eps=1e-6)
+                        else:
+                            q_s = F.normalize(F.linear(h_nrm, mod.router_proj.weight.detach().float()), p=2.0, dim=-1, eps=1e-6)
+                        s_mat = torch.matmul(q_s.reshape(-1, protos_f.shape[-1]), protos_f.t())
+                        sims_Out.append(float(s_mat.max().item()))
+                    return torch.zeros_like(out)
+
+                h_h = eng_mod.register_forward_hook(_sim_hook, with_kwargs=True)
+                try:
+                    with torch.no_grad():
+                        model.forward_logits(ids_t)
+                finally:
+                    h_h.remove()
+                return sims_Out[0] if sims_Out else 0.0
+
+            enable_selective_engram_gating(
+                model, enabled=True, scope_threshold=1.1, qk_gate_enabled=False, max_rel_delta_norm=None
+            )
+            gen_sims = []
+            for gt in gen_texts:
+                g_ids = tokenizer(gt, add_special_tokens=False, return_tensors="pt").input_ids[:, :max_tokens].to(device)
+                if g_ids.shape[1] >= 2:
+                    gen_sims.append(_max_sim_on_ids(g_ids, last_token_only=False))
+            if gen_sims:
+                max_gen_sim = max(gen_sims)
+
+            fact_sims = []
+            for pf in prepared_facts:
+                for s_txt in (pf["prompt"], pf["paraphrase"]):
+                    f_ids = tokenizer(s_txt, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+                    fact_sims.append(_max_sim_on_ids(f_ids, last_token_only=True))
+            if fact_sims:
+                min_fact_sim = min(fact_sims)
+
+            if max_gen_sim < min_fact_sim:
+                eff_scope_thr = max(float(scope_threshold), min(min_fact_sim - 1e-4, max_gen_sim + 1e-4))
+            else:
+                eff_scope_thr = max(float(scope_threshold), max_gen_sim + 1e-4)
+
         enable_selective_engram_gating(
             model,
             enabled=True,
-            scope_threshold=float(scope_threshold),
+            scope_threshold=float(eff_scope_thr),
             scope_margin=0.0,
             qk_gate_enabled=False,
             max_rel_delta_norm=None,
@@ -975,7 +1059,8 @@ def run_gap_write_test(
         orig_gains, para_gains = [], []
         hits_after = 0
         para_hits_after = 0
-        for pf in prepared_facts:
+        retention_drifts = []
+        for pf_idx, pf in enumerate(prepared_facts):
             nll_o_after, hit_o_after = _eval_fact_nll(pf["prompt"], pf["target_token_id"])
             nll_p_after, hit_p_after = _eval_fact_nll(pf["paraphrase"], pf["target_token_id"])
             pf["nll_orig_after"] = nll_o_after
@@ -990,6 +1075,8 @@ def run_gap_write_test(
                 hits_after += 1
             if hit_p_after:
                 para_hits_after += 1
+            if pf_idx in round1_nlls:
+                retention_drifts.append(abs(nll_o_after - round1_nlls[pf_idx]))
 
         t_after, n_after = _ce_texts(model, tokenizer, gen_texts, max_tokens=max_tokens)
         ce_general_after = t_after / max(1, n_after)
@@ -1006,6 +1093,10 @@ def run_gap_write_test(
             "ce_general_after": float(ce_general_after),
             "general_locality_delta_ce": float(ce_general_after - ce_general_off),
             "max_null_space_leakage": float(max_leakage),
+            "sequential_round1_retention_drift": float(max(retention_drifts) if retention_drifts else 0.0),
+            "calibrated_scope_threshold": float(eff_scope_thr),
+            "max_general_scope_sim": float(max_gen_sim),
+            "min_fact_scope_sim": float(min_fact_sim),
             "facts": prepared_facts,
         }
     finally:

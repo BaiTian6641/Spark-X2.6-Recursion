@@ -1897,7 +1897,16 @@ class ZipfianTieredMoEEngram(nn.Module):
             if scope_thr > 0.0:
                 protos = getattr(self, '_compiled_scope_prototypes', None)
                 if protos is not None and protos.numel() > 0 and int(pass_idx) == 0:
-                    sims = torch.matmul(u, protos.to(device=u.device, dtype=u.dtype).t())
+                    use_hidden_scope = (
+                        getattr(self, '_scope_proto_space', 'router') == 'hidden'
+                        and int(protos.shape[-1]) == int(self.width)
+                    )
+                    q_scope = (
+                        F.normalize(h_norm_f, p=2.0, dim=-1, eps=1e-6).to(u.dtype)
+                        if use_hidden_scope
+                        else u
+                    )
+                    sims = torch.matmul(q_scope, protos.to(device=q_scope.device, dtype=q_scope.dtype).t())
                     s_scope = sims.max(dim=-1, keepdim=True).values
                 elif getattr(self, 'use_centroid_scope_fallback', False):
                     s_scope = torch.matmul(u, c.t()).max(dim=-1, keepdim=True).values
@@ -1940,16 +1949,25 @@ class ZipfianTieredMoEEngram(nn.Module):
         return self.gain
 
     @torch.no_grad()
-    def register_scope_prototypes(self, u_vecs: torch.Tensor) -> int:
-        """Register unit-norm router query directions `[M, 64]` in the WISE activation scope prototype bank."""
-        u_norm = F.normalize(u_vecs.detach().float().reshape(-1, 64), p=2.0, dim=-1, eps=1e-6)
+    def register_scope_prototypes(self, u_vecs: torch.Tensor, space: Optional[str] = None) -> int:
+        """Register unit-norm directions (`[M, 64]` router or `[M, width]` hidden) in the WISE activation scope prototype bank."""
+        d_last = int(u_vecs.shape[-1]) if u_vecs.dim() >= 1 else 64
+        if space == 'hidden' or (space is None and d_last == int(self.width) and int(self.width) != 64):
+            proto_dim = int(self.width)
+            target_space = 'hidden'
+        else:
+            proto_dim = 64
+            target_space = 'router'
+        u_norm = F.normalize(u_vecs.detach().float().reshape(-1, proto_dim), p=2.0, dim=-1, eps=1e-6)
         existing = getattr(self, '_compiled_scope_prototypes', None)
-        if existing is None or existing.numel() == 0:
+        cur_space = getattr(self, '_scope_proto_space', 'router')
+        if existing is None or existing.numel() == 0 or existing.shape[-1] != proto_dim or cur_space != target_space:
             self._compiled_scope_prototypes = u_norm.to(self.expert_centroids.device)
         else:
             self._compiled_scope_prototypes = torch.cat(
                 [existing.to(self.expert_centroids.device), u_norm.to(self.expert_centroids.device)], dim=0
             )
+        self._scope_proto_space = target_space
         return int(self._compiled_scope_prototypes.shape[0])
 
     def configure_selective_gating(
@@ -1980,8 +1998,11 @@ class ZipfianTieredMoEEngram(nn.Module):
         """Reset the per-expert AlphaEdit active subspace basis, WISE scope prototypes, and historical activation tracker."""
         self._alphaedit_basis = {}
         self._alphaedit_history_acts = {}
+        self._alphaedit_history_qvecs = []
+        self._alphaedit_basis_qcount = {}
         self._alphaedit_fp32_down = {}
         self._compiled_scope_prototypes = None
+        self._scope_proto_space = 'router'
         self._eval_lex_cache = None
 
     @torch.no_grad()
@@ -2000,13 +2021,16 @@ class ZipfianTieredMoEEngram(nn.Module):
         """Compile salient LSA semantic clusters (`B_b`) vertically into this `ZipfianTieredMoEEngram` anchor
         via Null-Space Constrained Closed-Form Ridge Compilation (`AlphaEdit`, Fang et al., ICLR 2025).
 
-        Phase 0 fixes:
-          - M5: Uses exact damped right-inverse `W^T (W W^T + lam I)^{-1}` (`precompute_damped_right_inverse`) with
-            scale-adaptive Tikhonov damping relative to `mean_sv_sq(W_proj)`.
+        Phase 0 & BIE-5/SI4 fixes:
+          - M5: Exact damped right-inverse `W^T (W W^T + lam I)^{-1}` with scale-adaptive Tikhonov damping.
           - M6: Never overwrites `self.project.weight` with `0.25 * I` (skips cleanly if `project` is zero-gated).
           - M4: Raises `CapacityExhaustedError` via `update_orthonormal_basis` instead of silently truncating old basis columns.
           - m1: Uses `F.linear(..., self.router_proj.weight.float())` without mutating module parameters in place.
-          - M1: Supports `key_mode="query"` (default: keys on querying hidden state) or `"cluster"` (ablation).
+          - Cross-Expert Null-Space Projection: Protects all previously compiled query vectors `Q_hist` across every
+            touched specialist expert `e_id` in Top-K MoE routing so subsequent edits never leak across experts.
+          - Post-SwiGLU MEMIT Prototype Aggregation (`fact_id`): Averages post-SwiGLU activations `act_b` across probes
+            of the same `fact_id` in the exact linear domain of `expert_down` while registering full-width (`2560`-D)
+            normalized hidden prototypes in the WISE scope bank.
         """
         if not clusters:
             return {
@@ -2022,6 +2046,10 @@ class ZipfianTieredMoEEngram(nn.Module):
             self._alphaedit_basis = {}
         if not hasattr(self, "_alphaedit_history_acts") or self._alphaedit_history_acts is None:
             self._alphaedit_history_acts = {}
+        if not hasattr(self, "_alphaedit_history_qvecs") or self._alphaedit_history_qvecs is None:
+            self._alphaedit_history_qvecs = []
+        if not hasattr(self, "_alphaedit_basis_qcount") or self._alphaedit_basis_qcount is None:
+            self._alphaedit_basis_qcount = {}
         if not hasattr(self, "_alphaedit_fp32_down") or self._alphaedit_fp32_down is None:
             self._alphaedit_fp32_down = {}
 
@@ -2084,130 +2112,183 @@ class ZipfianTieredMoEEngram(nn.Module):
 
         use_multi_horizon = bool(getattr(self, "multi_horizon_recall", False))
         use_query_key = str(key_mode).lower().strip() != "cluster"
+
+        # Group clusters by optional `fact_id` so multi-probe facts form a single rank-1 post-SwiGLU prototype (MEMIT Eq. 14)
+        grouped_clusters: dict[Any, list[dict[str, Any]]] = {}
+        for idx_c, cl in enumerate(clusters):
+            f_key = cl.get("fact_id", f"__single_{idx_c}")
+            grouped_clusters.setdefault(f_key, []).append(cl)
+
         expert_buckets: dict[int, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = {}
-        for cl in clusters:
-            raw_key_h = cl.get("query_hidden") if (use_query_key and "query_hidden" in cl) else cl["cluster_hidden"]
-            h_b = raw_key_h.to(device=device, dtype=param_dtype).view(1, 1, self.width)
-            raw_y = cl.get("target_residual") if "target_residual" in cl else cl["value_residual"]
-            y_b = raw_y.to(device=device, dtype=torch.float32).view(self.width)
-            trig_pos = int(cl.get("trigger_pos", 0))
+        compiled_proto_list: list[torch.Tensor] = []
 
-            h_norm = triton_rmsnorm(h_b, self.norm_weight, self.norm_eps)
-            h_norm_f = h_norm.float().view(1, self.width)
+        for _, cl_group in grouped_clusters.items():
+            group_items = []
+            for cl in cl_group:
+                raw_key_h = cl.get("query_hidden") if (use_query_key and "query_hidden" in cl) else cl["cluster_hidden"]
+                h_b = raw_key_h.to(device=device, dtype=param_dtype).view(1, 1, self.width)
+                raw_y = cl.get("target_residual") if "target_residual" in cl else cl["value_residual"]
+                y_b = raw_y.to(device=device, dtype=torch.float32).view(self.width)
+                trig_pos = int(cl.get("trigger_pos", 0))
 
-            # Per-cluster `input_ids` override (so multi-prompt batches match each prompt's exact N-grams)
-            cl_ids = cl.get("input_ids")
-            if isinstance(cl_ids, torch.Tensor) and cl_ids.numel() > 0:
-                cl_ids_dev = cl_ids.to(device)
-                if cl_ids_dev.dim() == 1:
-                    cl_ids_dev = cl_ids_dev.unsqueeze(0)
-                cur_ng = self.compute_ngram_indices(cl_ids_dev, self.total_buckets)
-            else:
-                cur_ng = ngram_all
+                h_norm = triton_rmsnorm(h_b, self.norm_weight, self.norm_eps)
+                h_norm_f = h_norm.float().view(1, self.width)
+                h_hat_proto = F.normalize(h_norm_f, p=2.0, dim=-1, eps=1e-6)
+                compiled_proto_list.append(h_hat_proto.detach())
 
-            # Lexical lookup at trigger position matching `forward()` (including `multi_horizon_recall` when active)
-            if cur_ng is not None and 0 <= trig_pos < cur_ng[0].shape[1]:
-                sub_ng = (
-                    cur_ng[0][:, trig_pos : trig_pos + 1],
-                    cur_ng[1][:, trig_pos : trig_pos + 1],
-                    cur_ng[2][:, trig_pos : trig_pos + 1],
-                )
-                if inject_lexical and float(lexical_strength) > 0.0:
-                    q_cue = self.query_proj(h_norm).detach().view(self.eng_dim)
-                    for scale_i, idx_t in enumerate(sub_ng):
-                        b_id = int(idx_t.item())
-                        if 0 <= b_id < self.hot_buckets:
-                            row = b_id * 3 + scale_i
-                            self.tier1a_hot.weight.data[row].lerp_(
-                                q_cue.to(self.tier1a_hot.weight.dtype), float(lexical_strength)
-                            )
-                if use_multi_horizon and trig_pos >= 1:
-                    w_start = max(0, trig_pos - 2)
-                    win_ng = (
-                        cur_ng[0][:, w_start : trig_pos + 1],
-                        cur_ng[1][:, w_start : trig_pos + 1],
-                        cur_ng[2][:, w_start : trig_pos + 1],
-                    )
-                    e_win = self._lookup_tier1_lexical(win_ng, device, param_dtype)
-                    if e_win.shape[1] >= 3:
-                        e_lex = (0.83 * e_win[:, -1:, :] + 0.12 * e_win[:, -2:-1, :] + 0.05 * e_win[:, -3:-2, :]).to(param_dtype)
-                    elif e_win.shape[1] == 2:
-                        e_lex = (0.88 * e_win[:, -1:, :] + 0.12 * e_win[:, -2:-1, :]).to(param_dtype)
-                    else:
-                        e_lex = e_win[:, -1:, :]
+                # Per-cluster `input_ids` override (so multi-prompt batches match each prompt's exact N-grams)
+                cl_ids = cl.get("input_ids")
+                if isinstance(cl_ids, torch.Tensor) and cl_ids.numel() > 0:
+                    cl_ids_dev = cl_ids.to(device)
+                    if cl_ids_dev.dim() == 1:
+                        cl_ids_dev = cl_ids_dev.unsqueeze(0)
+                    cur_ng = self.compute_ngram_indices(cl_ids_dev, self.total_buckets)
                 else:
-                    e_lex = self._lookup_tier1_lexical(sub_ng, device, param_dtype)
-            else:
-                e_lex = torch.zeros((1, 1, self.eng_dim), device=device, dtype=param_dtype)
-            _lex_s = getattr(self, "_ablate_lex", 1.0)
-            if _lex_s != 1.0:
-                e_lex = e_lex * _lex_s
+                    cur_ng = ngram_all
 
-            # Fix m1: route `h_norm_f` through X-MoE hypersphere router without calling `.float()` on the module
-            u = F.normalize(F.linear(h_norm_f, self.router_proj.weight.float()), p=2.0, dim=-1, eps=1e-6)  # [1, 64]
-            r_logits = (torch.matmul(u, c_norm.t()) / temp) + p_bias  # [1, e_act]
-            scores = torch.sigmoid(r_logits)[0]  # [e_act]
+                if cur_ng is not None and 0 <= trig_pos < cur_ng[0].shape[1]:
+                    sub_ng = (
+                        cur_ng[0][:, trig_pos : trig_pos + 1],
+                        cur_ng[1][:, trig_pos : trig_pos + 1],
+                        cur_ng[2][:, trig_pos : trig_pos + 1],
+                    )
+                    if inject_lexical and float(lexical_strength) > 0.0:
+                        q_cue = self.query_proj(h_norm).detach().view(self.eng_dim)
+                        for scale_i, idx_t in enumerate(sub_ng):
+                            b_id = int(idx_t.item())
+                            if 0 <= b_id < self.hot_buckets:
+                                row = b_id * 3 + scale_i
+                                self.tier1a_hot.weight.data[row].lerp_(
+                                    q_cue.to(self.tier1a_hot.weight.dtype), float(lexical_strength)
+                                )
+                    if use_multi_horizon and trig_pos >= 1:
+                        w_start = max(0, trig_pos - 2)
+                        win_ng = (
+                            cur_ng[0][:, w_start : trig_pos + 1],
+                            cur_ng[1][:, w_start : trig_pos + 1],
+                            cur_ng[2][:, w_start : trig_pos + 1],
+                        )
+                        e_win = self._lookup_tier1_lexical(win_ng, device, param_dtype)
+                        if e_win.shape[1] >= 3:
+                            e_lex = (0.83 * e_win[:, -1:, :] + 0.12 * e_win[:, -2:-1, :] + 0.05 * e_win[:, -3:-2, :]).to(param_dtype)
+                        elif e_win.shape[1] == 2:
+                            e_lex = (0.88 * e_win[:, -1:, :] + 0.12 * e_win[:, -2:-1, :]).to(param_dtype)
+                        else:
+                            e_lex = e_win[:, -1:, :]
+                    else:
+                        e_lex = self._lookup_tier1_lexical(sub_ng, device, param_dtype)
+                else:
+                    e_lex = torch.zeros((1, 1, self.eng_dim), device=device, dtype=param_dtype)
+                _lex_s = getattr(self, "_ablate_lex", 1.0)
+                if _lex_s != 1.0:
+                    e_lex = e_lex * _lex_s
+
+                u = F.normalize(F.linear(h_norm_f, self.router_proj.weight.float()), p=2.0, dim=-1, eps=1e-6)  # [1, 64]
+                q_vec = (self.query_proj(h_norm) + e_lex).reshape(1, self.eng_dim)
+                ctx_b = (2.0 * torch.sigmoid(self.ctx_gate(h_norm).float())).view(self.width).clamp(min=0.1)
+                group_items.append((u, q_vec, ctx_b, y_b))
+
+            # Route fact group using its mean hypersphere query `u_mean` so all probes of a fact share `e_star`
+            u_mean = F.normalize(torch.stack([it[0] for it in group_items], dim=0).mean(dim=0), p=2.0, dim=-1, eps=1e-6)
+            r_logits = (torch.matmul(u_mean, c_norm.t()) / temp) + p_bias  # [1, e_act]
+            scores = torch.sigmoid(r_logits)[0]
             sel_scores = scores + e_bias
             _, topk_idx = torch.topk(sel_scores, k=k_act, dim=-1)
-            topk_raw = torch.gather(scores, dim=-1, index=topk_idx)
-            prim_raw = topk_raw[:k_base]
-            prim_gates = prim_raw / (prim_raw.sum() + 1e-6)
-            if k_act > k_base:
-                ent = -(prim_gates * torch.log(prim_gates.clamp(min=1e-7))).sum()
-                max_ent = math.log(max(2, k_base))
-                ent_norm = (ent / max_ent).clamp(0.0, 1.0)
-                beta_tail = float(getattr(self, "elastic_tail_blend_max", 0.18))
-                alpha_t = beta_tail * ent_norm.pow(2)
-                prim_gates = (1.0 - alpha_t) * prim_gates
 
-            # Pick the best active specialist in `topk_idx[:k_base]` with highest (gate * free_null_capacity)
             best_k = 0
             best_score = -1.0
             for k_i in range(k_base):
                 cand_e = int(topk_idx[k_i].item())
-                g_val = float(prim_gates[k_i].item())
                 v_basis = self._alphaedit_basis.get(cand_e)
                 used_r = int(v_basis.shape[1]) if v_basis is not None else 0
                 free_frac = max(0.05, 1.0 - (used_r / float(self.expert_rank)))
                 zone_mult = 1.25 if cand_e in zone_set else 1.0
-                sc = g_val * free_frac * zone_mult
+                sc = float(scores[cand_e].item()) * free_frac * zone_mult
                 if sc > best_score:
                     best_score = sc
                     best_k = k_i
 
             e_star = int(topk_idx[best_k].item())
-            g_star = max(float(prim_gates[best_k].item()), 1e-2)
-
-            # Post-SwiGLU hidden activation `a_b in R^3072` inside specialist `e_star`
-            q_vec = (self.query_proj(h_norm) + e_lex).reshape(1, self.eng_dim)
             w_g = self.expert_gate[e_star].detach()
             w_u = self.expert_up[e_star].detach()
-            act_b = triton_swiglu(torch.matmul(q_vec, w_g), torch.matmul(q_vec, w_u))[0].float()  # [3072]
 
-            # Pull target residual `target_scale * y_b` back to expert output delta `dz_b in R^2560` (M5 fix)
-            ctx_b = (2.0 * torch.sigmoid(self.ctx_gate(h_norm).float())).view(self.width).clamp(min=0.1)
-            r_target = float(target_scale) * y_b
-            comb_delta = torch.mv(pinv_w_p, r_target / mod_gate)
-            dz_b = comb_delta / (ctx_b * g_star)
+            act_list = []
+            dz_list = []
+            q_list = []
+            for u_it, q_it, ctx_it, y_it in group_items:
+                r_logits_it = (torch.matmul(u_it, c_norm.t()) / temp) + p_bias
+                scores_it = torch.sigmoid(r_logits_it)[0]
+                _, topk_it = torch.topk(scores_it + e_bias, k=k_act, dim=-1)
+                topk_raw_it = torch.gather(scores_it, dim=-1, index=topk_it)
+                prim_raw_it = topk_raw_it[:k_base]
+                prim_gates_it = prim_raw_it / (prim_raw_it.sum() + 1e-6)
+                if k_act > k_base:
+                    ent_it = -(prim_gates_it * torch.log(prim_gates_it.clamp(min=1e-7))).sum()
+                    ent_norm_it = (ent_it / math.log(max(2, k_base))).clamp(0.0, 1.0)
+                    alpha_t_it = float(getattr(self, "elastic_tail_blend_max", 0.18)) * ent_norm_it.pow(2)
+                    prim_gates_it = (1.0 - alpha_t_it) * prim_gates_it
+                match_pos = (topk_it[:k_base] == e_star).nonzero(as_tuple=False)
+                if match_pos.numel() > 0:
+                    g_star_it = max(float(prim_gates_it[int(match_pos[0].item())].item()), 1e-2)
+                else:
+                    g_star_it = max(float(prim_gates_it[best_k].item()), 1e-2)
 
-            expert_buckets.setdefault(e_star, []).append((act_b, dz_b, u.detach()))
+                act_it = triton_swiglu(torch.matmul(q_it, w_g), torch.matmul(q_it, w_u))[0].float()
+                r_target_it = float(target_scale) * y_it
+                comb_delta_it = torch.mv(pinv_w_p, r_target_it / mod_gate)
+                dz_it = comb_delta_it / (ctx_it * g_star_it)
+                act_list.append(act_it)
+                dz_list.append(dz_it)
+                q_list.append(q_it.detach())
+
+            # Post-SwiGLU MEMIT prototype aggregation across probes of the same fact
+            act_proto = torch.stack(act_list, dim=0).mean(dim=0)
+            dz_proto = torch.stack(dz_list, dim=0).mean(dim=0)
+            q_proto = torch.cat(q_list, dim=0)  # [P, eng_dim]
+            expert_buckets.setdefault(e_star, []).append((act_proto, dz_proto, q_proto))
 
         fit_errors: list[float] = []
         max_null_leakage = 0.0
         updated_experts: list[int] = []
         max_allowed_rank = max(1, int(self.expert_rank) - 16)
-        compiled_u_list: list[torch.Tensor] = []
+        new_qvecs_this_call: list[torch.Tensor] = []
 
         for e_id, pairs in expert_buckets.items():
+            # Cross-Expert Null-Space Projection: ensure all historical compiled queries `Q_hist` are protected on `e_id`
+            prev_q_count = int(self._alphaedit_basis_qcount.get(e_id, 0))
+            total_q_hist = len(self._alphaedit_history_qvecs)
+            v_act = self._alphaedit_basis.get(e_id)
+            if total_q_hist > prev_q_count:
+                unproj_q = torch.cat(self._alphaedit_history_qvecs[prev_q_count:total_q_hist], dim=0).to(
+                    device=device, dtype=param_dtype
+                )
+                act_hist_e = triton_swiglu(
+                    torch.matmul(unproj_q, self.expert_gate[e_id].detach()),
+                    torch.matmul(unproj_q, self.expert_up[e_id].detach()),
+                ).float()
+                act_hist_perp = project_into_null_space(act_hist_e, v_act)
+                hist_perp_sq = float(act_hist_perp.pow(2).sum().item()) / float(max(1, act_hist_perp.shape[0]))
+                hist_thr = max(1e-12, 1e-6 * math.sqrt(max(1e-24, hist_perp_sq)))
+                v_act = update_orthonormal_basis(
+                    v_act, act_hist_perp, max_rank=max_allowed_rank, null_threshold=hist_thr
+                )
+                self._alphaedit_basis[e_id] = v_act
+                a_hist_prev = self._alphaedit_history_acts.get(e_id)
+                if a_hist_prev is None:
+                    self._alphaedit_history_acts[e_id] = act_hist_e.detach().clone()
+                else:
+                    self._alphaedit_history_acts[e_id] = torch.cat([a_hist_prev, act_hist_e.detach().clone()], dim=0)
+                self._alphaedit_basis_qcount[e_id] = total_q_hist
+
             a_mat = torch.stack([p[0] for p in pairs], dim=0)  # [M_e, 3072]
             dz_mat = torch.stack([p[1] for p in pairs], dim=0)  # [M_e, 2560]
 
-            # Scale ridge regularizer and SVD null threshold relative to post-SwiGLU activation energy `||a_b||^2`
-            mean_act_sq = float(a_mat.pow(2).sum().item()) / float(max(1, a_mat.shape[0]))
-            eff_alpha = min(float(alpha_ridge), max(1e-12, float(alpha_ridge) * mean_act_sq))
-            eff_null_thr = min(float(null_threshold), max(1e-8, float(null_threshold) * math.sqrt(max(1e-12, mean_act_sq))))
+            # Scale ridge regularizer and SVD null threshold relative to POST-PROJECTION activation energy `||a_perp||^2`
+            a_perp_pre = project_into_null_space(a_mat, v_act)
+            mean_perp_sq = float(a_perp_pre.pow(2).sum().item()) / float(max(1, a_perp_pre.shape[0]))
+            eff_alpha = min(float(alpha_ridge), max(1e-18, float(alpha_ridge) * mean_perp_sq))
+            eff_null_thr = max(1e-12, 1e-6 * math.sqrt(max(1e-24, mean_perp_sq)))
 
-            v_act = self._alphaedit_basis.get(e_id)
             dw_down, a_perp, _, rel_err = solve_null_space_ridge(
                 a_mat, dz_mat, v_basis=v_act, alpha_ridge=eff_alpha
             )
@@ -2236,11 +2317,17 @@ class ZipfianTieredMoEEngram(nn.Module):
                 self._alphaedit_history_acts[e_id] = a_mat.detach().clone()
             else:
                 self._alphaedit_history_acts[e_id] = torch.cat([a_hist, a_mat.detach().clone()], dim=0)
+            for p in pairs:
+                new_qvecs_this_call.append(p[2])
             updated_experts.append(e_id)
-            compiled_u_list.extend(p[2] for p in pairs)
 
-        if compiled_u_list:
-            self.register_scope_prototypes(torch.cat(compiled_u_list, dim=0))
+        if new_qvecs_this_call:
+            self._alphaedit_history_qvecs.extend(new_qvecs_this_call)
+            for e_id in updated_experts:
+                self._alphaedit_basis_qcount[e_id] = len(self._alphaedit_history_qvecs)
+
+        if compiled_proto_list:
+            self.register_scope_prototypes(torch.cat(compiled_proto_list, dim=0), space='hidden')
 
         self._eval_lex_cache = None
         total_rank = sum(int(v.shape[1]) for v in self._alphaedit_basis.values() if v is not None)
