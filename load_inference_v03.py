@@ -549,6 +549,18 @@ def load_sparkx_loop72_lsa(
                     break
                 except Exception:
                     pass
+            if dlsa_checkpoint is not None and not os.path.isfile(str(dlsa_checkpoint)):
+                for dname in (os.path.basename(str(dlsa_checkpoint)), 'visit_selectors_stage_e.pt'):
+                    try:
+                        dlsa_checkpoint = _hf_dl(repo_or_dir, dname, token=token)
+                        break
+                    except Exception:
+                        pass
+            elif dlsa_checkpoint is None:
+                try:
+                    dlsa_checkpoint = _hf_dl(repo_or_dir, 'visit_selectors_stage_e.pt', token=token)
+                except Exception:
+                    pass
 
     backbone_source = repo_or_dir if (os.path.isdir(repo_or_dir) and not bool(use_pristine_base)) else base_repo
 
