@@ -160,7 +160,9 @@ def fit_loop72_visit_bank_pca(
             y_mat = torch.stack(k_lat_targets, dim=0)  # [M, 64]
             gram = x_mat.t() @ x_mat + 1e-2 * torch.eye(x_mat.shape[1], device=x_mat.device, dtype=torch.float32)
             w_q_T = torch.linalg.solve(gram, x_mat.t() @ y_mat)  # [768, 64]
-            indexer.W_q.weight.data.copy_(w_q_T.t().to(indexer.W_q.weight.dtype))
+            w_pca = indexer.W_k.weight.data.float()
+            w_blend = F.normalize(0.65 * w_pca + 0.35 * F.normalize(w_q_T.t(), dim=-1, eps=1e-6), dim=-1, eps=1e-6)
+            indexer.W_q.weight.data.copy_(w_blend.to(indexer.W_q.weight.dtype))
 
         report[gv_idx] = {
             "status": "ok",
@@ -175,69 +177,98 @@ def distill_single_visit_indexer(
     qkv_samples: Sequence[Tuple["torch.Tensor", "torch.Tensor"]],
     cfg: Optional[VisitDistillConfig] = None,
 ) -> Dict[str, Any]:
-    """Train a single visit's `(W_k, W_q)` (`98,304` params) with sampled-query KL + focal-KL distillation."""
+    """Train a single visit's `(W_k, W_q)` (`98,304` params) with pre-cached sampled-query KL + focal-KL distillation."""
     if not HAS_TORCH:
         raise RuntimeError("distill_single_visit_indexer requires PyTorch.")
     cfg = cfg or VisitDistillConfig(d_idx=int(indexer.cfg.d_idx))
+    g = torch.Generator(device="cpu").manual_seed(int(cfg.seed))
+
+    # Pre-cache free-slice query/key inputs and teacher distributions once per sample (avoids 200x repeated einsum)
+    prepared_batches: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    with torch.no_grad():
+        for q_s, k_s in qkv_samples:
+            h_q, t_seq, d_h = q_s.shape
+            h_kv = k_s.shape[0]
+            g_sz = h_q // h_kv
+            if t_seq < 4:
+                continue
+            n_samp = min(int(cfg.sampled_queries), t_seq - 1)
+            perm = torch.randperm(t_seq - 1, generator=g)[:n_samp] + 1
+            q_pos = perm.sort().values.to(q_s.device)
+
+            q_in_sub = indexer._group_free_query_features(q_s[:, q_pos, :]).detach()  # [S, 768]
+            _, k_in = indexer.inputs(q_s[:, :1, :], k_s)
+            k_in = k_in.detach()  # [T, 768]
+
+            scale = 1.0 / (d_h ** 0.5)
+            q_g = q_s[:, q_pos, :].view(h_kv, g_sz, n_samp, d_h).float()
+            k_f = k_s.float()
+            k_idx = torch.arange(t_seq, device=q_s.device).unsqueeze(0)  # [1, T]
+            q_col = q_pos.unsqueeze(1)  # [S, 1]
+            causal_mask = k_idx <= q_col  # [S, T]
+
+            t_logits = torch.einsum("hgsd,htd->hgst", q_g, k_f) * (scale / max(1e-4, float(cfg.tau_teacher)))
+            t_logits = t_logits.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+            t_probs = torch.softmax(t_logits, dim=-1).mean(dim=(0, 1))  # [S, T]
+            t_probs = (t_probs * causal_mask).clamp(min=0.0)
+            t_probs = t_probs / t_probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+            prepared_batches.append((q_in_sub, k_in, t_probs, causal_mask, q_pos))
+
+    if not prepared_batches:
+        return {
+            "steps": 0,
+            "loss_first": 0.0,
+            "loss_last": 0.0,
+            "initial_loss": 0.0,
+            "final_loss": 0.0,
+            "initial_recall": 0.0,
+            "final_recall": 0.0,
+        }
+
     for p in indexer.parameters():
         p.requires_grad_(True)
     opt = torch.optim.AdamW(indexer.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    g = torch.Generator(device="cpu").manual_seed(int(cfg.seed))
 
     loss_first: Optional[float] = None
     loss_last: float = 0.0
     recall_first: Optional[float] = None
     recall_last: float = 0.0
     for step_i in range(max(1, int(cfg.steps))):
-        q_s, k_s = qkv_samples[step_i % len(qkv_samples)]
-        h_q, t_seq, d_h = q_s.shape
-        h_kv = k_s.shape[0]
-        g_sz = h_q // h_kv
-        if t_seq < 4:
-            continue
+        q_in_sub, k_in, t_probs, causal_mask, q_pos = prepared_batches[step_i % len(prepared_batches)]
+        n_samp, t_seq = t_probs.shape
 
-        n_samp = min(int(cfg.sampled_queries), t_seq - 1)
-        perm = torch.randperm(t_seq - 1, generator=g)[:n_samp] + 1
-        q_pos = perm.sort().values.to(q_s.device)
+        q_lat = indexer.project_q(q_in_sub)  # [S, d_idx]
+        k_lat = indexer.project_k(k_in)      # [T, d_idx]
+        s_logits = (q_lat @ k_lat.t()) / max(1e-4, float(cfg.tau_student))  # [S, T]
+        if cfg.log_distance_prior_alpha > 0.0:
+            k_idx_f = torch.arange(t_seq, device=s_logits.device, dtype=torch.float32).unsqueeze(0)
+            dist = (q_pos.float().unsqueeze(1) - k_idx_f).clamp(min=0.0)
+            s_logits = s_logits - float(cfg.log_distance_prior_alpha) * torch.log1p(dist)
 
-        k_lat = indexer.encode_keys(k_s)  # [T, d_idx]
-        q_lat = indexer.encode_queries(q_s[:, q_pos, :])  # [S, d_idx]
+        s_logits_masked = s_logits.masked_fill(~causal_mask, float("-inf"))
+        log_s = F.log_softmax(s_logits_masked, dim=-1)
+        log_s_safe = torch.where(causal_mask, log_s, torch.zeros_like(log_s))
+        t_log_safe = torch.where(t_probs > 1e-12, t_probs.clamp(min=1e-12).log(), torch.zeros_like(t_probs))
+        kl_per_q = (t_probs * (t_log_safe - log_s_safe)).sum(dim=-1)
+        if cfg.focal_weight > 0.0:
+            s_probs = torch.where(causal_mask, log_s.exp(), torch.zeros_like(log_s))
+            focal_mod = (1.0 - s_probs).clamp(min=0.0) ** float(cfg.focal_gamma)
+            focal_kl_per_q = (focal_mod * t_probs * (t_log_safe - log_s_safe)).sum(dim=-1)
+            kl_per_q = (1.0 - float(cfg.focal_weight)) * kl_per_q + float(cfg.focal_weight) * focal_kl_per_q
+        step_loss = kl_per_q.mean()
 
-        scale = 1.0 / (d_h ** 0.5)
-        q_g = q_s[:, q_pos, :].view(h_kv, g_sz, n_samp, d_h).float()
-        k_f = k_s.float()
-
-        step_loss = torch.tensor(0.0, device=q_s.device, dtype=torch.float32)
-        step_recall = 0.0
-        for s_i in range(n_samp):
-            p_tok = int(q_pos[s_i].item())
-            upto = p_tok + 1
+        if step_i == 0 or step_i == max(1, int(cfg.steps)) - 1:
             with torch.no_grad():
-                # Teacher per-key probability mass across all query heads
-                t_logits = torch.einsum("hgd,htd->hgt", q_g[:, :, s_i, :], k_f[:, :upto, :])
-                # t_logits: [H_kv, g_sz, upto]
-                t_probs = torch.softmax((t_logits * scale) / max(1e-4, cfg.tau_teacher), dim=-1).mean(dim=(0, 1))
-                t_probs = t_probs.clamp(min=1e-8)
-                t_probs = t_probs / t_probs.sum()
+                step_recall = 0.0
+                for s_i in range(n_samp):
+                    upto = int(q_pos[s_i].item()) + 1
+                    k_top = min(upto, max(8, upto // 4))
+                    s_top_idx = torch.topk(s_logits[s_i, :upto], k=k_top, dim=-1).indices
+                    step_recall += float(t_probs[s_i, s_top_idx].sum().item()) / float(n_samp)
+        else:
+            step_recall = recall_last
 
-            s_logits = (k_lat[:upto] @ q_lat[s_i]) / max(1e-4, cfg.tau_student)
-            if cfg.log_distance_prior_alpha > 0.0:
-                dist = (p_tok - torch.arange(upto, device=q_s.device, dtype=torch.float32)).clamp(min=0.0)
-                s_logits = s_logits - float(cfg.log_distance_prior_alpha) * torch.log1p(dist)
-            with torch.no_grad():
-                k_top = min(upto, max(8, upto // 4))
-                s_top_idx = torch.topk(s_logits, k=k_top, dim=-1).indices
-                step_recall += float(t_probs[s_top_idx].sum().item()) / float(n_samp)
-            log_s = F.log_softmax(s_logits, dim=-1)
-            kl = F.kl_div(log_s, t_probs, reduction="sum")
-            if cfg.focal_weight > 0.0:
-                s_probs = log_s.exp()
-                focal_mod = (1.0 - s_probs).clamp(min=0.0) ** float(cfg.focal_gamma)
-                focal_kl = (focal_mod * t_probs * (t_probs.log() - log_s)).sum()
-                kl = (1.0 - float(cfg.focal_weight)) * kl + float(cfg.focal_weight) * focal_kl
-            step_loss = step_loss + kl / float(n_samp)
-
-        opt.zero_grad()
+        opt.zero_grad(set_to_none=True)
         step_loss.backward()
         opt.step()
         val = float(step_loss.detach().item())
@@ -309,13 +340,14 @@ def run_loop72_four_way_eval(
     saved_thresh = int(sparse_cfg.exact_threshold)
     saved_yarn = float(sparse_cfg.yarn_scale_factor)
     seq_len = int(input_ids.shape[1])
+    sparse_thresh = min(saved_thresh, max(64, seq_len // 2))
     results: Dict[str, Dict[str, float]] = {}
 
     modes = [
         ("Dense_NativeRoPE", seq_len + 1024, 1.0),
-        ("Sparse_NativeRoPE", saved_thresh, 1.0),
+        ("Sparse_NativeRoPE", sparse_thresh, 1.0),
         ("Dense_YaRNRoPE", seq_len + 1024, float(yarn_scale_factor)),
-        ("Sparse_YaRNRoPE", saved_thresh, float(yarn_scale_factor)),
+        ("Sparse_YaRNRoPE", sparse_thresh, float(yarn_scale_factor)),
     ]
     ref_logits: Optional[torch.Tensor] = None
     try:

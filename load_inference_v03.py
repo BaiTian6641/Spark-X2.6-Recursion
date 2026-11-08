@@ -294,6 +294,10 @@ def configure_model_for_loop72_lsa(
     model.settings.ce_chunk_tokens = int(prefill_cfg.get('ce_chunk_tokens', 2048))
 
     patch_spark_for_unsloth_triton(model.base, preserve_native_activation=preserve_native)
+    if hasattr(model, 'controllers'):
+        for ctrl in model.controllers.values():
+            if hasattr(ctrl, 'reset_parameters_to_step0'):
+                ctrl.reset_parameters_to_step0()
 
     model.set_loop(
         start=int(loop_cfg.get('start', 4)),
@@ -410,30 +414,28 @@ def configure_model_for_loop72_lsa(
 
 
 def load_sparkx_loop72_lsa(
-    repo_or_dir: str = 'TassP0lar/Spark-X2.6-4B-En4B-A1B',
+    repo_or_dir: str = 'XHToken/Spark-X2.6-4B',
     base_repo: str = 'XHToken/Spark-X2.6-4B',
     model_id: Optional[str] = None,
     config_path: Optional[str] = None,
     dlsa_checkpoint: Optional[str] = None,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
     dtype: torch.dtype = torch.bfloat16,
-    use_pristine_base: bool = False,
+    use_pristine_base: bool = True,
     token: Optional[str] = None,
     return_meta: bool = False,
 ):
-    """Load the Spark-X2.6-4B-Loop72-LSA architecture (72 visits = 18 global + 54 local, native GELU, 0 Engram params)."""
+    """Load the Spark-X2.6-4B-Loop72-LSA architecture strictly atop the original `XHToken/Spark-X2.6-4B` model
+    (72 visits = 18 global + 54 local, native GELU, 0 Engram params)."""
     _patch_transformers_v5_tied_weights()
     if model_id is not None:
         base_repo = str(model_id)
-        if str(model_id) == 'XHToken/Spark-X2.6-4B':
-            use_pristine_base = True
-        else:
-            repo_or_dir = str(model_id)
+        repo_or_dir = str(model_id)
     cfg = load_loop72_lsa_yaml_config(config_path)
     if token is None:
         token = os.environ.get('HF_TOKEN') or None
 
-    meta: dict = {}
+    meta: dict = {'base': base_repo, 'merged_standalone': False}
     state: Optional[dict] = None
     if os.path.isdir(repo_or_dir):
         for cname in ('loop_config_v03.json', 'loop_config.json'):
@@ -447,21 +449,8 @@ def load_sparkx_loop72_lsa(
             if os.path.exists(p):
                 state = torch.load(p, map_location='cpu')
                 break
-    else:
-        try:
-            cfg_p = hf_hub_download(repo_or_dir, 'loop_config_v03.json', token=token)
-            with open(cfg_p, 'r', encoding='utf-8') as f:
-                meta = json.load(f)
-        except Exception:
-            pass
-        try:
-            st_p = hf_hub_download(repo_or_dir, 'loop_v03_state.pt', token=token)
-            state = torch.load(st_p, map_location='cpu')
-        except Exception:
-            pass
 
-    has_merged_backbone = bool(meta.get('merged_standalone', True)) and not bool(use_pristine_base)
-    backbone_source = repo_or_dir if has_merged_backbone else base_repo
+    backbone_source = repo_or_dir if (os.path.isdir(repo_or_dir) and not bool(use_pristine_base)) else base_repo
 
     try:
         tok = AutoTokenizer.from_pretrained(backbone_source, trust_remote_code=True, token=token)

@@ -3767,6 +3767,60 @@ class SparkXLoopV03(nn.Module):
                     if cap_hook is not None:
                         cap_hook(idx, v_idx, p, 'post_block', h)
                     virtual_idx += 1
+        elif bool(getattr(self.settings, 'preserve_native_activation', False)) and not self.engram_enabled and not (
+            self.training and any(p.requires_grad for p in self.controllers.parameters())
+        ):
+            # Depth-Matched Two-Stream Recurrent Highway for native GELU Loop72-LSA (`XHToken/Spark-X2.6-4B`):
+            # - `s0_hwy` maintains the depth-27 highway (`h_L27`), while `s_work` enters Pass 2 at depth 3 (`h_L3`)
+            #   and Pass 3 at depth 11 (`h_L11`) so every layer visit `0..71` operates strictly in-distribution at its
+            #   native pre-trained depth without 240 per-sublayer FP32 dynamic routing kernel launches per token.
+            h_prelude_entry = h
+            h_p3_entry = h
+            h_p3_exit_ref: Optional[torch.Tensor] = None
+            s0_hwy = h
+            for p, s_idx, e_idx in pass_spans:
+                if p == 0:
+                    s_work = h_prelude_entry
+                elif p == 1:
+                    s_work = h_prelude_entry + 0.05 * (s0_hwy - h_prelude_entry)
+                else:
+                    s_work = h_p3_entry + 0.03 * (s0_hwy - h_p3_entry)
+                for idx in range(s_idx, e_idx):
+                    v_idx = visit_counts.get(idx, 0)
+                    visit_counts[idx] = v_idx + 1
+                    if v_idx == 0:
+                        first_virtual_idx[idx] = virtual_idx
+                    share_ro = bool(v_idx > 0 and share_global_kv and idx in global_layer_set)
+                    eff_v_idx = first_virtual_idx.get(idx, virtual_idx) if share_ro else virtual_idx
+                    if cap_hook is not None:
+                        cap_hook(idx, v_idx, p, 'pre_block', s_work)
+                    s_work = self._apply_layer(
+                        idx, s_work, masks, ropes,
+                        past_key_values=past_key_values,
+                        cache_position=cache_position,
+                        virtual_idx=eff_v_idx,
+                        read_only_kv=share_ro,
+                    )
+                    if cap_hook is not None:
+                        cap_hook(idx, v_idx, p, 'post_layer', s_work)
+                    s_work = _maybe_apply_esm(s_work, idx, v_idx)
+                    if cap_hook is not None:
+                        cap_hook(idx, v_idx, p, 'post_block', s_work)
+                    if idx == self.p3_start - 1 and p in (0, 1):
+                        h_p3_entry = s_work
+                    if idx == self.p3_end - 1 and p in (0, 1):
+                        h_p3_exit_ref = s_work
+                    virtual_idx += 1
+                if p == 0:
+                    s0_hwy = s_work
+                elif p == 1:
+                    s0_hwy = 0.85 * s0_hwy + 0.15 * s_work
+                else:
+                    if h_p3_exit_ref is not None:
+                        s0_hwy = s0_hwy + 0.08 * (s_work - h_p3_exit_ref)
+                    else:
+                        s0_hwy = 0.92 * s0_hwy + 0.08 * s_work
+            h = s0_hwy.float()
         else:
             # At >=8K training, store between-layer checkpoint boundary streams in BF16 (saves >10GB VRAM at 16K/60L-72L)
             # while TwoStreamMHC.forward executes all internal Sinkhorn & residual math in FP32.

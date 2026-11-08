@@ -606,12 +606,20 @@ def attach_loop72_dlsa_attention(
                     beta_slow=float(cfg.yarn_beta_slow),
                     device=hidden_states.device,
                 )
-                cos = cos_y.unsqueeze(0).to(dtype=cos.dtype)
-                sin = sin_y.unsqueeze(0).to(dtype=sin.dtype)
+                if cos.ndim == 3 and cos_y.ndim == 2:
+                    cos = cos_y.unsqueeze(0).to(dtype=cos.dtype)
+                    sin = sin_y.unsqueeze(0).to(dtype=sin.dtype)
+                else:
+                    cos = cos_y.to(dtype=cos.dtype)
+                    sin = sin_y.to(dtype=sin.dtype)
 
             if apply_rope_fn is not None:
                 q_rot = apply_rope_fn(query_states[..., :rot_dim], cos, sin).to(query_states.dtype)
                 k_rot = apply_rope_fn(key_states[..., :rot_dim], cos, sin).to(key_states.dtype)
+                while q_rot.ndim > query_states.ndim and q_rot.shape[0] == 1:
+                    q_rot = q_rot.squeeze(0)
+                while k_rot.ndim > key_states.ndim and k_rot.shape[0] == 1:
+                    k_rot = k_rot.squeeze(0)
                 if rot_dim < h_dim:
                     query_states = torch.cat([q_rot, query_states[..., rot_dim:]], dim=-1)
                     key_states = torch.cat([k_rot, key_states[..., rot_dim:]], dim=-1)
