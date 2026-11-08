@@ -555,18 +555,30 @@ def load_sparkx_loop72_lsa(
     try:
         tok = AutoTokenizer.from_pretrained(backbone_source, trust_remote_code=True, token=token, revision=revision)
     except Exception:
-        tok = AutoTokenizer.from_pretrained(base_repo, trust_remote_code=True, token=token, revision=revision)
+        try:
+            tok = AutoTokenizer.from_pretrained(base_repo, trust_remote_code=True, token=token, revision=revision)
+        except Exception:
+            tok = AutoTokenizer.from_pretrained(base_repo, trust_remote_code=True, token=token)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
 
-    base = AutoModelForCausalLM.from_pretrained(
-        backbone_source,
-        trust_remote_code=True,
-        dtype=dtype,
-        low_cpu_mem_usage=True,
-        token=token,
-        revision=revision,
-    ).to(device)
+    try:
+        base = AutoModelForCausalLM.from_pretrained(
+            backbone_source,
+            trust_remote_code=True,
+            dtype=dtype,
+            low_cpu_mem_usage=True,
+            token=token,
+            revision=revision,
+        ).to(device)
+    except Exception:
+        base = AutoModelForCausalLM.from_pretrained(
+            backbone_source,
+            trust_remote_code=True,
+            dtype=dtype,
+            low_cpu_mem_usage=True,
+            token=token,
+        ).to(device)
 
     settings = LoopV03Settings.for_loop72_lsa(checkpoint_layers=False, offload_checkpoint_to_cpu=False)
     model = SparkXLoopV03(base, settings, patch_sdpa=True).to(device)

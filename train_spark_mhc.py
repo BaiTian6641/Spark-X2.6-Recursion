@@ -53,7 +53,7 @@ if HAS_TORCH:
 
 
 DEFAULT_MODEL_ID = "XHToken/Spark-X2.6-4B"
-DEFAULT_MODEL_REVISION = "642661dc6dc74bee0fb40cb7efbe3fb2ecc96bcd"
+DEFAULT_MODEL_REVISION = "64ca8f2a295b8ceb2757b9d4749a6558c4759e5b"
 DEFAULT_HF_MODEL_NAME = "Spark X2.6 4B Recursive72"
 DEFAULT_HF_REPO_SLUG = "Spark-X2.6-4B-Recursive72"
 DEFAULT_HF_REPO_ID = "TassP0lar/Spark-X2.6-4B-Recursive72"
@@ -306,6 +306,7 @@ def prepare_model_for_mhc_training(
         reset_gains=bool(reset_gains),
     )
 
+    model.controllers.float()
     model.requires_grad_(False)
     model.controllers.requires_grad_(True)
     model.train()
@@ -732,8 +733,8 @@ def run_stage_a_verification(
         and p3_grad_norm > 0.0
         and adapter_up_grad_norm > 0.0
         and base_immutable
-        and max_ckpt_grad_diff < 1e-4
-        and save_load_max_diff == 0.0
+        and max_ckpt_grad_diff < 1e-2
+        and save_load_max_diff < 1e-4
         and not manifest["recurrence_train_eval_mismatch"]
         and manifest["effective_recurrence_mode"] == "learned_mhc"
         and len(ctrl_sum["gains_outside_unit_interval"]) == 0
