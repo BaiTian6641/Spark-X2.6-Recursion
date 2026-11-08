@@ -3986,7 +3986,8 @@ class SparkXLoopV03(nn.Module):
                 or getattr(self, 'dlsa_index_bank', None) is not None
             )
         )
-        cache = self.make_inference_cache() if use_paged else DynamicCache()
+        ext_cache = kwargs.pop('cache', None) or kwargs.pop('past_key_values', None)
+        cache = ext_cache if ext_cache is not None else (self.make_inference_cache() if use_paged else DynamicCache())
         prefill_chunk = int(kwargs.pop('prefill_chunk_tokens', getattr(self.settings, 'prefill_chunk_tokens', 2048)) or 0)
         out = input_ids
 

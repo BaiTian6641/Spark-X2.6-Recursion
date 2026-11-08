@@ -149,8 +149,8 @@ def fit_loop72_visit_bank_pca(
             k_f = k_s.float()
             for s_i, p_tok in enumerate(q_positions):
                 upto = p_tok + 1
-                logits = torch.einsum("gdh,td->gt", q_g[:, :, s_i, :], k_f[:, :upto, :]) * scale
-                probs = torch.softmax(logits, dim=-1).mean(dim=0)  # [upto]
+                logits = torch.einsum("hgd,htd->hgt", q_g[:, :, s_i, :], k_f[:, :upto, :]) * scale
+                probs = torch.softmax(logits, dim=-1).mean(dim=(0, 1))  # [upto]
                 target_lat = F.normalize(probs @ k_lat[:upto].float(), dim=-1, eps=1e-6)
                 q_feats_list.append(qf[s_i].float())
                 k_lat_targets.append(target_lat)
@@ -214,7 +214,7 @@ def distill_single_visit_indexer(
             upto = p_tok + 1
             with torch.no_grad():
                 # Teacher per-key probability mass across all query heads
-                t_logits = torch.einsum("gdh,gid->gti", q_g[:, :, s_i, :].unsqueeze(-1), k_f[:, :upto, :].unsqueeze(1)).squeeze(-1)
+                t_logits = torch.einsum("hgd,htd->hgt", q_g[:, :, s_i, :], k_f[:, :upto, :])
                 # t_logits: [H_kv, g_sz, upto]
                 t_probs = torch.softmax((t_logits * scale) / max(1e-4, cfg.tau_teacher), dim=-1).mean(dim=(0, 1))
                 t_probs = t_probs.clamp(min=1e-8)

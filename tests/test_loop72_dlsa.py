@@ -455,6 +455,23 @@ class TestLoop72BenchmarkSuiteAndNotebook(unittest.TestCase):
         self.assertIn("total_map_parameters", dlsa_defs)
         self.assertIn("select_with_buckets", dlsa_defs)
 
+        # Verify every `base_cfg.<attr>` or `base_idx_cfg.<attr>` accessed in `sparkx_dlsa.py` and `load_inference_v03.py`
+        # exists on `DLSAIndexConfig`
+        cfg_fields = set()
+        for node in ast.walk(trees["sparkx_dlsa.py"]):
+            if isinstance(node, ast.ClassDef) and node.name == "DLSAIndexConfig":
+                for sub in node.body:
+                    if isinstance(sub, ast.AnnAssign) and isinstance(sub.target, ast.Name):
+                        cfg_fields.add(sub.target.id)
+        for fn in ("sparkx_dlsa.py", "load_inference_v03.py"):
+            for node in ast.walk(trees[fn]):
+                if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in ("base_cfg", "base_idx_cfg"):
+                    self.assertIn(
+                        node.attr,
+                        cfg_fields,
+                        f"{fn} accesses `{node.value.id}.{node.attr}`, which is missing from DLSAIndexConfig!",
+                    )
+
         cache_defs = {n.name for n in ast.walk(trees["sparkx_paged_cache.py"]) if isinstance(n, (ast.ClassDef, ast.FunctionDef))}
         self.assertIn("Loop72HybridPagedCache", cache_defs)
         self.assertIn("is_fully_gpu_resident", cache_defs)

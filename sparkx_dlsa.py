@@ -61,6 +61,8 @@ class DLSAIndexConfig:
     beam_width: int = 32
     residual_block_compensation: bool = False
     persistent_token_latents: Optional[bool] = False
+    maps_per_global_visit: bool = True
+    projection_revision: str = "loop72_dlsa_v1"
 
     def __post_init__(self) -> None:
         if self.n_kv_heads is not None:
@@ -1824,36 +1826,8 @@ class VisitAwareDLSAIndexBank(nn.Module):
                 self.indexers[str(gid)].cfg.max_selected_keys = b
             return
         idx_val = int(visit_or_layer)
-        # Note: idx_val in [0..17] may be a global_visit_id OR a physical_layer in {3, 7, 11, 15}.
-        # Check global_visit_id first when idx_val is in _gvisit_meta AND not in _vvisit_to_gvisit, or when explicitly in [0..17].
-        if idx_val in self._gvisit_meta and idx_val not in GLOBAL_PHYSICAL_LAYERS:
-            self.per_visit_budget_overrides[idx_val] = b
-            if self.maps_per_global_visit and str(idx_val) in self.indexers:
-                self.indexers[str(idx_val)].k_long_range = b
-                self.indexers[str(idx_val)].cfg.k_long_range = b
-                self.indexers[str(idx_val)].cfg.max_selected_keys = b
-        elif idx_val in self._vvisit_to_gvisit and idx_val not in self._gvisit_meta:
-            gid = self._vvisit_to_gvisit[idx_val]
-            self.per_visit_budget_overrides[gid] = b
-            if self.maps_per_global_visit and str(gid) in self.indexers:
-                self.indexers[str(gid)].k_long_range = b
-                self.indexers[str(gid)].cfg.k_long_range = b
-                self.indexers[str(gid)].cfg.max_selected_keys = b
-        elif idx_val in self._gvisit_meta:
-            self.per_visit_budget_overrides[idx_val] = b
-            if self.maps_per_global_visit and str(idx_val) in self.indexers:
-                self.indexers[str(idx_val)].k_long_range = b
-                self.indexers[str(idx_val)].cfg.k_long_range = b
-                self.indexers[str(idx_val)].cfg.max_selected_keys = b
-            # If idx_val is also a physical layer (e.g. 3, 7, 11, 15), also apply to its visits when passed as layer override
-            for gid, meta in self._gvisit_meta.items():
-                if int(meta["physical_layer"]) == idx_val and gid not in self.per_visit_budget_overrides:
-                    self.per_visit_budget_overrides[gid] = b
-                    if self.maps_per_global_visit and str(gid) in self.indexers:
-                        self.indexers[str(gid)].k_long_range = b
-                        self.indexers[str(gid)].cfg.k_long_range = b
-                        self.indexers[str(gid)].cfg.max_selected_keys = b
-        else:
+        # Physical layer indices `{3, 7, 11, 15, 19, 23, 27, 31, 35}` map to all global visits of that layer
+        if idx_val in GLOBAL_PHYSICAL_LAYERS:
             for gid, meta in self._gvisit_meta.items():
                 if int(meta["physical_layer"]) == idx_val:
                     self.per_visit_budget_overrides[gid] = b
@@ -1865,6 +1839,19 @@ class VisitAwareDLSAIndexBank(nn.Module):
                 self.indexers[str(idx_val)].k_long_range = b
                 self.indexers[str(idx_val)].cfg.k_long_range = b
                 self.indexers[str(idx_val)].cfg.max_selected_keys = b
+        elif idx_val in self._gvisit_meta:
+            self.per_visit_budget_overrides[idx_val] = b
+            if self.maps_per_global_visit and str(idx_val) in self.indexers:
+                self.indexers[str(idx_val)].k_long_range = b
+                self.indexers[str(idx_val)].cfg.k_long_range = b
+                self.indexers[str(idx_val)].cfg.max_selected_keys = b
+        elif idx_val in self._vvisit_to_gvisit:
+            gid = self._vvisit_to_gvisit[idx_val]
+            self.per_visit_budget_overrides[gid] = b
+            if self.maps_per_global_visit and str(gid) in self.indexers:
+                self.indexers[str(gid)].k_long_range = b
+                self.indexers[str(gid)].cfg.k_long_range = b
+                self.indexers[str(gid)].cfg.max_selected_keys = b
 
     def get_visit_budget(
         self,
@@ -1914,6 +1901,8 @@ class VisitAwareDLSAIndexBank(nn.Module):
             "global_schedule": [dict(r) for r in self.global_schedule],
             "state_dict": {k: v.detach().cpu() for k, v in self.state_dict().items()},
         }
+
+    export_manifest = export_manifest_state
 
     def load_from_legacy_or_visit_checkpoint(self, ckpt_data: Dict[str, Any], strict: bool = False) -> Dict[str, Any]:
         """Load either an 18-visit `VisitAwareDLSAIndexBank` checkpoint or broadcast a 9-layer `LSA-F2` checkpoint

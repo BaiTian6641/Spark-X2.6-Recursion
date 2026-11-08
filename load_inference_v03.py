@@ -486,6 +486,7 @@ def load_sparkx_loop72_lsa(
 
     if state is not None:
         load_loop_v03_state_dict(model, state, strict=False)
+        del state
 
     loop72_info = configure_model_for_loop72_lsa(model, config=cfg, dlsa_checkpoint=dlsa_checkpoint)
     model.loaded_meta = {**meta, 'loop72_lsa': loop72_info}
