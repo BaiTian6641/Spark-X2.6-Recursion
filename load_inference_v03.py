@@ -527,6 +527,28 @@ def load_sparkx_loop72_lsa(
                 state = torch.load(p, map_location='cpu')
                 state_path = p
                 break
+    elif repo_or_dir and str(repo_or_dir) != str(base_repo):
+        try:
+            from huggingface_hub import hf_hub_download as _hf_dl
+        except Exception:
+            _hf_dl = None
+        if _hf_dl is not None:
+            for cname in ('loop_config_v03.json', 'loop_config.json'):
+                try:
+                    p = _hf_dl(repo_or_dir, cname, token=token)
+                    with open(p, 'r', encoding='utf-8') as f:
+                        meta = json.load(f)
+                    break
+                except Exception:
+                    pass
+            for sname in ('loop_v03_state.pt', 'loop_state.pt'):
+                try:
+                    p = _hf_dl(repo_or_dir, sname, token=token)
+                    state = torch.load(p, map_location='cpu')
+                    state_path = p
+                    break
+                except Exception:
+                    pass
 
     backbone_source = repo_or_dir if (os.path.isdir(repo_or_dir) and not bool(use_pristine_base)) else base_repo
 
@@ -574,12 +596,21 @@ def load_sparkx_loop72_lsa(
         load_report = model.dlsa_index_bank.load_from_checkpoint_dict(embedded_dlsa_state)
         if int(load_report.get('loaded_modules', 0)) == 0:
             raise ValueError('Loop state did not restore any D-LSA selector modules')
+        prov = load_report.get('provenance') if isinstance(load_report, dict) else None
+        cur_rec_mode = model.effective_recurrence_mode(training=False)
+        rec_match = (
+            None
+            if not isinstance(prov, dict) or not prov.get('recurrence_mode')
+            else (str(prov.get('recurrence_mode')) == cur_rec_mode)
+        )
         model.dlsa_checkpoint_status = {
             'initialization': 'loop_state_checkpoint_loaded_unverified',
             'quality_evidence': 'not_evaluated_in_loader',
             'checkpoint_name': os.path.basename(state_path) if state_path else None,
             'checkpoint_sha256': _file_sha256(state_path) if state_path else None,
             'load_report': load_report,
+            'provenance': dict(prov) if isinstance(prov, dict) else {},
+            'recurrence_mode_match': rec_match,
         }
     elif embedded_dlsa_state is not None and not attach_sparse_attention:
         model.dlsa_checkpoint_status['saved_selector_payload_not_attached'] = True

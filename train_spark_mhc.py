@@ -54,6 +54,9 @@ if HAS_TORCH:
 
 DEFAULT_MODEL_ID = "XHToken/Spark-X2.6-4B"
 DEFAULT_MODEL_REVISION = "642661dc6dc74bee0fb40cb7efbe3fb2ecc96bcd"
+DEFAULT_HF_MODEL_NAME = "Spark X2.6 4B Recursive72"
+DEFAULT_HF_REPO_SLUG = "Spark-X2.6-4B-Recursive72"
+DEFAULT_HF_REPO_ID = "TassP0lar/Spark-X2.6-4B-Recursive72"
 EXPECTED_DEFAULT_CONTROLLER_PARAMS = 10_078_176
 
 DOMAIN_MIXTURE_WEIGHTS: Dict[str, float] = {
@@ -115,14 +118,23 @@ class MHCTrainingConfig:
     stage_e_seq_len: int = 2048
     stage_e_distill_steps: int = 150
 
-    # Checkpointing & reproducibility
+    # Checkpointing, Hugging Face Hub upload & reproducibility
     save_every_steps: int = 50
     eval_every_steps: int = 25
     use_hf_streaming: bool = True
     seed: int = 42
+    hf_model_name: str = DEFAULT_HF_MODEL_NAME
+    hf_repo_id: str = DEFAULT_HF_REPO_ID
+    push_to_hub: bool = False
+    hf_private: bool = False
+    hf_token: Optional[str] = None
+    export_standalone_backbone: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
-        return dataclasses.asdict(self)
+        d = dataclasses.asdict(self)
+        if d.get("hf_token"):
+            d["hf_token"] = "***REDACTED***"
+        return d
 
 
 def detect_gpu_training_profile(vram_gb: Optional[float] = None) -> Dict[str, Any]:
@@ -1281,11 +1293,14 @@ def save_mhc_training_checkpoint(
     ctrl_sum = model.controller_summary()
     exec_manifest = model.execution_manifest()
     loop_cfg_payload = {
+        "model_name": str(getattr(cfg, "hf_model_name", DEFAULT_HF_MODEL_NAME)),
+        "hf_repo_id": str(getattr(cfg, "hf_repo_id", DEFAULT_HF_REPO_ID)),
         "base_model": cfg.model_id,
         "base_revision": cfg.revision,
         "curriculum_version": "loop72_mhc_v2",
         "stage_name": stage_name,
         "global_step": int(global_step),
+        "merged_standalone": False,
         "stage": {
             "start": int(model.loop_start),
             "end": int(model.loop_end),
@@ -1301,9 +1316,12 @@ def save_mhc_training_checkpoint(
         "metrics": metrics_snapshot,
         "checkpoint_sha256": state_sha256,
     }
-    config_file.write_text(json.dumps(loop_cfg_payload, indent=2, default=str) + "\n", encoding="utf-8")
+    cfg_json = json.dumps(loop_cfg_payload, indent=2, default=str) + "\n"
+    config_file.write_text(cfg_json, encoding="utf-8")
+    (out_path / "loop_config.json").write_text(cfg_json, encoding="utf-8")
 
     train_manifest = {
+        "model_name": str(getattr(cfg, "hf_model_name", DEFAULT_HF_MODEL_NAME)),
         "stage_name": stage_name,
         "global_step": int(global_step),
         "checkpoint_path": str(state_file),
@@ -1316,6 +1334,255 @@ def save_mhc_training_checkpoint(
     }
     manifest_file.write_text(json.dumps(train_manifest, indent=2, default=str) + "\n", encoding="utf-8")
     return train_manifest
+
+
+def resolve_hf_token(explicit_token: Optional[str] = None) -> Optional[str]:
+    """Resolve a Hugging Face Hub token from argument, environment, Colab secrets, or cached login."""
+    if explicit_token and str(explicit_token).strip():
+        return str(explicit_token).strip()
+    for env_key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        val = os.environ.get(env_key)
+        if val and val.strip():
+            return val.strip()
+    try:
+        from google.colab import userdata  # type: ignore
+        col_tok = userdata.get("HF_TOKEN")
+        if col_tok and str(col_tok).strip():
+            return str(col_tok).strip()
+    except Exception:
+        pass
+    try:
+        from huggingface_hub import get_token  # type: ignore
+        cached = get_token()
+        if cached and str(cached).strip():
+            return str(cached).strip()
+    except Exception:
+        pass
+    return None
+
+
+def normalize_hf_repo_id(
+    repo_id_or_name: Optional[str],
+    token: Optional[str] = None,
+    default_owner: str = "TassP0lar",
+    api_client: Any = None,
+) -> str:
+    """Normalize a display name like `'Spark X2.6 4B Recursive72'` or `'owner/Spark X2.6 4B Recursive72'`
+    into a valid Hugging Face Hub `<owner>/Spark-X2.6-4B-Recursive72` repository ID."""
+    raw = str(repo_id_or_name or DEFAULT_HF_REPO_ID).strip()
+    if not raw:
+        raw = DEFAULT_HF_REPO_ID
+    if "/" in raw:
+        owner_part, slug_part = raw.split("/", 1)
+        owner = owner_part.strip() or default_owner
+        slug = "-".join(slug_part.strip().split())
+        return f"{owner}/{slug}"
+
+    slug = "-".join(raw.split())
+    owner = default_owner
+    client = api_client
+    if client is None and token:
+        try:
+            from huggingface_hub import HfApi  # type: ignore
+            client = HfApi(token=token)
+        except Exception:
+            client = None
+    if client is not None and hasattr(client, "whoami"):
+        try:
+            who = client.whoami()
+            if isinstance(who, dict) and who.get("name"):
+                owner = str(who["name"]).strip()
+        except Exception:
+            pass
+    return f"{owner}/{slug}"
+
+
+def build_recursive72_model_card(
+    cfg: MHCTrainingConfig,
+    report: Dict[str, Any],
+    repo_id: str,
+) -> str:
+    """Build the `README.md` Hugging Face model card for `Spark X2.6 4B Recursive72`."""
+    model_title = str(cfg.hf_model_name or DEFAULT_HF_MODEL_NAME)
+    stage_c = report.get("stages", {}).get("stage_c", {})
+    stage_d = report.get("stages", {}).get("stage_d", {})
+    stage_e = report.get("stages", {}).get("stage_e", {})
+    ctrl_sum = (
+        stage_d.get("controller_summary")
+        or stage_c.get("controller_summary")
+        or report.get("stages", {}).get("stage_a", {}).get("controller_summary", {})
+    )
+    prov = stage_e.get("provenance", {})
+    return (
+        "---\n"
+        "library_name: transformers\n"
+        f"base_model: {cfg.model_id}\n"
+        "tags:\n"
+        "  - spark\n"
+        "  - spark-x2.6-4b\n"
+        "  - recursive-transformer\n"
+        "  - loop72\n"
+        "  - mhc\n"
+        "  - d-lsa\n"
+        "  - long-context\n"
+        "pipeline_tag: text-generation\n"
+        "---\n\n"
+        f"# {model_title}\n\n"
+        f"**`{model_title}`** (`{repo_id}`) is the 72-visit recurrent-depth (`Loop72`) + per-visit Paged Latent Sparse Attention (`D-LSA`) "
+        f"model built strictly atop the frozen BF16 **`{cfg.model_id}`** (`revision={cfg.revision}`) 36-layer hybrid backbone.\n\n"
+        "## Architecture Summary\n"
+        "- **Base Backbone**: `XHToken/Spark-X2.6-4B` (36 physical layers = 9 full-attention + 27 sliding-window layers, native GELU, frozen BF16).\n"
+        "- **72-Visit Recurrent Schedule (`4 + 24 + 24 + 12 + 8 = 72`)**:\n"
+        "  - Prelude `L0..L3` (1 pass = 4 visits)\n"
+        "  - Core Pass 1 `L4..L27` (24 visits)\n"
+        "  - Core Pass 2 `L4..L27` (24 visits)\n"
+        "  - Inner Pass 3 `L12..L23` (12 visits)\n"
+        "  - Coda `L28..L35` (1 pass = 8 visits)\n"
+        f"- **Differentiable `TwoStreamMHC` Controllers (`{EXPECTED_DEFAULT_CONTROLLER_PARAMS:,}` params)**:\n"
+        f"  - Bounded-gain Schema v2 (`gain_mode={ctrl_sum.get('gain_mode', cfg.gain_mode)!r}`, "
+        f"`mhc_schema_version={ctrl_sum.get('mhc_schema_version', 2)}`), guaranteeing $(1 - g)I + gP \\in \\mathcal{{B}}_2$ across all 60 core visits.\n"
+        f"  - Mean Pass-2 Gain (Attn/FFN): `{ctrl_sum.get('mean_gain_p2_attn', cfg.init_p2_gain)}` / `{ctrl_sum.get('mean_gain_p2_ffn', cfg.init_p2_gain)}`\n"
+        f"  - Mean Pass-3 Gain (Attn/FFN): `{ctrl_sum.get('mean_gain_p3_attn', cfg.init_p3_gain)}` / `{ctrl_sum.get('mean_gain_p3_ffn', cfg.init_p3_gain)}`\n"
+        "- **18-Visit `VisitAwareDLSAIndexBank`**:\n"
+        f"  - Per-visit `(W_k, W_q)` $\\mathbb{{S}}^{{63}}$ projections distilled on the trained `learned_mhc` residual stream.\n"
+        f"  - Locked `mhc_checkpoint_sha256`: `{prov.get('mhc_checkpoint_sha256', 'N/A')}`\n\n"
+        "## Quickstart\n\n"
+        "```python\n"
+        "import torch\n"
+        "from load_inference_v03 import load_sparkx_loop72_lsa\n\n"
+        "model, tokenizer = load_sparkx_loop72_lsa(\n"
+        f"    repo_or_dir={repo_id!r},\n"
+        f"    base_repo={cfg.model_id!r},\n"
+        f"    revision={cfg.revision!r},\n"
+        "    recurrence_mode='learned_mhc',\n"
+        "    attach_sparse_attention=True,\n"
+        ")\n"
+        "model.eval()\n"
+        "print(model.execution_manifest())\n"
+        "```\n"
+    )
+
+
+def export_and_upload_recursive72_to_hub(
+    model: "SparkXLoopV03",
+    tokenizer: Any,
+    export_dir: str | Path,
+    cfg: MHCTrainingConfig,
+    report: Dict[str, Any],
+    hf_token: Optional[str] = None,
+    api_client: Any = None,
+) -> Dict[str, Any]:
+    """Package the final `Spark X2.6 4B Recursive72` export directory (including `README.md`, `loop_v03_state.pt`,
+    `visit_selectors_stage_e.pt`, `loop_config_v03.json`, runtime helper modules, and optional standalone backbone)
+    and upload to Hugging Face Hub when `cfg.push_to_hub` is enabled."""
+    import shutil
+
+    exp_path = Path(export_dir)
+    exp_path.mkdir(parents=True, exist_ok=True)
+    token = resolve_hf_token(hf_token or cfg.hf_token)
+    resolved_repo_id = normalize_hf_repo_id(cfg.hf_repo_id or cfg.hf_model_name, token=token, api_client=api_client)
+
+    # Copy Stage E selector checkpoint into the export folder if present in parent output_dir
+    parent_sel = Path(cfg.output_dir) / "visit_selectors_stage_e.pt"
+    target_sel = exp_path / "visit_selectors_stage_e.pt"
+    if parent_sel.is_file() and parent_sel.resolve() != target_sel.resolve():
+        shutil.copy2(parent_sel, target_sel)
+
+    # Copy helper runtime files so the Hugging Face repository is self-contained
+    repo_root = Path(__file__).resolve().parent
+    copied_helpers: List[str] = []
+    for helper_name in (
+        "sparkx_loop_v03_core.py",
+        "sparkx_dlsa.py",
+        "sparkx_paged_cache.py",
+        "sparkx_sparse_attention.py",
+        "load_inference_v03.py",
+        "train_spark_dlsa.py",
+        "train_spark_mhc.py",
+    ):
+        src_f = repo_root / helper_name
+        if src_f.is_file():
+            shutil.copy2(src_f, exp_path / helper_name)
+            copied_helpers.append(helper_name)
+
+    cfg_yaml = repo_root / "configs" / "spark4b_loop72_lsa.yaml"
+    if cfg_yaml.is_file():
+        (exp_path / "configs").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(cfg_yaml, exp_path / "configs" / "spark4b_loop72_lsa.yaml")
+
+    standalone_saved = False
+    if bool(cfg.export_standalone_backbone) and hasattr(model.base, "save_pretrained"):
+        try:
+            model.base.save_pretrained(str(exp_path), safe_serialization=True, max_shard_size="4GB")
+            if hasattr(tokenizer, "save_pretrained"):
+                tokenizer.save_pretrained(str(exp_path))
+            standalone_saved = True
+        except Exception as exc:
+            standalone_saved = False
+            print(f"[Recursive72 Export] Standalone backbone save skipped: {exc}")
+
+    # Update loop_config_v03.json / loop_config.json with final model_name, hf_repo_id, and merged_standalone flag
+    for cfg_name in ("loop_config_v03.json", "loop_config.json"):
+        c_file = exp_path / cfg_name
+        if c_file.is_file():
+            try:
+                c_data = json.loads(c_file.read_text(encoding="utf-8"))
+                c_data["model_name"] = str(cfg.hf_model_name or DEFAULT_HF_MODEL_NAME)
+                c_data["hf_repo_id"] = resolved_repo_id
+                c_data["merged_standalone"] = bool(standalone_saved)
+                c_file.write_text(json.dumps(c_data, indent=2, default=str) + "\n", encoding="utf-8")
+            except Exception:
+                pass
+
+    readme_text = build_recursive72_model_card(cfg, report, resolved_repo_id)
+    (exp_path / "README.md").write_text(readme_text, encoding="utf-8")
+
+    hub_result: Dict[str, Any] = {
+        "model_name": str(cfg.hf_model_name or DEFAULT_HF_MODEL_NAME),
+        "hf_repo_id": resolved_repo_id,
+        "export_dir": str(exp_path),
+        "standalone_backbone_saved": bool(standalone_saved),
+        "copied_helpers": copied_helpers,
+        "push_to_hub_requested": bool(cfg.push_to_hub),
+        "uploaded": False,
+        "hub_url": f"https://huggingface.co/{resolved_repo_id}",
+    }
+
+    if bool(cfg.push_to_hub):
+        client = api_client
+        if client is None:
+            if not token:
+                hub_result["error"] = (
+                    "push_to_hub=True requested, but no HF_TOKEN was found in args, environment, or Colab secrets."
+                )
+                return hub_result
+            from huggingface_hub import HfApi  # type: ignore
+            client = HfApi(token=token)
+        try:
+            client.create_repo(
+                repo_id=resolved_repo_id,
+                private=bool(cfg.hf_private),
+                exist_ok=True,
+                repo_type="model",
+            )
+            client.upload_folder(
+                folder_path=str(exp_path),
+                repo_id=resolved_repo_id,
+                repo_type="model",
+                commit_message=(
+                    f"Upload {cfg.hf_model_name} (72-visit learned_mhc + 18-visit D-LSA, "
+                    f"gain_mode={cfg.gain_mode})"
+                ),
+            )
+            hub_result["uploaded"] = True
+            print(
+                f"[Hugging Face Hub] Uploaded `{cfg.hf_model_name}` -> https://huggingface.co/{resolved_repo_id}"
+            )
+        except Exception as exc:
+            hub_result["error"] = str(exc)
+            print(f"[Hugging Face Hub Error] Failed to upload `{resolved_repo_id}`: {exc}")
+
+    return hub_result
 
 
 def run_mhc_training_pipeline(
@@ -1634,6 +1901,24 @@ def run_mhc_training_pipeline(
         distill_rep["selector_checkpoint_path"] = str(selector_path)
         distill_rep["final_export"] = ckpt_final
         report["stages"]["stage_e"] = distill_rep
+    else:
+        save_mhc_training_checkpoint(
+            model,
+            out_root / "final_loop72_mhc_dlsa_export",
+            cfg=cfg,
+            stage_name="final_mhc_export",
+            global_step=global_step,
+            metrics={"stages_completed": list(report["stages"].keys())},
+        )
+
+    hub_export = export_and_upload_recursive72_to_hub(
+        model,
+        tokenizer,
+        export_dir=out_root / "final_loop72_mhc_dlsa_export",
+        cfg=cfg,
+        report=report,
+    )
+    report["huggingface_export"] = hub_export
 
     summary_path = out_root / "mhc_training_report.json"
     summary_path.write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
@@ -1642,7 +1927,7 @@ def run_mhc_training_pipeline(
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Milestone 2 Differentiable TwoStreamMHC Trainer for Spark X2.6 4B Loop72-LSA."
+        description="Milestone 2 Differentiable TwoStreamMHC Trainer for Spark X2.6 4B Recursive72."
     )
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID, help="Hugging Face model ID or local path.")
     parser.add_argument("--revision", default=DEFAULT_MODEL_REVISION, help="Pinned model revision SHA.")
@@ -1672,6 +1957,28 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--skip-stage-d", action="store_true", help="Skip Stage D Oh My Pi tool specialization.")
     parser.add_argument("--skip-stage-e", action="store_true", help="Skip Stage E D-LSA selector distillation.")
     parser.add_argument("--verify-only", action="store_true", help="Run Stage A mechanical & gradient verification only.")
+    parser.add_argument(
+        "--hf-model-name",
+        default=DEFAULT_HF_MODEL_NAME,
+        help="Model display name for Hugging Face model card and manifest (default: 'Spark X2.6 4B Recursive72').",
+    )
+    parser.add_argument(
+        "--hf-repo-id",
+        default=DEFAULT_HF_REPO_ID,
+        help="Target Hugging Face Hub repository ID or model name (default: 'TassP0lar/Spark-X2.6-4B-Recursive72').",
+    )
+    parser.add_argument(
+        "--push-to-hub",
+        action="store_true",
+        help="Upload the trained 'Spark X2.6 4B Recursive72' package to Hugging Face Hub after training.",
+    )
+    parser.add_argument("--hf-private", action="store_true", help="Create private Hugging Face repository when pushing.")
+    parser.add_argument("--hf-token", default=None, help="Explicit Hugging Face write token (or use HF_TOKEN env/Colab secret).")
+    parser.add_argument(
+        "--no-standalone-backbone",
+        action="store_true",
+        help="Export only loop controllers + D-LSA selectors without duplicating the 36L base weights.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args(argv)
 
@@ -1699,6 +2006,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         stage_e_distill_steps=args.stage_e_distill_steps,
         run_stage_d_omp=not args.skip_stage_d,
         run_stage_e_dlsa=not args.skip_stage_e,
+        hf_model_name=args.hf_model_name,
+        hf_repo_id=args.hf_repo_id,
+        push_to_hub=bool(args.push_to_hub),
+        hf_private=bool(args.hf_private),
+        hf_token=args.hf_token,
+        export_standalone_backbone=not bool(args.no_standalone_backbone),
         seed=args.seed,
     )
     hw_info = apply_hardware_profile_to_config(cfg)

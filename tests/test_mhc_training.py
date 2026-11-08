@@ -25,13 +25,18 @@ except ModuleNotFoundError as exc:
     nn = None
 
 from train_spark_mhc import (
+    DEFAULT_HF_MODEL_NAME,
+    DEFAULT_HF_REPO_ID,
     DOMAIN_MIXTURE_WEIGHTS,
     EXPECTED_DEFAULT_CONTROLLER_PARAMS,
     MHCTrainingConfig,
     apply_hardware_profile_to_config,
     build_five_domain_seed_bank,
     build_omp_tool_trajectory_examples,
+    build_recursive72_model_card,
     detect_gpu_training_profile,
+    export_and_upload_recursive72_to_hub,
+    normalize_hf_repo_id,
     render_example_to_Ids_and_labels,
 )
 
@@ -190,6 +195,27 @@ class TestMHCTrainingPurePythonContracts(unittest.TestCase):
             supervised_count = sum(1 for y in labels if y != -100)
             self.assertGreater(masked_count, 0)
             self.assertGreater(supervised_count, 0)
+
+    def test_huggingface_recursive72_repo_naming_and_model_card(self):
+        self.assertEqual(DEFAULT_HF_MODEL_NAME, "Spark X2.6 4B Recursive72")
+        self.assertEqual(DEFAULT_HF_REPO_ID, "TassP0lar/Spark-X2.6-4B-Recursive72")
+        self.assertEqual(
+            normalize_hf_repo_id("Spark X2.6 4B Recursive72"),
+            "TassP0lar/Spark-X2.6-4B-Recursive72",
+        )
+        fake_api = types.SimpleNamespace(whoami=lambda: {"name": "BaiTian6641"})
+        self.assertEqual(
+            normalize_hf_repo_id("Spark X2.6 4B Recursive72", api_client=fake_api),
+            "BaiTian6641/Spark-X2.6-4B-Recursive72",
+        )
+        self.assertEqual(
+            normalize_hf_repo_id("BaiTian6641/Spark X2.6 4B Recursive72"),
+            "BaiTian6641/Spark-X2.6-4B-Recursive72",
+        )
+        cfg = MHCTrainingConfig()
+        card = build_recursive72_model_card(cfg, {"stages": {}}, "BaiTian6641/Spark-X2.6-4B-Recursive72")
+        self.assertIn("# Spark X2.6 4B Recursive72", card)
+        self.assertIn("BaiTian6641/Spark-X2.6-4B-Recursive72", card)
 
 
 @unittest.skipIf(torch is None, "torch not installed")
@@ -361,6 +387,44 @@ class TestMHCTrainingTorchContracts(unittest.TestCase):
             bank_info = bank.load_from_legacy_or_visit_checkpoint(sel_payload)
             self.assertEqual(bank_info["provenance"]["mhc_checkpoint_sha256"], expected_d_sha)
             self.assertEqual(bank_info["provenance"]["recurrence_mode"], "learned_mhc")
+
+            # Verify Hugging Face Recursive72 export artifacts & mock Hub upload
+            export_dir = pathlib.Path(tmp_dir) / "final_loop72_mhc_dlsa_export"
+            readme_file = export_dir / "README.md"
+            cfg_file = export_dir / "loop_config_v03.json"
+            self.assertTrue(readme_file.is_file())
+            self.assertIn("# Spark X2.6 4B Recursive72", readme_file.read_text(encoding="utf-8"))
+            cfg_json = json.loads(cfg_file.read_text(encoding="utf-8"))
+            self.assertEqual(cfg_json["model_name"], "Spark X2.6 4B Recursive72")
+
+            created_repos = []
+            uploaded_folders = []
+
+            class _FakeHfApi:
+                def whoami(self):
+                    return {"name": "BaiTian6641"}
+
+                def create_repo(self, **kwargs):
+                    created_repos.append(kwargs)
+
+                def upload_folder(self, **kwargs):
+                    uploaded_folders.append(kwargs)
+
+            cfg.push_to_hub = True
+            cfg.hf_repo_id = "Spark X2.6 4B Recursive72"
+            hub_res = export_and_upload_recursive72_to_hub(
+                model,
+                _TinyTok(),
+                export_dir=export_dir,
+                cfg=cfg,
+                report=rep,
+                api_client=_FakeHfApi(),
+            )
+            self.assertTrue(hub_res["uploaded"])
+            self.assertEqual(hub_res["model_name"], "Spark X2.6 4B Recursive72")
+            self.assertEqual(hub_res["hf_repo_id"], "BaiTian6641/Spark-X2.6-4B-Recursive72")
+            self.assertEqual(created_repos[0]["repo_id"], "BaiTian6641/Spark-X2.6-4B-Recursive72")
+            self.assertEqual(uploaded_folders[0]["repo_id"], "BaiTian6641/Spark-X2.6-4B-Recursive72")
 
 
 if __name__ == "__main__":

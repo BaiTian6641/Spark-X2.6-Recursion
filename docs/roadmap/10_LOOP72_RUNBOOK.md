@@ -69,7 +69,7 @@ python -m train_spark_mhc \
   --verify-only \
   --output-dir results/mhc-verify-001
 
-# Full Stages A–E training & selector calibration on Colab G4 96GB
+# Full Stages A–E training, 18-visit D-LSA calibration & automatic upload of "Spark X2.6 4B Recursive72" to Hugging Face Hub
 python -m train_spark_mhc \
   --hardware-profile colab_g4_96gb \
   --gain-mode sigmoid \
@@ -80,6 +80,9 @@ python -m train_spark_mhc \
   --stage-c-steps 300 \
   --stage-d-steps 60 \
   --stage-e-distill-steps 150 \
+  --hf-model-name "Spark X2.6 4B Recursive72" \
+  --hf-repo-id "Spark X2.6 4B Recursive72" \
+  --push-to-hub \
   --output-dir results/mhc-train-001
 ```
 
