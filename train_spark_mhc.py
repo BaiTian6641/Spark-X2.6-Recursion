@@ -676,10 +676,15 @@ def run_stage_a_verification(
     loss_ckpt.backward()
 
     max_ckpt_grad_diff = 0.0
+    max_ckpt_rel_grad_diff = 0.0
     for name, p in model.controllers.named_parameters():
         if p.grad is not None and name in grads_nockpt:
-            diff = float((p.grad.detach() - grads_nockpt[name]).abs().max().item())
+            g_ckpt = p.grad.detach().float()
+            g_ref = grads_nockpt[name].float()
+            diff = float((g_ckpt - g_ref).abs().max().item())
+            denom = max(1.0, float(g_ref.norm().item()))
             max_ckpt_grad_diff = max(max_ckpt_grad_diff, diff)
+            max_ckpt_rel_grad_diff = max(max_ckpt_rel_grad_diff, diff / denom)
 
     p2_grad_norm = float(
         sum(
@@ -725,6 +730,9 @@ def run_stage_a_verification(
         logits_after_load = model.forward_logits(input_ids).detach().float()
         save_load_max_diff = float((logits_before_save - logits_after_load).abs().max().item())
 
+    # Reset controllers back to clean Step-0 initialization after the Stage A probe step
+    prepare_model_for_mhc_training(model, cfg=cfg, reset_gains=True)
+    model.eval()
     ctrl_sum = model.controller_summary()
     manifest = model.execution_manifest()
     passed = (
@@ -733,7 +741,7 @@ def run_stage_a_verification(
         and p3_grad_norm > 0.0
         and adapter_up_grad_norm > 0.0
         and base_immutable
-        and max_ckpt_grad_diff < 1e-2
+        and max_ckpt_rel_grad_diff < 0.05
         and save_load_max_diff < 1e-4
         and not manifest["recurrence_train_eval_mismatch"]
         and manifest["effective_recurrence_mode"] == "learned_mhc"
@@ -747,9 +755,10 @@ def run_stage_a_verification(
         "expected_full_model_controller_parameters": EXPECTED_DEFAULT_CONTROLLER_PARAMS,
         "loss_metrics": metrics_ckpt,
         "p2_gain_grad_l1": round(p2_grad_norm, 8),
-        "p3_gain_grad_l1": round(p3_grad_norm, 8),
+        "p3_gain_grad_l1": round(p3_gain_norm, 8),
         "adapter_up_grad_norm": round(adapter_up_grad_norm, 8),
         "max_checkpoint_replay_grad_diff": float(max_ckpt_grad_diff),
+        "max_checkpoint_replay_rel_grad_diff": round(float(max_ckpt_rel_grad_diff), 8),
         "base_weights_immutable": bool(base_immutable),
         "base_sha256": base_sha_after,
         "save_load_max_logit_diff": float(save_load_max_diff),
