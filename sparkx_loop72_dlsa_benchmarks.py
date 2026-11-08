@@ -1,27 +1,22 @@
-"""sparkx_loop72_dlsa_benchmarks.py — Official Benchmark Reference & Modern 2026 Evaluation Suite for Spark X2.6 4B Loop72 + Per-Visit Paged D-LSA (`loop72-dlsa` branch).
+"""Loop72 + D-LSA benchmark adapters, explicit smoke tests and reference values.
 
-Evaluates **strictly the 72-Visit Looped Transformer (`Loop72`) + Per-Visit Paged `D-LSA` enhancement** (`construct_engram=False`, `0` Engram parameters, native `GELU` preserved) against:
-  1. Official `Spark X2.6-4B` published benchmark scores (and competitor baselines `Spark X2.5-4B`, `Qwen3.5 9B`,
-     `Qwen3.5 4B`, `Gemma4 12B`, `Gemma4 E4B`).
-  2. Significant official benchmarks across Long Context, Math, General/Instruction, Agent, and Code:
-     - **Long Context**: `OpenAI MRCR v2` (`openai/mrcr`), `GraphWalks BFS` (`openai/graphwalks` F1),
-       `LongBench v2` (`zai-org/LongBench-v2`), `AA-LCR v1.1` (`ArtificialAnalysis/AA-LCR`).
-     - **Math**: `Gaokao 2026` (`XHToken/gaokao_math_2026`), `AIME 2026` (`MathArena/aime_2026`),
-       `HMMT Feb 2026` (`MathArena/hmmt_feb_2026`), `IMO-AnswerBench` (`Hwilner/imo-answerbench`).
-     - **General & Knowledge**: `IFEval` (`google/IFEval`), `IFBench` (`allenai/IFBench_test`),
-       `GPQA Diamond` (`Idavidrein/gpqa`).
-     - **Agent & Code**: `BFCL-V4` (`gorilla-llm/Berkeley-Function-Calling-Leaderboard`), `SciCode` (`SciCode1/SciCode`).
-  3. Modern 2025–2026 Held-Out Text Perplexity, 4-Way Positional/Sparse Ablation (`Dense_NativeRoPE`, `Sparse_NativeRoPE`,
-     `Dense_YaRNRoPE`, `Sparse_YaRNRoPE`), and 72-Visit Hybrid Paged Cache Memory Ledger (`M0/M1/M2`).
+Local protocols cover MRCR, GraphWalks BFS and LongBench v2 zero-shot. Other
+official suites require their released task environments and evaluators. Dataset
+samples, handwritten checks, synthetic performance streams and payload arithmetic
+are labelled separately and do not populate published-score comparisons. Full
+execution and pinned-dataset provenance belong to the full-suite runner.
 """
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import math
 import random
 import re
+import statistics
 import time
+from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
@@ -272,6 +267,9 @@ def verify_scicode_in_sandbox(response_text: str, spec: Dict[str, Any]) -> Verdi
     """Execute a `SciCode` scientific computing task in an isolated sandbox using both unit assertions (`test_suite`)
     and `stdio` numerical test cases (`test_cases`).
     """
+    spec = spec.get("scicode_spec", spec)
+    if not spec.get("test_cases") and not spec.get("test_suite"):
+        return Verdict(False, "unsupported_missing_executable_tests", {"score": None, "status": "unsupported"})
     scores: List[float] = []
     details: Dict[str, Any] = {"sandbox": "isolated_scicode_harness"}
     ok_all = True
@@ -415,7 +413,9 @@ def verify_bfcl_tool_call(response_text: str, spec: Dict[str, Any]) -> Verdict:
     implementation in the sandbox when provided.
     """
     seg = extract_answer_segment(response_text)
-    expected_tool = str(spec.get("expected_tool", "")).strip()
+    expected_tool = str(spec.get("expected_tool", spec.get("function_name", ""))).strip()
+    if not expected_tool:
+        return Verdict(False, "unsupported_missing_function_name", {"score": None, "status": "unsupported"})
     expected_args = spec.get("expected_args", {})
     arg_names = list(expected_args.keys()) if isinstance(expected_args, dict) else list(spec.get("required_arg_names", []))
 
@@ -431,12 +431,15 @@ def verify_bfcl_tool_call(response_text: str, spec: Dict[str, Any]) -> Verdict:
 
     if expected_tool:
         checks_total += 1
-        norm_got = tool_name.split(".")[-1].split("__")[-1].strip().lower()
-        norm_exp = expected_tool.split(".")[-1].split("__")[-1].strip().lower()
-        if norm_got == norm_exp or norm_exp in norm_got or norm_got in norm_exp:
+        if tool_name == expected_tool:
             checks_passed += 1
         else:
             errors.append(f"tool_name:got={tool_name!r},exp={expected_tool!r}")
+
+    if isinstance(expected_args, dict) and not spec.get("allow_extra_args", False):
+        extra_args = set(args) - set(expected_args)
+        if extra_args:
+            errors.append(f"unexpected_args:{sorted(extra_args)}")
 
     # Normalize argument keys for case-insensitive lookup if needed
     args_norm_map = {str(k).strip().lower(): v for k, v in args.items()}
@@ -520,9 +523,9 @@ def verify_mcq_choice(response_text: str, gold_letter: Any, gold_text: str = "")
     boxed = extract_boxed(seg) or extract_boxed(response_text) or ""
     g_let = str(gold_letter).strip().upper()
     cand_box = boxed.strip().strip("().: ")
-    if cand_box.upper() == g_let or (cand_box and cand_box[0].upper() == g_let and len(cand_box) <= 3):
+    if cand_box.upper() == g_let:
         return Verdict(True, "ok_boxed_letter", {"score": 1.0, "pred": cand_box, "gold": g_let})
-    if gold_text and gold_text.strip().lower() in (boxed or seg).lower():
+    if gold_text and gold_text.strip().lower() == (boxed or seg).strip().lower():
         return Verdict(True, "ok_gold_text", {"score": 1.0, "pred": gold_text, "gold": g_let})
     # Check explicit `Answer: X` or `(X)` at tail of segment
     m = re.findall(r"(?:answer|choice|option|select)\s*(?:is|:)?\s*\(?([A-E])\)?\b", seg, flags=re.IGNORECASE)
@@ -543,7 +546,7 @@ def verify_ifeval_constraints(
     kwargs_list = list(kwargs_list or [])
     seg = extract_answer_segment(response_text).strip()
     if not instruction_id_list:
-        return Verdict(bool(seg), "ok", {"score": 1.0 if seg else 0.0})
+        return Verdict(False, "unsupported_no_constraints", {"score": None, "status": "unsupported"})
 
     passed_rules = 0
     rule_results: List[Dict[str, Any]] = []
@@ -574,10 +577,10 @@ def verify_ifeval_constraints(
             ok_rule = _cmp_rel(len(sents), int(kw.get("num_sentences", 1)), str(kw.get("relation", "at least")))
         elif "number_paragraphs" in iid:
             paras = [p for p in re.split(r"\n\s*\n|\*\*\*", seg) if p.strip()]
-            ok_rule = len(paras) >= int(kw.get("num_paragraphs", 1))
+            ok_rule = len(paras) == int(kw.get("num_paragraphs", 1))
         elif "number_bullet_lists" in iid:
             bullets = re.findall(r"^\s*[\*\-\+]\s+", seg, flags=re.MULTILINE)
-            ok_rule = len(bullets) >= int(kw.get("num_bullets", 1))
+            ok_rule = len(bullets) == int(kw.get("num_bullets", 1))
         elif "number_placeholders" in iid:
             phs = re.findall(r"\[[^\]]+\]", seg)
             ok_rule = len(phs) >= int(kw.get("num_placeholders", 1))
@@ -610,9 +613,12 @@ def verify_ifeval_constraints(
             ok_rule = "******" in seg
         elif "repeat_prompt" in iid:
             ptxt = str(kw.get("prompt_to_repeat", "")).strip().lower()
-            ok_rule = seg.lower().startswith(ptxt[:40]) if ptxt else True
+            ok_rule = seg.lower().startswith(ptxt) if ptxt else False
         else:
-            ok_rule = len(seg) > 0
+            return Verdict(False, "unsupported_instruction", {
+                "score": None, "status": "unsupported", "instruction_id": inst_id,
+                "rules": rule_results,
+            })
 
         if ok_rule:
             passed_rules += 1
@@ -904,7 +910,7 @@ OFFICIAL_BENCHMARK_TABLE: Dict[str, Dict[str, Any]] = {
 
 
 # ==============================================================================
-# 2. Modern 2025–2026 Held-Out Text Corpus (Zero Overlap with Legacy Prompts)
+# 2. Handwritten technical text for synthetic performance diagnostics
 # ==============================================================================
 MODERN_2026_TEXT_CORPUS: List[Dict[str, str]] = [
     {
@@ -970,7 +976,11 @@ MODERN_2026_TEXT_CORPUS: List[Dict[str, str]] = [
 
 
 def build_modern_long_eval_stream(target_tokens: int = 8192, tokenizer: Any = None) -> str:
-    """Build a deterministic, non-repetitive modern 2026 technical evaluation stream of at least `target_tokens` tokens."""
+    """Build a synthetic performance stream that repeats a small fixed corpus.
+
+    This is useful for capacity/latency diagnostics, not held-out language-model
+    quality evaluation. Unique headers do not make the repeated bodies unique.
+    """
     blocks: List[str] = []
     sec_idx = 0
     while True:
@@ -996,7 +1006,7 @@ def build_modern_long_eval_stream(target_tokens: int = 8192, tokenizer: Any = No
 
 
 # ==============================================================================
-# 3. Official Long-Context Benchmark Generators & Scorers (GraphWalks BFS + MRCR v2 + LongBench v2)
+# 3. Synthetic long-context smoke generators and task scoring helpers
 # ==============================================================================
 def generate_graphwalks_bfs_instance(
     num_nodes: int = 128,
@@ -1059,7 +1069,8 @@ def generate_graphwalks_bfs_instance(
         f"{edge_lines}\n\n"
         f"Question: Starting from node `{start_node}`, find all nodes at exact Breadth-First Search (BFS) "
         f"distance {target_depth} (i.e., reachable in {target_depth} directed hops and no fewer). "
-        "Output the matching 8-character node IDs separated by commas inside `\\boxed{id1, id2, ...}`."
+        "Put the matching node IDs on the very last line as `Final Answer: [id1, id2, ...]`. "
+        "For no matching nodes, use `Final Answer: []`."
     )
     return {
         "benchmark": "Graphwalks bfs f1",
@@ -1073,23 +1084,37 @@ def generate_graphwalks_bfs_instance(
 
 
 def score_graphwalks_bfs_f1(response_text: str, gold_nodes: Sequence[str]) -> Dict[str, Any]:
-    """Compute exact Precision, Recall, and F1 on a `GraphWalks BFS` prediction."""
-    ans_seg = extract_answer_segment(response_text)
-    boxed = extract_boxed_answer(ans_seg) or ans_seg
-    pred_tokens = set(re.findall(r"\b[0-9a-f]{8}\b", boxed.lower()))
-    gold_set = {g.lower() for g in gold_nodes}
-    if not gold_set and not pred_tokens:
-        return {"f1": 1.0, "precision": 1.0, "recall": 1.0, "predicted": [], "gold": list(gold_set)}
-    tp = len(pred_tokens & gold_set)
-    prec = tp / max(1, len(pred_tokens)) if pred_tokens else 0.0
-    rec = tp / max(1, len(gold_set))
-    f1 = (2.0 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+    """Use the upstream final-line parser and exact, case-sensitive set metric.
+
+    Protocol: openai/graphwalks README.md at revision
+    be6cc6ecf9b4d495b07d1ff53d2a16598e90fed7, "Extraction and Grading".
+    The literal last line must contain ``Final Answer:`` and a bracketed list.
+    Do not strip trailing newlines, normalize node identifiers, mine earlier
+    prose, or accept boxed-only responses: those change the upstream protocol.
+    """
+    line = response_text.split("\n")[-1]
+    list_part = re.search(r"\[.*\]", line) if "Final Answer:" in line else None
+    failed_to_parse = list_part is None
+    sampled = list_part.group(0).strip("[]").split(",") if list_part else []
+    pred_tokens = {item.strip() for item in sampled if item.strip()}
+    gold_set = set(gold_nodes)
+    if failed_to_parse:
+        prec = rec = f1 = 0.0
+    elif not gold_set and not pred_tokens:
+        prec = rec = f1 = 1.0
+    else:
+        tp = len(pred_tokens & gold_set)
+        prec = tp / len(pred_tokens) if pred_tokens else 0.0
+        rec = tp / len(gold_set) if gold_set else 0.0
+        f1 = (2.0 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
     return {
-        "f1": round(f1, 4),
-        "precision": round(prec, 4),
-        "recall": round(rec, 4),
+        "f1": f1,
+        "precision": prec,
+        "recall": rec,
         "predicted": sorted(pred_tokens),
         "gold": sorted(gold_set),
+        "failed_to_parse": failed_to_parse,
+        "parser": "upstream_final_line",
     }
 
 
@@ -1153,11 +1178,23 @@ def generate_mrcr_v2_instance(
     }
 
 
-def score_mrcr_v2_response(response_text: str, gold_answer: str) -> Dict[str, Any]:
-    """Score an `openai/mrcr` response by exact tag match and normalized substring similarity."""
+def score_mrcr_v2_response(response_text: str, gold_answer: str, random_string_to_prepend: Optional[str] = None) -> Dict[str, Any]:
+    """Use the dataset-card SequenceMatcher metric when a prefix is supplied.
+
+    With no prefix, this helper checks an exact synthetic tag for smoke tests.
+    https://huggingface.co/datasets/openai/mrcr (grade function).
+    """
+    if random_string_to_prepend is not None:
+        prefix = str(random_string_to_prepend)
+        if not prefix:
+            return {"status": "invalid", "score": None, "reason": "missing_mrcr_prefix"}
+        prefix_ok = response_text.startswith(prefix)
+        score = SequenceMatcher(None, response_text[len(prefix):], gold_answer.removeprefix(prefix)).ratio() if prefix_ok else 0.0
+        return {"status": "scored", "score": float(score), "exact_match": response_text == gold_answer,
+                "prefix_matched": prefix_ok, "metric": "sequence_match_ratio"}
     ans_seg = extract_answer_segment(response_text)
     boxed = (extract_boxed_answer(ans_seg) or ans_seg).strip().strip("`\"'")
-    exact = gold_answer.lower() in boxed.lower()
+    exact = gold_answer == boxed
     return {
         "exact_match": bool(exact),
         "score": 1.0 if exact else 0.0,
@@ -1371,7 +1408,7 @@ def evaluate_oh_my_pi_hashline_task(
 
 
 # ==============================================================================
-# 4. Complete Significant Benchmark Suite Covering 100% of Official Benchmark Categories
+# 4. Handwritten smoke tasks; not official benchmark instances or scores
 # ==============================================================================
 SIGNIFICANT_BENCHMARK_SUITE: List[Dict[str, Any]] = [
     # --- Math: Gaokao 2026 / AIME 2026 / HMMT Feb 26 / IMO-AnswerBench ---
@@ -1847,6 +1884,15 @@ SIGNIFICANT_BENCHMARK_SUITE: List[Dict[str, Any]] = [
 ]
 
 
+# Handwritten tasks are plumbing checks, independent of their reference names.
+for _smoke_item in SIGNIFICANT_BENCHMARK_SUITE:
+    _smoke_item["benchmark_id"] = _smoke_item["benchmark"]
+    _smoke_item["benchmark"] = "Smoke / " + _smoke_item["benchmark"]
+    _smoke_item.update(source="synthetic", evaluation_kind="smoke", status="ready",
+                       official_comparable=False, official_spark_x26_score=None,
+                       protocol="handwritten_smoke")
+
+
 def _fetch_hf_rows_via_rest_api(
     repo_id: str,
     config: Optional[str] = None,
@@ -1913,7 +1959,7 @@ def _load_bfcl_v4_rows_from_hub(max_rows: int = 3) -> List[Dict[str, Any]]:
             with urllib.request.urlopen(req, timeout=8.0) as resp:
                 return resp.read().decode("utf-8").splitlines()
 
-    for filename in ("BFCL_v4_simple_python.json", "BFCL_v3_simple.json"):
+    for filename in ("BFCL_v4_simple_python.json",):
         try:
             q_lines = _read_lines(filename)
             a_lines = _read_lines(f"possible_answer/{filename}")
@@ -1947,8 +1993,20 @@ def _load_bfcl_v4_rows_from_hub(max_rows: int = 3) -> List[Dict[str, Any]]:
     return []
 
 
+class BenchmarkSampleCollection(dict):
+    """Legacy mapping of diagnostic samples plus explicit loading outcomes."""
+
+    def __init__(self):
+        super().__init__()
+        self.load_report: Dict[str, Any] = {}
+
+
 def try_load_hf_benchmark_samples(max_per_dataset: int = 2) -> Dict[str, List[Dict[str, Any]]]:
-    """Stream real benchmark samples from the official Hugging Face datasets across Math, Long Context,
+    """Download unpinned diagnostic samples, never a full official evaluation.
+
+    Maximum 20 per dataset; use the pinned full runner for more. Split fallback,
+    missing datasets and exact returned counts are exposed in ``load_report``.
+    Legacy sources across Math, Long Context,
     General Knowledge, Agent Tool Use, and Coding suites (`XHToken/gaokao_math_2026`, `MathArena/aime_2026`,
     `MathArena/hmmt_feb_2026`, `Hwilner/imo-answerbench`, `zai-org/LongBench-v2`, `openai/graphwalks`,
     `openai/mrcr`, `ArtificialAnalysis/AA-LCR`, `google/IFEval`, `allenai/IFBench_test`, `cais/hle`,
@@ -1958,7 +2016,11 @@ def try_load_hf_benchmark_samples(max_per_dataset: int = 2) -> Dict[str, List[Di
     Uses `datasets.load_dataset(..., streaming=True)` first, with automatic fallback to the public
     Hugging Face Datasets Server REST API and `hf_hub_download` for JSONL repositories.
     """
-    loaded: Dict[str, List[Dict[str, Any]]] = {}
+    if max_per_dataset is None or not 0 <= int(max_per_dataset) <= 20:
+        raise ValueError("diagnostic sampler accepts 0..20 rows; full evaluation requires the pinned dataset runner")
+    loaded = BenchmarkSampleCollection()
+    if int(max_per_dataset) == 0:
+        return loaded
     has_datasets = False
     try:
         from datasets import load_dataset  # type: ignore
@@ -1994,6 +2056,9 @@ def try_load_hf_benchmark_samples(max_per_dataset: int = 2) -> Dict[str, List[Di
 
     for name, repo_id, cfg_name, splits in specs:
         rows: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        selected_split = None
+        method = None
         if has_datasets and load_dataset is not None:
             for sp in splits:
                 try:
@@ -2002,17 +2067,21 @@ def try_load_hf_benchmark_samples(max_per_dataset: int = 2) -> Dict[str, List[Di
                         if cfg_name
                         else load_dataset(repo_id, split=sp, streaming=True)
                     )
+                    candidate_rows = []
                     for row in ds:
                         r_dict = dict(row)
                         # For HLE(w/o tools), skip multimodal image rows so text-only evaluation is clean
                         if name == "HLE(w/o tools)" and r_dict.get("image"):
                             continue
-                        rows.append(r_dict)
-                        if len(rows) >= int(max_per_dataset):
+                        candidate_rows.append(r_dict)
+                        if len(candidate_rows) >= int(max_per_dataset):
                             break
+                    rows = candidate_rows
                     if rows:
+                        selected_split, method = sp, "datasets_streaming"
                         break
-                except Exception:
+                except Exception as exc:
+                    errors.append(f"{sp}:{type(exc).__name__}:{exc}")
                     continue
 
         if not rows:
@@ -2024,615 +2093,230 @@ def try_load_hf_benchmark_samples(max_per_dataset: int = 2) -> Dict[str, List[Di
                     limit=int(max_per_dataset),
                 )
                 if rows:
+                    selected_split, method = sp, "dataset_server_initial_rows"
                     break
 
-        if rows:
-            loaded[name] = rows
+        loaded[name] = rows
+        loaded.load_report[name] = {
+            "status": "sampled" if rows else "blocked", "dataset": repo_id, "config": cfg_name,
+            "split": selected_split, "method": method, "revision": None,
+            "requested_rows": int(max_per_dataset), "returned_rows": len(rows),
+            "official_comparable": False, "full_split_complete": False,
+            "errors": errors, "reason": None if rows else "dataset_unavailable_or_no_rows",
+        }
 
     # Special JSONL loader for BFCL-V4 (`gorilla-llm/Berkeley-Function-Calling-Leaderboard`)
     bfcl_rows = _load_bfcl_v4_rows_from_hub(max_rows=int(max_per_dataset))
-    if bfcl_rows:
-        loaded["BFCL-V4"] = bfcl_rows
+    loaded["BFCL-V4"] = bfcl_rows
+    loaded.load_report["BFCL-V4"] = {"status": "sampled" if bfcl_rows else "blocked",
+        "category": "v4_simple_python_only", "revision": None, "returned_rows": len(bfcl_rows),
+        "full_split_complete": False, "official_comparable": False}
 
     return loaded
+
+
+LOCAL_OFFICIAL_PROTOCOLS = {
+    "LongBench v2": "longbench_v2_0shot",
+    "Graphwalks bfs 256k f1": "graphwalks_bfs_set_f1",
+    "Graphwalks bfs 1m f1": "graphwalks_bfs_set_f1",
+    "Openai_MRCR v2 256k-512k": "mrcr_sequence_match",
+    "Openai_MRCR v2 512k-1M": "mrcr_sequence_match",
+}
+
+# Upstream THUDM/LongBench prompts/0shot.txt, blob 81ad9bc1e85ad7ba5b4780fe0fa87745f4bfd964.
+LONGBENCH_V2_0SHOT_TEMPLATE = (
+    "Please read the following text and answer the question below.\n\n"
+    "<text>\n$DOC$\n</text>\n\n"
+    "What is the correct answer to this question: $Q$\nChoices:\n"
+    "(A) $C_A$\n(B) $C_B$\n(C) $C_C$\n(D) $C_D$\n\n"
+    'Format your response as follows: "The correct answer is (insert answer here)".'
+)
+
+
+def _first_present(row: Dict[str, Any], *keys: str, default: Any = "") -> Any:
+    """Select a value without treating valid zero/empty-answer data as missing."""
+    for key in keys:
+        if key in row and row[key] is not None:
+            return row[key]
+    return default
 
 
 def convert_hf_row_to_eval_task(
     benchmark_name: str,
     row: Dict[str, Any],
     row_idx: int = 0,
-) -> Optional[Dict[str, Any]]:
-    """Convert a live streamed Hugging Face dataset row into an executable benchmark task with a real verifier.
-    Returns `None` only if the row lacks verifiable ground-truth fields.
+    task_mode: str = "diagnostic",
+) -> Dict[str, Any]:
+    """Convert a dataset row without changing its difficulty or exposing gold.
+
+    Official mode implements only the protocols named in LOCAL_OFFICIAL_PROTOCOLS.
+    Other benchmarks require their actual external harness; a substitute verifier
+    cannot produce an official score. Diagnostic mode permits explicitly labelled
+    local math/MCQ/simple-call checks. Neither mode asserts published comparability.
+    Dataset revision, filtering, split and completeness are the runner's contract.
     """
-    import ast as _ast
-
-    if not isinstance(row, dict) or not row:
-        return None
-
-    meta = OFFICIAL_BENCHMARK_TABLE.get(benchmark_name, {})
-    category = str(meta.get("category", "General & Knowledge"))
-    raw_ref = meta.get("Spark_X2.6_4B")
-    ref_score: Optional[float] = float(raw_ref) if raw_ref is not None else None
+    if task_mode not in ("official", "diagnostic"):
+        raise ValueError("task_mode must be 'official' or 'diagnostic'")
     slug = re.sub(r"[^a-z0-9]+", "_", benchmark_name.lower()).strip("_")
-    task_id = f"hf_{slug}_{row_idx}"
+    row = row if isinstance(row, dict) else {}
+    identity = _first_present(row, "_id", "id", "instance_id", default=row_idx)
+    item: Dict[str, Any] = {
+        "id": f"hf_{slug}_{identity}", "row_id": identity, "row_index": int(row_idx),
+        "benchmark_id": benchmark_name,
+        "benchmark": benchmark_name if task_mode == "official" else f"Diagnostic / {benchmark_name}",
+        "category": OFFICIAL_BENCHMARK_TABLE.get(benchmark_name, {}).get("category", "Other"),
+        "source": "hf_real", "evaluation_kind": task_mode, "status": "ready",
+        "official_comparable": False, "official_spark_x26_score": None,
+        "score": None, "reason": None, "prompt_truncated": False,
+        "protocol": LOCAL_OFFICIAL_PROTOCOLS.get(benchmark_name, "local_diagnostic"),
+    }
 
-    # 1. Competition Math (`Gaokao 2026`, `AIME 2026`, `HMMT Feb 26`, `IMO-AnswerBench`)
-    if benchmark_name in ("Gaokao 2026", "AIME 2026", "HMMT Feb 26", "IMO-AnswerBench"):
-        prob = str(
-            row.get("problem")
-            or row.get("Problem")
-            or row.get("question")
-            or row.get("Question")
-            or row.get("query")
-            or row.get("prompt")
-            or ""
-        ).strip()
-        ans = str(
-            row.get("answer")
-            or row.get("Short Answer")
-            or row.get("target")
-            or row.get("final_answer")
-            or row.get("ground_truth")
-            or ""
-        ).strip()
-        boxed_gold = extract_boxed_answer(ans)
-        if boxed_gold:
-            ans = boxed_gold.strip()
-        ans = ans.strip("$").strip()
-        if not prob or not ans:
-            return None
-        # Handle multiple-choice questions in Gaokao 2026 (`target` in A/B/C/D)
-        if len(ans) == 1 and ans.upper() in ("A", "B", "C", "D"):
-            return {
-                "id": task_id,
-                "benchmark": benchmark_name,
-                "category": "Math",
-                "official_spark_x26_score": ref_score,
-                "source": "hf_real",
-                "prompt": (
-                    f"[{benchmark_name} — Official HF Dataset Problem #{row_idx + 1}]\n"
-                    f"{prob}\n\n"
-                    "Solve this problem and put the correct option letter inside \\boxed{A}, \\boxed{B}, \\boxed{C}, or \\boxed{D}."
-                ),
-                "mcq_spec": {"gold_letter": ans.upper(), "gold_text": ""},
-                "verifier": "mcq",
-            }
-        return {
-            "id": task_id,
-            "benchmark": benchmark_name,
-            "category": "Math",
-            "official_spark_x26_score": ref_score,
-            "source": "hf_real",
-            "prompt": (
-                f"[{benchmark_name} — Official HF Dataset Problem #{row_idx + 1}]\n"
-                f"{prob}\n\n"
-                "Solve this problem carefully and put your exact final answer inside \\boxed{}."
-            ),
-            "gold": ans,
-            "verifier": "math",
-        }
+    def stop(reason: str, status: str = "unsupported") -> Dict[str, Any]:
+        item.update(status=status, reason=reason, score=None)
+        return item
 
-    # 2. LongBench v2 (`zai-org/LongBench-v2`) — 4-choice reading comprehension over long context
+    if not row:
+        return stop("missing_or_invalid_dataset_row", "invalid")
+    if task_mode == "official" and benchmark_name not in LOCAL_OFFICIAL_PROTOCOLS:
+        return stop("requires_pinned_official_external_harness")
+
     if benchmark_name == "LongBench v2":
-        ctx = str(row.get("context", "")).strip()
-        q_txt = str(row.get("question", "")).strip()
-        c_a = str(row.get("choice_A", "")).strip()
-        c_b = str(row.get("choice_B", "")).strip()
-        c_c = str(row.get("choice_C", "")).strip()
-        c_d = str(row.get("choice_D", "")).strip()
-        ans_letter = str(row.get("answer", "")).strip().upper()
-        if not q_txt or ans_letter not in ("A", "B", "C", "D"):
-            return None
-        if len(ctx) > 32000:
-            ctx = ctx[:16000] + "\n\n...[middle section omitted for fast evaluation cap]...\n\n" + ctx[-16000:]
-        choices_map = {"A": c_a, "B": c_b, "C": c_c, "D": c_d}
-        prompt = (
-            f"[LongBench v2 — Official HF Dataset Instance #{row_idx + 1}]\n"
-            f"Read the following document context carefully and answer the multiple-choice question.\n\n"
-            f"--- DOCUMENT START ---\n{ctx}\n--- DOCUMENT END ---\n\n"
-            f"Question: {q_txt}\n"
-            f"(A) {c_a}\n"
-            f"(B) {c_b}\n"
-            f"(C) {c_c}\n"
-            f"(D) {c_d}\n\n"
-            "Output the correct option letter inside \\boxed{A}, \\boxed{B}, \\boxed{C}, or \\boxed{D}."
-        )
-        return {
-            "id": task_id,
-            "benchmark": benchmark_name,
-            "category": "Long Context",
-            "official_spark_x26_score": ref_score,
-            "source": "hf_real",
-            "prompt": prompt,
-            "mcq_spec": {
-                "gold_letter": ans_letter,
-                "gold_text": choices_map.get(ans_letter, ""),
-            },
-            "verifier": "mcq",
-        }
+        required = ("context", "question", "choice_A", "choice_B", "choice_C", "choice_D", "answer")
+        if any(key not in row or row[key] is None for key in required):
+            return stop("missing_longbench_fields", "invalid")
+        answer = str(row["answer"]).strip().upper()
+        if answer not in "ABCD" or len(answer) != 1:
+            return stop("invalid_longbench_answer", "invalid")
+        mapping = {"$DOC$": str(row["context"]).strip(), "$Q$": str(row["question"]).strip()}
+        mapping.update({f"$C_{c}$": str(row[f"choice_{c}"]).strip() for c in "ABCD"})
+        # One replacement pass prevents text inside a document from becoming a template token.
+        prompt = re.sub(r"\$DOC\$|\$Q\$|\$C_[A-D]\$", lambda m: mapping[m.group()], LONGBENCH_V2_0SHOT_TEMPLATE)
+        item.update(prompt=prompt, verifier="mcq", mcq_spec={"gold_letter": answer, "gold_text": ""},
+                    parser="longbench_v2_official", protocol_source="https://github.com/THUDM/LongBench/blob/main/pred.py",
+                    protocol_source_blob="1c20cba9edfa3675dc944ee10db5334fbd39a118",
+                    protocol_variant="0shot_full_context_no_truncation")
+        return item
 
-    # 3. GraphWalks (`openai/graphwalks`)
-    if benchmark_name in ("Graphwalks bfs 256k f1", "Graphwalks bfs 1m f1"):
-        p_txt = str(row.get("prompt", "")).strip()
-        ans_nodes = row.get("answer_nodes") or row.get("gold_nodes") or []
-        if isinstance(ans_nodes, str):
+    if benchmark_name.startswith("Graphwalks bfs"):
+        if task_mode == "official" and str(row.get("problem_type", "")).lower() != "bfs":
+            return stop("row_is_not_bfs", "filtered")
+        prompt = str(row.get("prompt", ""))
+        nodes = _first_present(row, "answer_nodes", "gold_nodes", default=None)
+        if isinstance(nodes, str):
             try:
-                ans_nodes = json.loads(ans_nodes)
-            except Exception:
-                ans_nodes = [x.strip() for x in ans_nodes.split(",") if x.strip()]
-        if not p_txt or not ans_nodes:
-            return None
-        if len(p_txt) > 48000:
-            p_txt = p_txt[:24000] + "\n...[graph edges truncated]...\n" + p_txt[-24000:]
-        return {
-            "id": task_id,
-            "benchmark": benchmark_name,
-            "category": "Long Context",
-            "official_spark_x26_score": ref_score,
-            "source": "hf_real",
-            "prompt": p_txt + "\n\nPut the final list of nodes inside \\boxed{...}.",
-            "gold_nodes": [str(x) for x in ans_nodes],
-            "verifier": "graphwalks_f1",
-        }
+                nodes = json.loads(nodes)
+            except (ValueError, TypeError):
+                return stop("invalid_answer_nodes", "invalid")
+        if not prompt or not isinstance(nodes, list):
+            return stop("missing_graphwalks_fields", "invalid")
+        item.update(prompt=prompt, gold_nodes=[str(node) for node in nodes], verifier="graphwalks_f1",
+                    problem_type=row.get("problem_type"), protocol="graphwalks_bfs_set_f1")
+        return item
 
-    # 4. OpenAI MRCR (`openai/mrcr`)
-    if benchmark_name in ("Openai_MRCR v2 256k-512k", "Openai_MRCR v2 512k-1M"):
-        raw_p = row.get("prompt", "")
-        ans = str(row.get("answer", "")).strip()
-        if isinstance(ans, str) and len(ans) >= 2 and ans[0] == '"' and ans[-1] == '"':
-            try:
-                ans = json.loads(ans)
-            except Exception:
-                ans = ans.strip('"')
-        # Parse JSON string or doubly-encoded JSON list of messages
-        msgs: Any = raw_p
+    if benchmark_name.startswith("Openai_MRCR"):
+        messages: Any = row.get("prompt")
         for _ in range(2):
-            if isinstance(msgs, str) and (msgs.strip().startswith("[") or msgs.strip().startswith('"[')):
+            if isinstance(messages, str):
                 try:
-                    msgs = json.loads(msgs)
-                except Exception:
+                    messages = json.loads(messages)
+                except (ValueError, TypeError):
                     break
-        if isinstance(msgs, list) and msgs:
-            desired_idx = int(row.get("desired_msg_index", len(msgs) - 2))
-            # Keep first 2 turns, the target needle turn around `desired_idx`, and the final user query turn
-            selected_turns: List[Dict[str, Any]] = []
-            for idx_m, m in enumerate(msgs):
-                if not isinstance(m, dict):
-                    continue
-                if idx_m < 2 or abs(idx_m - desired_idx) <= 2 or idx_m >= len(msgs) - 2:
-                    selected_turns.append(m)
-            p_txt = "\n\n".join(
-                f"{m.get('role', 'user').upper()}: {str(m.get('content', ''))[:4000]}"
-                for m in selected_turns
-            )
-        else:
-            p_txt = str(raw_p).strip()
-            if len(p_txt) > 24000:
-                p_txt = p_txt[:8000] + "\n\n...[conversation history window]...\n\n" + p_txt[-16000:]
-        if not p_txt or not ans:
-            return None
-        # Focus verification on the random_string_to_prepend + first line of answer so scoring is deterministic
-        prepend_tok = str(row.get("random_string_to_prepend", "")).strip()
-        short_gold = prepend_tok if prepend_tok else ans.splitlines()[0].strip()[:80]
-        return {
-            "id": task_id,
-            "benchmark": benchmark_name,
-            "category": "Long Context",
-            "official_spark_x26_score": ref_score,
-            "source": "hf_real",
-            "prompt": p_txt + (f"\n\nEnsure your response begins with the exact prefix token `{prepend_tok}` inside \\boxed{{}}." if prepend_tok else ""),
-            "gold_answer": short_gold,
-            "verifier": "mrcr",
-        }
+        if not isinstance(messages, list) or not messages or any(
+            not isinstance(m, dict) or m.get("role") not in ("system", "user", "assistant")
+            or not isinstance(m.get("content"), str) for m in messages
+        ):
+            return stop("invalid_mrcr_message_history", "invalid")
+        answer = row.get("answer")
+        prefix = row.get("random_string_to_prepend")
+        if not isinstance(answer, str) or not isinstance(prefix, str) or not prefix or not answer.startswith(prefix):
+            return stop("invalid_mrcr_answer_or_prefix", "invalid")
+        # Never use desired_msg_index (a gold pointer) to select, shorten or mark turns.
+        item.update(messages=[dict(m) for m in messages], gold_answer=answer,
+                    random_string_to_prepend=prefix, verifier="mrcr", n_needles=row.get("n_needles"),
+                    protocol="mrcr_sequence_match", protocol_source="https://huggingface.co/datasets/openai/mrcr")
+        return item
 
-    # 5. AA-LCRv1.1 (`ArtificialAnalysis/AA-LCR`)
+    # These tasks need tool execution, repository/container assets, or released
+    # judge protocols. Keyword/patch matching is not a replacement in either mode.
+    if benchmark_name in ("MCP-Atlas", "SciCode", "SWE Pro", "SWE Verified", "SWE Multilingual",
+                          "Terminal-Bench 4.0", "openai/gdpval", "tau2-bench", "AA-Omniscience v1.1"):
+        return stop("requires_task_environment_assets_and_official_evaluator")
+
     if benchmark_name == "AA-LCRv1.1":
-        q_txt = str(row.get("question") or row.get("prompt") or "").strip()
-        ctx = str(row.get("context") or row.get("document") or "").strip()
-        ans = str(row.get("answer") or "").strip()
-        if not q_txt or not ans:
-            return None
-        if len(ctx) > 32000:
-            ctx = ctx[:16000] + "\n...[truncated]...\n" + ctx[-16000:]
-        full_p = (
-            f"[AA-LCR — Official HF Dataset Problem #{row_idx + 1} (Category: {row.get('document_category', 'General')})]\n"
-            + (f"Context:\n{ctx}\n\n" if ctx else f"Reference Answer Schema Context: {ans}\n\n")
-            + f"Question: {q_txt}\n\n"
-            + "Provide the exact factual answer inside \\boxed{}."
-        )
-        return {
-            "id": task_id,
-            "benchmark": benchmark_name,
-            "category": "Long Context",
-            "official_spark_x26_score": ref_score,
-            "source": "hf_real",
-            "prompt": full_p,
-            "gold": ans.splitlines()[0].strip(),
-            "should_abstain": False,
-            "verifier": "omniscience",
-        }
+        context = str(_first_present(row, "context", "document"))
+        if not context:
+            return stop("missing_source_document_assets")
+        return stop("requires_official_answer_judge_and_document_assembly")
 
-    # 6. IFEval (`google/IFEval`) & IFBench (`allenai/IFBench_test`)
-    if benchmark_name in ("IFEval", "IFBench"):
-        p_txt = str(row.get("prompt", "")).strip()
-        inst_ids = list(row.get("instruction_id_list") or [])
-        raw_kwargs = list(row.get("kwargs") or [])
-        parsed_kwargs: List[Dict[str, Any]] = []
-        for kw in raw_kwargs:
-            if isinstance(kw, str):
-                try:
-                    parsed_kwargs.append(json.loads(kw))
-                except Exception:
-                    parsed_kwargs.append({})
-            elif isinstance(kw, dict):
-                parsed_kwargs.append({k: v for k, v in kw.items() if v is not None})
-            else:
-                parsed_kwargs.append({})
-        if not p_txt or not inst_ids:
-            return None
-        return {
-            "id": task_id,
-            "benchmark": benchmark_name,
-            "category": "General & Knowledge",
-            "official_spark_x26_score": ref_score,
-            "source": "hf_real",
-            "prompt": p_txt,
-            "ifeval_spec": {
-                "instruction_id_list": [str(x) for x in inst_ids],
-                "kwargs": parsed_kwargs,
-            },
-            "verifier": "ifeval",
-        }
-
-    # 7. GPQA & GPQA Diamond (`Idavidrein/gpqa`)
-    if benchmark_name in ("GPQA", "GPQA Diamond"):
-        q_txt = str(row.get("Question") or row.get("question") or "").strip()
-        corr = str(row.get("Correct Answer") or row.get("correct_answer") or "").strip()
-        inc1 = str(row.get("Incorrect Answer 1") or row.get("incorrect_answer_1") or "").strip()
-        inc2 = str(row.get("Incorrect Answer 2") or row.get("incorrect_answer_2") or "").strip()
-        inc3 = str(row.get("Incorrect Answer 3") or row.get("incorrect_answer_3") or "").strip()
-        if not q_txt or not corr or not inc1:
-            return None
-        options = [corr, inc1, inc2, inc3]
-        rot = int(row_idx) % 4
-        rotated = options[rot:] + options[:rot]
-        letters = ["A", "B", "C", "D"]
-        gold_letter = letters[(4 - rot) % 4]
-        prompt = (
-            f"[{benchmark_name} — Official HF Dataset Question #{row_idx + 1}]\n"
-            f"{q_txt}\n\n"
-            f"(A) {rotated[0]}\n"
-            f"(B) {rotated[1]}\n"
-            f"(C) {rotated[2]}\n"
-            f"(D) {rotated[3]}\n\n"
-            "Output your final choice inside \\boxed{A}, \\boxed{B}, \\boxed{C}, or \\boxed{D}."
-        )
-        return {
-            "id": task_id,
-            "benchmark": benchmark_name,
-            "category": "General & Knowledge",
-            "official_spark_x26_score": ref_score,
-            "source": "hf_real",
-            "prompt": prompt,
-            "mcq_spec": {
-                "gold_letter": gold_letter,
-                "gold_text": corr,
-            },
-            "verifier": "mcq",
-        }
-
-    # 8. HLE (w/o tools) (`cais/hle`)
-    if benchmark_name == "HLE(w/o tools)":
-        if row.get("image"):
-            return None
-        q_txt = str(row.get("question") or "").strip()
-        ans = str(row.get("answer") or "").strip()
-        if not q_txt or not ans:
-            return None
-        if len(ans) == 1 and ans.upper() in ("A", "B", "C", "D", "E"):
-            return {
-                "id": task_id,
-                "benchmark": benchmark_name,
-                "category": "General & Knowledge",
-                "official_spark_x26_score": ref_score,
-                "source": "hf_real",
-                "prompt": f"[HLE (w/o tools) — Official HF Question #{row_idx + 1}]\n{q_txt}\n\nPut the correct choice letter inside \\boxed{{}}.",
-                "mcq_spec": {"gold_letter": ans.upper(), "gold_text": ""},
-                "verifier": "mcq",
-            }
-        return {
-            "id": task_id,
-            "benchmark": benchmark_name,
-            "category": "General & Knowledge",
-            "official_spark_x26_score": ref_score,
-            "source": "hf_real",
-            "prompt": f"[HLE (w/o tools) — Official HF Question #{row_idx + 1}]\n{q_txt}\n\nPut your exact final answer inside \\boxed{{}}.",
-            "gold": ans,
-            "should_abstain": False,
-            "verifier": "omniscience",
-        }
-
-    # 9. AA-Omniscience (`ArtificialAnalysis/AA-Omniscience-Public`)
-    if benchmark_name == "AA-Omniscience v1.1":
-        q_txt = str(row.get("question") or "").strip()
-        ans = str(row.get("answer") or "").strip()
-        domain = str(row.get("domain") or "General").strip()
-        if not q_txt or not ans:
-            return None
-        return {
-            "id": task_id,
-            "benchmark": benchmark_name,
-            "category": "General & Knowledge",
-            "official_spark_x26_score": ref_score,
-            "source": "hf_real",
-            "prompt": (
-                f"[AA-Omniscience ({domain}) — Official HF Question #{row_idx + 1}]\n"
-                f"Scoring rule: +1 for exact correct answer, -1 for incorrect guess, 0 for \\boxed{{ABSTAIN}}.\n\n"
-                f"Question: {q_txt}\n\n"
-                "Put your exact final answer inside \\boxed{}."
-            ),
-            "gold": ans,
-            "should_abstain": False,
-            "verifier": "omniscience",
-        }
-
-    # 10. BFCL-V4 (`gorilla-llm/Berkeley-Function-Calling-Leaderboard`)
-    if benchmark_name == "BFCL-V4":
-        q_field = row.get("question", [])
-        funcs = row.get("function", [])
-        gt_list = row.get("ground_truth", [])
-        user_msg = ""
-        if isinstance(q_field, list):
-            for turn in q_field:
-                if isinstance(turn, list):
-                    for m in turn:
-                        if isinstance(m, dict) and m.get("content"):
-                            user_msg += str(m["content"]) + "\n"
-                elif isinstance(turn, dict) and turn.get("content"):
-                    user_msg += str(turn["content"]) + "\n"
-        elif isinstance(q_field, str):
-            user_msg = q_field
-        user_msg = user_msg.strip()
-        if not user_msg or not funcs or not gt_list:
-            return None
-        gt_first = gt_list[0] if isinstance(gt_list, list) and gt_list else gt_list
-        if not isinstance(gt_first, dict) or not gt_first:
-            return None
-        fn_name = next(iter(gt_first.keys()))
-        raw_expected_args = gt_first[fn_name]
-        if not isinstance(raw_expected_args, dict):
-            return None
-        expected_args: Dict[str, Any] = {}
-        for k, v in raw_expected_args.items():
-            if isinstance(v, list):
-                # In BFCL ground_truth, `""` in the candidate list means the parameter is optional (omitting it is valid)
-                if "" in v:
-                    continue
-                if v:
-                    expected_args[k] = v[0]
-            else:
-                expected_args[k] = v
-        param_order: List[str] = list(expected_args.keys())
-        if isinstance(funcs, list) and funcs and isinstance(funcs[0], dict):
-            props = funcs[0].get("parameters", {}).get("properties", {})
-            if isinstance(props, dict) and props:
-                param_order = list(props.keys())
-
-        prompt = (
-            f"[BFCL-V4 — Official Berkeley Function Calling Leaderboard Instance ({row.get('id', row_idx)})]\n"
-            f"Available Tool Schema:\n```json\n{json.dumps(funcs, indent=2)}\n```\n\n"
-            f"User Request: {user_msg}\n\n"
-            "Output a JSON tool call `{\"name\": \"...\", \"arguments\": {...}}` inside a ```json``` block."
-        )
-        return {
-            "id": task_id,
-            "benchmark": benchmark_name,
-            "category": "Agent",
-            "official_spark_x26_score": ref_score,
-            "source": "hf_real",
-            "prompt": prompt,
-            "tool_spec": {
-                "function_name": fn_name,
-                "expected_args": expected_args,
-                "param_order": param_order,
-                "allow_extra_args": True,
-            },
-            "verifier": "bfcl_tool",
-        }
-
-    # 11. MCP-Atlas (`ScaleAI/MCP-Atlas`) — Claim Coverage Evaluation
-    if benchmark_name == "MCP-Atlas":
-        p_txt = str(row.get("PROMPT") or row.get("prompt") or "").strip()
-        claims_raw = row.get("GTFA_CLAIMS") or row.get("claims") or []
-        if isinstance(claims_raw, str):
-            try:
-                claims_raw = json.loads(claims_raw)
-            except Exception:
-                try:
-                    claims_raw = _ast.literal_eval(claims_raw)
-                except Exception:
-                    claims_raw = [claims_raw]
-        claims: List[str] = []
-        if isinstance(claims_raw, list):
-            for c in claims_raw:
-                if isinstance(c, dict):
-                    claims.append(str(c.get("claim") or c.get("text") or ""))
-                elif isinstance(c, str):
-                    claims.append(c)
-        claims = [c.strip() for c in claims if c.strip()]
-        if not p_txt or not claims:
-            return None
-        return {
-            "id": task_id,
-            "benchmark": benchmark_name,
-            "category": "Agent",
-            "official_spark_x26_score": ref_score,
-            "source": "hf_real",
-            "prompt": (
-                f"[MCP-Atlas — Official ScaleAI Dataset Task #{row_idx + 1}]\n"
-                f"User Query: {p_txt}\n\n"
-                f"Ground-Truth Reference Facts to Synthesize:\n"
-                + "\n".join(f"- {c}" for c in claims)
-                + "\n\nSynthesize a clear, complete response incorporating all required facts above."
-            ),
-            "mcp_claims": claims,
-            "verifier": "mcp_claims",
-        }
-
-    # 12. SciCode (`SciCode1/SciCode`) — Real Sub-Step Function Synthesis & Sandbox Execution
-    if benchmark_name == "SciCode":
-        sub_steps = row.get("sub_steps") or []
-        if not isinstance(sub_steps, list) or not sub_steps:
-            return None
-        step0 = sub_steps[0] if isinstance(sub_steps[0], dict) else {}
-        step_desc = str(step0.get("step_description_prompt") or row.get("problem_description_main") or "").strip()
-        step_bg = str(step0.get("step_background") or "").strip()
-        fn_hdr = str(step0.get("function_header") or "").strip()
-        ret_line = str(step0.get("return_line") or "").strip()
-        if not step_desc or not fn_hdr:
-            return None
-        # Build sandbox unit tests for the SciCode sub-step function
-        if "def wrap(" in fn_hdr:
-            test_suite_code = (
-                "import math\n"
-                "def _check_close(a, b):\n"
-                "    assert len(a) == len(b)\n"
-                "    for x, y in zip(a, b):\n"
-                "        assert abs(float(x) - float(y)) < 1e-5, f'{x} != {y}'\n"
-                "_check_close(wrap([10.5, -1.2, 20.3], 5.0), [0.5, 3.8, 0.3])\n"
-                "_check_close(wrap([10.0, 5.5, -0.1], 10.0), [0.0, 5.5, 9.9])\n"
-            )
+    if benchmark_name in ("Gaokao 2026", "AIME 2026", "HMMT Feb 26", "IMO-AnswerBench"):
+        prompt = str(_first_present(row, "problem", "Problem", "question", "Question", "query", "prompt")).strip()
+        answer = str(_first_present(row, "answer", "Short Answer", "target", "final_answer", "ground_truth")).strip()
+        if not prompt or not answer:
+            return stop("missing_problem_or_answer", "invalid")
+        answer = (extract_boxed_answer(answer) or answer).strip("$").strip()
+        if len(answer) == 1 and answer.upper() in "ABCD":
+            item.update(prompt=prompt, verifier="mcq", mcq_spec={"gold_letter": answer.upper(), "gold_text": ""})
         else:
-            m_fn = re.search(r"def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", fn_hdr)
-            fn_name_sc = m_fn.group(1) if m_fn else "solution"
-            test_suite_code = f"assert callable({fn_name_sc})\n"
+            item.update(prompt=prompt, verifier="math", gold=answer)
+        return item
 
-        prompt = (
-            f"[SciCode — Official HF Dataset Problem {row.get('problem_id', '')} Step {step0.get('step_number', '1')}]\n"
-            f"{step_desc}\n"
-            + (f"\n{step_bg}\n" if step_bg else "")
-            + f"\nFunction Signature:\n```python\n{fn_hdr}\n    # your implementation\n{ret_line}\n```\n\n"
-            "Write the complete Python function inside a ```python``` block (using standard Python / math / numpy)."
-        )
-        return {
-            "id": task_id,
-            "benchmark": benchmark_name,
-            "category": "Code",
-            "official_spark_x26_score": ref_score,
-            "source": "hf_real",
-            "prompt": prompt,
-            "scicode_spec": {
-                "required_imports": "import math\ntry:\n    import numpy as np\nexcept Exception:\n    pass",
-                "test_suite_code": test_suite_code,
-            },
-            "verifier": "scicode_sandbox",
-        }
+    if benchmark_name in ("IFEval", "IFBench"):
+        prompt = row.get("prompt")
+        rules = row.get("instruction_id_list")
+        if not isinstance(prompt, str) or not isinstance(rules, list) or not rules:
+            return stop("missing_instruction_fields", "invalid")
+        parsed = []
+        for val in row.get("kwargs", []):
+            if isinstance(val, str):
+                try:
+                    val = json.loads(val)
+                except (ValueError, TypeError):
+                    return stop("invalid_instruction_kwargs", "invalid")
+            parsed.append(val or {})
+        item.update(prompt=prompt, verifier="ifeval", ifeval_spec={"instruction_id_list": rules, "kwargs": parsed})
+        return item
 
-    # 13. SWE Verified / SWE Pro / SWE Multilingual (`princeton-nlp/SWE-bench_Verified`, `ScaleAI/SWE-bench_Pro`, `SWE-bench/SWE-bench_Multilingual`)
-    if benchmark_name in ("SWE Verified", "SWE Pro", "SWE Multilingual"):
-        prob_stmt = str(row.get("problem_statement") or "").strip()
-        patch_txt = str(row.get("patch") or "").strip()
-        iid = str(row.get("instance_id") or f"swe_{row_idx}").strip()
-        repo = str(row.get("repo") or "").strip()
-        if not prob_stmt or not patch_txt:
-            return None
-        # Extract the first code hunk from the official patch
-        hunks = re.findall(r"(@@[^\n]*@@\n(?:[ \+\-].*\n?)+)", patch_txt)
-        first_hunk = hunks[0] if hunks else patch_txt[:1500]
-        added_lines: List[str] = []
-        removed_lines: List[str] = []
-        buggy_snippet_lines: List[str] = []
-        for ln in first_hunk.splitlines():
-            if ln.startswith("@@"):
-                continue
-            if ln.startswith("+") and not ln.startswith("+++"):
-                clean_add = ln[1:].strip()
-                if clean_add:
-                    added_lines.append(clean_add)
-            elif ln.startswith("-") and not ln.startswith("---"):
-                clean_rem = ln[1:].strip()
-                if clean_rem:
-                    removed_lines.append(clean_rem)
-                buggy_snippet_lines.append(ln[1:])
-            elif ln.startswith(" "):
-                buggy_snippet_lines.append(ln[1:])
-        if not added_lines:
-            return None
-        buggy_snippet = "\n".join(buggy_snippet_lines[:30])
-        prompt = (
-            f"[{benchmark_name} — Official HF Instance `{iid}` (`{repo}`)]\n"
-            f"Issue Description:\n{prob_stmt[:1800]}\n\n"
-            f"Buggy Code Hunk to Fix:\n```\n{buggy_snippet}\n```\n"
-            + (f"Line(s) to replace: `{removed_lines[0]}`\n" if removed_lines else "")
-            + "\nProvide the fixed code snippet or unified diff solving this issue."
-        )
-        return {
-            "id": task_id,
-            "benchmark": benchmark_name,
-            "category": "Code",
-            "official_spark_x26_score": ref_score,
-            "source": "hf_real",
-            "prompt": prompt,
-            "swe_hf_spec": {
-                "instance_id": iid,
-                "added_lines": added_lines,
-                "removed_lines": removed_lines,
-            },
-            "verifier": "swe_hf_patch",
-        }
+    if benchmark_name in ("GPQA", "GPQA Diamond"):
+        prompt = str(_first_present(row, "Question", "question"))
+        choices = [str(_first_present(row, "Correct Answer", "correct_answer"))]
+        choices += [str(_first_present(row, f"Incorrect Answer {i}", f"incorrect_answer_{i}")) for i in (1, 2, 3)]
+        if not prompt or any(not c for c in choices):
+            return stop("missing_gpqa_fields", "invalid")
+        order = list(range(4))
+        seed = int(hashlib.sha256((prompt + str(identity)).encode()).hexdigest()[:16], 16)
+        random.Random(seed).shuffle(order)
+        gold = "ABCD"[order.index(0)]
+        prompt += "\n\n" + "\n".join(f"({c}) {choices[i]}" for c, i in zip("ABCD", order))
+        item.update(prompt=prompt, verifier="mcq", mcq_spec={"gold_letter": gold, "gold_text": ""}, choice_seed=seed)
+        return item
 
-    # 14. Terminal-Bench 4.0 (`ia03/terminal-bench`)
-    if benchmark_name == "Terminal-Bench 4.0":
-        desc = str(row.get("base_description") or row.get("instruction") or "").strip()
-        t_id = str(row.get("task_id") or f"tb_{row_idx}").strip()
-        if not desc:
-            return None
-        return {
-            "id": task_id,
-            "benchmark": benchmark_name,
-            "category": "Agent",
-            "official_spark_x26_score": ref_score,
-            "source": "hf_real",
-            "prompt": (
-                f"[Terminal-Bench — Official HF Task `{t_id}`]\n"
-                f"{desc[:2000]}\n\n"
-                "Write a self-contained CLI / Python implementation script inside a ```python``` or ```bash``` block."
-            ),
-            "tb_hf_spec": {"task_id": t_id, "tags": list(row.get("tags") or [])},
-            "verifier": "terminal_hf",
-        }
+    if benchmark_name == "HLE(w/o tools)":
+        return stop("requires_official_hle_judge_and_modality_protocol")
 
-    # 15. openai/gdpval (`openai/gdpval`)
-    if benchmark_name == "openai/gdpval":
-        p_txt = str(row.get("prompt") or "").strip()
-        sector = str(row.get("sector") or "").strip()
-        occ = str(row.get("occupation") or "").strip()
-        rubric_raw = row.get("rubric_json") or "[]"
-        try:
-            rubric_items = json.loads(rubric_raw) if isinstance(rubric_raw, str) else list(rubric_raw)
-        except Exception:
-            rubric_items = []
-        if not p_txt:
-            return None
-        criteria = [str(it.get("criterion", "")) for it in rubric_items if isinstance(it, dict) and it.get("criterion")][:4]
-        return {
-            "id": task_id,
-            "benchmark": benchmark_name,
-            "category": "Agent",
-            "official_spark_x26_score": ref_score,
-            "source": "hf_real",
-            "prompt": (
-                f"[openai/gdpval — Official HF Deliverable Task ({sector} / {occ})]\n"
-                f"{p_txt[:1800]}\n\n"
-                + ("Required Deliverable Rubric Criteria:\n" + "\n".join(f"- {c}" for c in criteria) + "\n\n" if criteria else "")
-                + "Provide a structured audit deliverable addressing all rubric criteria above."
-            ),
-            "gdpval_hf_spec": {"criteria": criteria, "occupation": occ},
-            "verifier": "gdpval_hf",
-        }
-
-    return None
+    if benchmark_name == "BFCL-V4":
+        # Intentionally restricted simple-call diagnostic. Multi-turn/parallel and
+        # alternative-valued gold require BFCL's AST/execution evaluator.
+        questions, functions, gold = row.get("question"), row.get("function"), row.get("ground_truth")
+        if not questions or not functions or not isinstance(gold, list) or len(gold) != 1:
+            return stop("unsupported_bfcl_category_or_missing_fields")
+        if not isinstance(gold[0], dict) or len(gold[0]) != 1:
+            return stop("unsupported_bfcl_parallel_calls")
+        function, args = next(iter(gold[0].items()))
+        if not isinstance(args, dict):
+            return stop("invalid_bfcl_ground_truth", "invalid")
+        expected = {}
+        for key, val in args.items():
+            if isinstance(val, list):
+                if len(val) != 1 or val[0] == "":
+                    return stop("requires_bfcl_alternative_argument_evaluator")
+                val = val[0]
+            expected[key] = val
+        text = questions if isinstance(questions, str) else json.dumps(questions, ensure_ascii=False)
+        item.update(prompt=f"Available tools:\n{json.dumps(functions, ensure_ascii=False)}\n\nUser request:\n{text}",
+                    verifier="bfcl_tool", tool_spec={"expected_tool": function, "function_name": function,
+                    "expected_args": expected, "allow_extra_args": False}, protocol="simple_call_diagnostic")
+        return item
+    return stop("no_supported_converter")
 
 
 # ==============================================================================
@@ -2643,517 +2327,429 @@ def evaluate_modern_text_perplexity_and_dlsa(
     model: Any,
     tokenizer: Any,
     seq_len: int = 4096,
-    calibrate_pca: bool = True,
+    calibrate_pca: bool = False,
+    calibration_input_ids: Optional[Any] = None,
+    eval_text: Optional[str] = None,
+    evaluation_provenance: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Compare:
-      1. `36L_Base` (`passes=1, use_mhc=False, enable_p3=False, use_engram=False`)
-      2. `72L_Loop_Dense` (`passes=2, use_mhc=True, enable_p3=True`, exact global attention)
-      3. `72L_Loop_DLSA_Flat` (`72` visits + per-visit paged D-LSA `search_mode='flat'`)
-      4. `72L_Loop_DLSA_Tree` (`72` visits + per-visit paged D-LSA `search_mode='tree'`)
-    on the Modern 2025-2026 Technical Text Stream.
+    """Run a bounded dense/sparse diagnostic on identical evaluation tokens.
+
+    The default repeated technical corpus is synthetic, not held-out validation.
+    PCA adaptation is opt-in and requires a separately supplied calibration tensor;
+    callers must establish its provenance/disjointness. Search-mode and threshold
+    overrides are always restored, including when a forward or scoring call fails.
+    Timings include forward execution and CUDA synchronization, excluding NLL work.
     """
+    if calibrate_pca and calibration_input_ids is None:
+        raise ValueError("calibrate_pca requires separate calibration_input_ids; evaluation tokens cannot calibrate the selector")
     if not HAS_TORCH:
         raise RuntimeError("evaluate_modern_text_perplexity_and_dlsa requires PyTorch.")
-
-    from train_spark_dlsa import capture_loop72_global_visit_qkv, fit_loop72_visit_bank_pca
-
+    if int(seq_len) < 2:
+        raise ValueError("seq_len must be at least two")
     device = next(model.base.parameters()).device
-    raw_text = build_modern_long_eval_stream(target_tokens=seq_len + 256, tokenizer=tokenizer)
-    enc = tokenizer.encode(raw_text, add_special_tokens=False)[: int(seq_len)]
-    input_ids = torch.tensor([enc], dtype=torch.long, device=device)
-    actual_len = int(input_ids.shape[1])
-
+    raw_text = eval_text if eval_text is not None else build_modern_long_eval_stream(target_tokens=int(seq_len) + 256, tokenizer=tokenizer)
+    ids = tokenizer.encode(raw_text, add_special_tokens=False)[:int(seq_len)]
+    if len(ids) < 2:
+        raise ValueError("evaluation text must contain at least two tokens")
+    input_ids = torch.tensor([ids], dtype=torch.long, device=device)
+    actual_len = len(ids)
     bank = getattr(model, "dlsa_index_bank", None)
     sparse_cfg = getattr(model, "sparse_attention_cfg", None)
-    pca_info: Optional[Dict[int, Any]] = None
-
-    if calibrate_pca and bank is not None:
-        cal_len = min(actual_len, 1024)
-        qkv_map = capture_loop72_global_visit_qkv(model, input_ids[:, :cal_len])
-        samples = {gv: [(q_t, k_t)] for gv, (q_t, k_t, _) in qkv_map.items()}
-        pca_info = fit_loop72_visit_bank_pca(bank, samples)
-
-    def _eval_nll(logits: torch.Tensor, ids: torch.Tensor) -> Tuple[float, float]:
-        shift_logits = logits[:, :-1, :].float().contiguous()
-        shift_labels = ids[:, 1:].contiguous()
-        nll = float(
-            F.cross_entropy(
-                shift_logits.view(-1, shift_logits.shape[-1]),
-                shift_labels.view(-1),
-            ).item()
-        )
-        ppl = math.exp(min(20.0, nll))
-        return round(nll, 6), round(ppl, 4)
-
+    saved_threshold = getattr(sparse_cfg, "exact_threshold", None)
+    saved_modes = [(indexer.cfg, indexer.cfg.search_mode) for indexer in bank.visit_indexers.values()] if bank is not None else []
+    was_training = getattr(model, "training", None)
+    pca_info = None
     results: Dict[str, Any] = {}
+    ledger_snapshot = None
 
-    # 1. 36L Base (loop off)
-    t0 = time.perf_counter()
-    with model.loop_config(passes=1, use_mhc=False, use_engram=False, enable_p3=False, use_esm=False):
-        if sparse_cfg is not None:
-            saved_thr = sparse_cfg.exact_threshold
-            sparse_cfg.exact_threshold = actual_len + 1024
-        try:
-            logits_36 = model.forward_logits(input_ids)
-        finally:
-            if sparse_cfg is not None:
-                sparse_cfg.exact_threshold = saved_thr
-    nll_36, ppl_36 = _eval_nll(logits_36, input_ids)
-    results["36L_Base_Dense"] = {
-        "effective_visits": 36,
-        "nll": nll_36,
-        "ppl": ppl_36,
-        "latency_sec": round(time.perf_counter() - t0, 4),
-    }
-    del logits_36
+    def sync() -> None:
+        if getattr(device, "type", str(device).split(":")[0]) == "cuda":
+            torch.cuda.synchronize(device)
 
-    # 2. 72L Loop Dense Reference
-    t0 = time.perf_counter()
-    if sparse_cfg is not None:
-        saved_thr = sparse_cfg.exact_threshold
-        sparse_cfg.exact_threshold = actual_len + 1024
+    def nll_ppl(logits: Any) -> Tuple[float, float]:
+        # Bound FP32 vocabulary workspace instead of copying every token's logits.
+        total_loss, total_labels = 0.0, 0
+        for start in range(0, actual_len - 1, 64):
+            end = min(actual_len - 1, start + 64)
+            labels = input_ids[:, start + 1:end + 1].contiguous().view(-1)
+            loss = F.cross_entropy(logits[:, start:end].float().reshape(-1, logits.shape[-1]), labels, reduction="sum")
+            total_loss += float(loss.item())
+            total_labels += int(labels.numel())
+        nll = total_loss / total_labels
+        return nll, math.exp(nll) if nll < 700.0 else float("inf")
+
+    def timed_forward(cache: Any = None) -> Tuple[Any, float]:
+        sync()
+        started = time.perf_counter()
+        if cache is None:
+            logits = model.forward_logits(input_ids)
+        else:
+            logits = model.forward_logits(input_ids, past_key_values=cache,
+                                          chunk_size=getattr(model.settings, "prefill_chunk_tokens", 2048))
+        sync()
+        return logits, time.perf_counter() - started
+
     try:
-        cache_dense = model.make_inference_cache(session_id="bench_72l_dense")
-        logits_72_dense = model.forward_logits(
-            input_ids,
-            past_key_values=cache_dense,
-            chunk_size=getattr(model.settings, "prefill_chunk_tokens", 2048),
-        )
+        if hasattr(model, "eval"):
+            model.eval()
+        if calibrate_pca:
+            if bank is None:
+                raise ValueError("calibration requested but no D-LSA index bank is attached")
+            cal = calibration_input_ids.to(device)
+            if cal.ndim != 2 or cal.shape[0] != 1 or cal.shape[1] < 2:
+                raise ValueError("calibration_input_ids must have shape [1, >=2]")
+            smaller = min(int(cal.shape[1]), actual_len)
+            if torch.equal(cal[:, :smaller], input_ids[:, :smaller]):
+                raise ValueError("calibration tokens overlap the evaluation prefix")
+            from train_spark_dlsa import capture_loop72_global_visit_qkv, fit_loop72_visit_bank_pca
+            captured = capture_loop72_global_visit_qkv(model, cal)
+            pca_info = fit_loop72_visit_bank_pca(bank, {gv: [(q, k)] for gv, (q, k, _) in captured.items()})
+        if sparse_cfg is not None:
+            sparse_cfg.exact_threshold = actual_len + 1024
+        with model.loop_config(passes=1, use_mhc=False, use_engram=False, enable_p3=False, use_esm=False):
+            logits36, latency = timed_forward()
+        nll36, ppl36 = nll_ppl(logits36)
+        results["36L_Base_Dense"] = {"effective_visits": 36, "nll": nll36, "ppl": ppl36, "latency_sec": latency}
+        del logits36
+        dense_cache = model.make_inference_cache(session_id="ppl_dense")
+        dense, latency = timed_forward(dense_cache)
+        nll_dense, ppl_dense = nll_ppl(dense)
+        results["72L_Loop_Dense"] = {"effective_visits": model.total_virtual_layers,
+                                     "nll": nll_dense, "ppl": ppl_dense, "latency_sec": latency,
+                                     "delta_nll_vs_36L": nll_dense - nll36}
+        del dense_cache
+        if bank is not None and sparse_cfg is not None:
+            sparse_cfg.exact_threshold = min(1024, max(1, actual_len // 2))
+            for mode in ("flat", "tree"):
+                for config, _ in saved_modes:
+                    config.search_mode = mode
+                cache = model.make_inference_cache(session_id=f"ppl_{mode}")
+                logits, latency = timed_forward(cache)
+                nll, ppl = nll_ppl(logits)
+                absolute_sum, elements = 0.0, 0
+                for start in range(0, actual_len, 64):
+                    delta = (logits[:, start:start + 64].float() - dense[:, start:start + 64].float()).abs()
+                    absolute_sum += float(delta.sum().item())
+                    elements += int(delta.numel())
+                results[f"72L_Loop_DLSA_{mode.capitalize()}"] = {
+                    "effective_visits": model.total_virtual_layers, "search_mode": mode,
+                    "nll": nll, "ppl": ppl, "latency_sec": latency,
+                    "delta_nll_vs_72L_dense": nll - nll_dense, "delta_nll_vs_36L": nll - nll36,
+                    "mean_abs_logit_diff_vs_72L_dense": absolute_sum / max(1, elements),
+                }
+                if ledger_snapshot is None:
+                    ledger_snapshot = cache.memory_ledger()
+                del logits, cache
+        del dense
     finally:
         if sparse_cfg is not None:
-            sparse_cfg.exact_threshold = saved_thr
-    nll_72d, ppl_72d = _eval_nll(logits_72_dense, input_ids)
-    results["72L_Loop_Dense"] = {
-        "effective_visits": model.total_virtual_layers,
-        "nll": nll_72d,
-        "ppl": ppl_72d,
-        "delta_nll_vs_36L": round(nll_72d - nll_36, 6),
-        "latency_sec": round(time.perf_counter() - t0, 4),
-    }
+            sparse_cfg.exact_threshold = saved_threshold
+        for config, search_mode in saved_modes:
+            config.search_mode = search_mode
+        if was_training is not None and hasattr(model, "train"):
+            model.train(was_training)
+    return {"status": "completed", "seq_len": actual_len,
+            "evaluation_kind": "supplied_text_diagnostic" if eval_text is not None else "synthetic_repeated_text_diagnostic",
+            "held_out_quality_verified": False, "evaluation_provenance": evaluation_provenance,
+            "pca_calibrated_visits": len(pca_info) if pca_info else 0,
+            "calibration_provenance_verified": False if calibrate_pca else None,
+            "timing_scope": "synchronized_forward_only_excludes_nll",
+            "modes": results, "paged_cache_memory_ledger": ledger_snapshot}
 
-    # 3. 72L Loop + Paged D-LSA (Flat & Tree)
-    ledger_snapshot: Optional[Dict[str, Any]] = None
-    if bank is not None and sparse_cfg is not None:
-        saved_thr = sparse_cfg.exact_threshold
-        # Force sparse path active at `seq_len` (use threshold = min(1024, actual_len // 2))
-        sparse_cfg.exact_threshold = min(1024, max(128, actual_len // 2))
-        try:
-            for mode in ("flat", "tree"):
-                for indexer in bank.visit_indexers.values():
-                    indexer.cfg.search_mode = mode
-                t0 = time.perf_counter()
-                cache_sp = model.make_inference_cache(session_id=f"bench_72l_dlsa_{mode}")
-                logits_sp = model.forward_logits(
-                    input_ids,
-                    past_key_values=cache_sp,
-                    chunk_size=getattr(model.settings, "prefill_chunk_tokens", 2048),
-                )
-                dt = time.perf_counter() - t0
-                nll_sp, ppl_sp = _eval_nll(logits_sp, input_ids)
-                logit_diff = float((logits_sp.float() - logits_72_dense.float()).abs().mean().item())
-                if ledger_snapshot is None:
-                    ledger_snapshot = cache_sp.memory_ledger()
-                results[f"72L_Loop_DLSA_{mode.capitalize()}"] = {
-                    "effective_visits": model.total_virtual_layers,
-                    "search_mode": mode,
-                    "nll": nll_sp,
-                    "ppl": ppl_sp,
-                    "delta_nll_vs_72L_dense": round(nll_sp - nll_72d, 6),
-                    "delta_nll_vs_36L": round(nll_sp - nll_36, 6),
-                    "mean_abs_logit_diff_vs_72L_dense": round(logit_diff, 6),
-                    "latency_sec": round(dt, 4),
-                }
-                del logits_sp
-        finally:
-            sparse_cfg.exact_threshold = saved_thr
 
-    del logits_72_dense
-    return {
-        "seq_len": actual_len,
-        "pca_calibrated_visits": len(pca_info) if pca_info else 0,
-        "modes": results,
-        "paged_cache_memory_ledger": ledger_snapshot,
+def _task_result_base(item: Dict[str, Any]) -> Dict[str, Any]:
+    keys = ("id", "row_id", "row_index", "benchmark", "benchmark_id", "category", "source",
+            "evaluation_kind", "protocol", "protocol_variant", "protocol_source", "protocol_source_blob")
+    result = {key: item[key] for key in keys if key in item}
+    result.update(status=item.get("status", "ready"), score=None, raw_score=None, passed=None,
+                  official_comparable=False, reason=item.get("reason"), detail={})
+    return result
+
+
+def score_benchmark_task(item: Dict[str, Any], response: str) -> Dict[str, Any]:
+    """Score one final answer; unavailable evaluators are never recorded as 0/100.
+
+    Scores are percentages of the named raw metric. They are only aggregatable
+    within an identical benchmark/protocol/metric, never as a suite-wide average.
+    Official prompts and scorers do not establish sampling/release comparability.
+    """
+    result = _task_result_base(item)
+    if result["status"] not in ("ready", "completed"):
+        return result
+    kind, verifier = item.get("evaluation_kind", "diagnostic"), item.get("verifier", "")
+    if kind == "official" and item.get("protocol") not in LOCAL_OFFICIAL_PROTOCOLS.values():
+        result.update(status="unsupported", reason="requires_official_evaluator")
+        return result
+    try:
+        detail: Dict[str, Any]
+        if verifier == "graphwalks_f1":
+            detail = score_graphwalks_bfs_f1(response, item["gold_nodes"])
+            raw, passed, metric = float(detail["f1"]), detail["f1"] == 1.0, "node_set_f1"
+        elif verifier == "mrcr":
+            detail = score_mrcr_v2_response(response, item["gold_answer"], item.get("random_string_to_prepend"))
+            if detail.get("score") is None:
+                result.update(status=detail.get("status", "invalid"), reason=detail.get("reason"), detail=detail)
+                return result
+            raw, passed = float(detail["score"]), bool(detail["exact_match"])
+            metric = "sequence_match_ratio" if "random_string_to_prepend" in item else "synthetic_tag_exact_match"
+        elif verifier == "mcq" and item.get("parser") == "longbench_v2_official":
+            # Exact upstream parser from pred.py blob 1c20cba9edfa3675dc944ee10db5334fbd39a118.
+            text = response.replace("*", "")
+            match = re.search(r"The correct answer is \(([A-D])\)", text)
+            if match is None:
+                match = re.search(r"The correct answer is ([A-D])", text)
+            predicted = match.group(1) if match else None
+            passed = predicted == item["mcq_spec"]["gold_letter"]
+            raw, metric, detail = float(passed), "accuracy", {"predicted": predicted}
+        else:
+            verdicts = {
+                "math": lambda: verify_math_answer(response, item["gold"]),
+                "mcq": lambda: verify_mcq_choice(response, item["mcq_spec"]),
+                "ifeval": lambda: verify_ifeval_constraints(response, item["ifeval_spec"]),
+                "json": lambda: verify_json_schema(response, item["schema"]),
+                "bfcl_tool": lambda: verify_bfcl_tool_call(response, item["tool_spec"]),
+            }
+            # Executable toy tasks stay explicit smoke tests. HF repository or
+            # agent tasks must go through their external task environments.
+            if kind == "smoke":
+                verdicts.update({
+                    "swe_sandbox": lambda: verify_swe_patch_in_sandbox(response, item["swe_spec"]),
+                    "scicode_sandbox": lambda: verify_scicode_in_sandbox(response, item),
+                    "code": lambda: verify_code_stdio(response, item["test_cases"]),
+                    "terminal_bench": lambda: verify_terminal_bench_task(response, item["terminal_spec"]),
+                    "gdpval": lambda: verify_gdpval_deliverable(response, item["gdpval_spec"]),
+                })
+            if verifier == "omniscience" and kind == "smoke":
+                detail = score_aa_omniscience_v11(response, item["gold"], bool(item.get("should_abstain", False)))
+                raw, passed, metric = detail["normalized_score"] / 100.0, bool(detail["passed"]), "toy_abstention_score"
+            elif verifier in verdicts:
+                verdict = verdicts[verifier]()
+                detail = dict(verdict.detail or {})
+                if detail.get("status") == "unsupported" or ("score" in detail and detail["score"] is None):
+                    result.update(status="unsupported", reason=verdict.reason, detail=detail)
+                    return result
+                raw = float(detail.get("score", float(verdict.ok)))
+                passed, metric = bool(verdict.ok), f"diagnostic_{verifier}"
+            else:
+                result.update(status="unsupported", reason="no_executable_official_evaluator")
+                return result
+        result.update(status="completed", score=100.0 * raw, raw_score=raw, passed=bool(passed),
+                      metric=metric, reason=None, detail=detail)
+    except Exception as exc:
+        result.update(status="error", reason=f"scoring_error:{type(exc).__name__}:{exc}")
+    return result
+
+
+def _split_model_response(raw: str, text: str, prompt_has_open_think: bool = False) -> Dict[str, Any]:
+    """Keep reasoning out of answer-only scorers without inventing closing tokens."""
+    if "</think>" in raw:
+        reasoning, final_raw = raw.rsplit("</think>", 1)
+        final = text.rsplit("</think>", 1)[-1] if "</think>" in text else final_raw
+        return {"response": final, "reasoning": reasoning.removeprefix("<think>"), "thinking_complete": True}
+    if prompt_has_open_think or "<think>" in raw:
+        return {"response": "", "reasoning": text, "thinking_complete": False}
+    return {"response": text, "reasoning": "", "thinking_complete": True}
+
+
+def _configured_context_limit(model: Any) -> Optional[int]:
+    for cfg in (getattr(model, "paged_cache_cfg", None), getattr(model, "settings", None)):
+        value = getattr(cfg, "context_limit_tokens", None)
+        if value is not None:
+            return int(value)
+    return None
+
+
+@_no_grad()
+def evaluate_benchmark_task(
+    model: Any,
+    tokenizer: Any,
+    item: Dict[str, Any],
+    max_new_tokens: int = 8192,
+    generation_options: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Generate and score one row, preserving raw conversations and token budgets.
+
+    No gold enters generation, no prompts are truncated, and no extra generation
+    is hidden outside max_new_tokens. Context overflow and template failures are
+    reported explicitly. This public single-row API supports streaming runners.
+    """
+    result = _task_result_base(item)
+    if result["status"] != "ready":
+        return result
+    if not HAS_TORCH or model is None or tokenizer is None:
+        result.update(status="blocked", reason="model_tokenizer_and_pytorch_required")
+        return result
+    if int(max_new_tokens) <= 0:
+        result.update(status="invalid", reason="max_new_tokens_must_be_positive")
+        return result
+    options: Dict[str, Any] = {
+        "do_sample": False, "temperature": 1.0, "top_p": 1.0, "top_k": 0,
+        "repetition_penalty": 1.0, "no_repeat_ngram_size": 0,
+        "force_think_close": False, "min_think_tokens": 0,
     }
+    options.update(generation_options or {})
+    reserved = {"input_ids", "cache", "past_key_values", "tokenizer", "stream_print", "max_new_tokens"}
+    if reserved.intersection(options):
+        result.update(status="invalid", reason="generation_options_contains_reserved_keys")
+        return result
+    if item.get("evaluation_kind") == "official" and (options.get("force_think_close")
+            or options.get("repetition_penalty") != 1.0 or options.get("no_repeat_ngram_size", 0) != 0
+            or options.get("min_think_tokens", 0) != 0):
+        result.update(status="invalid", reason="official_protocol_forbids_answer_forcing_or_repetition_bias")
+        return result
+    if "force_think_close" not in inspect.signature(model.generate_cached).parameters:
+        result.update(status="unsupported", reason="runtime_cannot_disable_forced_thinking_close")
+        return result
+    messages = item.get("messages")
+    if messages is None:
+        if not isinstance(item.get("prompt"), str) or not item["prompt"]:
+            result.update(status="invalid", reason="missing_prompt")
+            return result
+        messages = [{"role": "user", "content": item["prompt"]}]
+    try:
+        chat_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+        if isinstance(chat_ids, dict):
+            chat_ids = chat_ids["input_ids"]
+        elif hasattr(chat_ids, "input_ids"):
+            chat_ids = chat_ids.input_ids
+        if hasattr(chat_ids, "tolist"):
+            chat_ids = chat_ids.tolist()
+        if chat_ids and isinstance(chat_ids[0], list):
+            if len(chat_ids) != 1:
+                raise ValueError("single task requires one prompt")
+            chat_ids = chat_ids[0]
+        if not chat_ids:
+            raise ValueError("empty chat template output")
+        prompt_text = tokenizer.decode(chat_ids, skip_special_tokens=False)
+    except Exception as exc:
+        result.update(status="unsupported", reason=f"chat_template_error:{type(exc).__name__}:{exc}")
+        return result
+    result.update(prompt_tokens=len(chat_ids), max_new_tokens=int(max_new_tokens),
+                  generation_options=options.copy(), prompt_truncated=False,
+                  prompt_sha256=hashlib.sha256(json.dumps(messages, ensure_ascii=False, sort_keys=True).encode()).hexdigest())
+    context_limit = _configured_context_limit(model)
+    if context_limit is not None and len(chat_ids) + int(max_new_tokens) > context_limit:
+        result.update(status="blocked", reason="prompt_plus_output_budget_exceeds_configured_context",
+                      configured_context_limit=context_limit)
+        return result
+    started = time.perf_counter()
+    try:
+        device = next(model.base.parameters()).device
+        inp = torch.tensor([chat_ids], dtype=torch.long, device=device)
+        cache = model.make_inference_cache(session_id=f"bench_{item.get('id', 'task')}")
+        model.last_generation_timing = None
+        output = model.generate_cached(inp, max_new_tokens=int(max_new_tokens), tokenizer=tokenizer,
+                                       stream_print=False, cache=cache, **options)
+        token_ids = output[0, len(chat_ids):].tolist()
+        if len(token_ids) > int(max_new_tokens):
+            raise RuntimeError("runtime exceeded max_new_tokens")
+        raw = tokenizer.decode(token_ids, skip_special_tokens=False)
+        text = tokenizer.decode(token_ids, skip_special_tokens=True)
+        prompt_has_open_think = prompt_text.rfind("<think>") > prompt_text.rfind("</think>")
+        separated = _split_model_response(raw, text, prompt_has_open_think)
+        for special in getattr(tokenizer, "all_special_tokens", []):
+            separated["response"] = separated["response"].replace(special, "")
+        timing = dict(getattr(model, "last_generation_timing", None) or {})
+        result.update(raw_response=raw, **separated, generated_tokens=len(token_ids),
+                      wall_time_sec=time.perf_counter() - started, timing=timing,
+                      finish_reason=timing.get("finish_reason", "length" if len(token_ids) == int(max_new_tokens) else "unknown"))
+        # An unfinished think segment is observable model output. Score its empty
+        # final answer under the task protocol; never mine reasoning for gold.
+        result.update(score_benchmark_task(item, separated["response"]))
+        result["output_incomplete"] = not separated["thinking_complete"]
+    except Exception as exc:
+        result.update(status="error", score=None, raw_score=None, passed=None,
+                      reason=f"generation_error:{type(exc).__name__}:{exc}",
+                      wall_time_sec=time.perf_counter() - started)
+    return result
 
 
 @_no_grad()
 def evaluate_selected_benchmark_tasks(
     model: Any,
     tokenizer: Any,
-    max_new_tokens: int = 768,
+    max_new_tokens: int = 8192,
     graphwalks_nodes: int = 64,
     mrcr_rounds: int = 16,
-    hf_samples: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    hf_samples: Optional[Dict[str, Any]] = None,
     include_hf_streamed: bool = True,
-    max_hf_per_benchmark: int = 1,
+    max_hf_per_benchmark: Optional[int] = None,
+    include_smoke: bool = False,
+    task_mode: str = "official",
+    generation_options: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Run live generation across both:
-      1. Real streamed problems from official Hugging Face benchmark datasets (`hf_samples` / `try_load_hf_benchmark_samples`), converted via `convert_hf_row_to_eval_task` and scored by real verifiers (`[HF-Real]`).
-      2. The full 25-task executable & sandboxed benchmark suite (`GraphWalks BFS 256k & 1M`, `OpenAI MRCR v2 256k-512k & 512k-1M`,
-         `Gaokao 2026`, `AIME 2026`, `HMMT Feb 26`, `IMO-AnswerBench`, `AA-LCRv1.1`, `LongBench v2`, `IFEval`, `IFBench`,
-         `HLE(w/o tools)`, `GPQA`, `GPQA Diamond`, `BFCL-V4`, `tau2-bench`, `MCP-Atlas`, `SWE Pro`, `SWE Verified`,
-         `SWE Multilingual`, `SciCode`, `AA-Omniscience v1.1`, `Terminal-Bench 4.0`, `openai/gdpval`) under `72L Loop + Paged D-LSA`.
+    """Evaluate supplied rows with explicit scope and no implicit synthetic tasks.
+
+    None means every supplied row, including generators. This does not establish
+    that supplied rows are a complete official split: the full runner records and
+    validates dataset revisions, filters and expected row counts independently.
+    Unpinned convenience downloads are available only in diagnostic sample mode.
     """
-    if not HAS_TORCH:
-        raise RuntimeError("evaluate_selected_benchmark_tasks requires PyTorch.")
-
-    device = next(model.base.parameters()).device
-
-    def _generate_one(
-        prompt_text: str,
-        answer_hint: str = "Final Answer: ",
-        cont_budget: int = 192,
-    ) -> Tuple[str, float, Dict[str, Any]]:
-        t0 = time.perf_counter()
-        guided_prompt = (
-            prompt_text
-            + "\n\nKeep your <think> reasoning concise and direct (under 180 words), then close </think> and provide the required final output."
-        )
-        messages = [{"role": "user", "content": guided_prompt}]
-        try:
-            chat_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
-            if hasattr(chat_ids, "input_ids"):
-                chat_ids = chat_ids.input_ids
-            inp = torch.tensor([chat_ids], dtype=torch.long, device=device)
-        except Exception:
-            enc = tokenizer.encode(guided_prompt, add_special_tokens=True)
-            inp = torch.tensor([enc], dtype=torch.long, device=device)
-
-        cache = model.make_inference_cache(session_id="eval_task_live") if hasattr(model, "make_inference_cache") else None
-        gen_kwargs: Dict[str, Any] = {
-            "max_new_tokens": int(max_new_tokens),
-            "temperature": 0.2,
-            "top_p": 0.95,
-            "do_sample": False,
-            "tokenizer": tokenizer,
-            "stream_print": False,
-        }
-        if cache is not None:
-            gen_kwargs["cache"] = cache
-
-        out_ids = model.generate_cached(inp, **gen_kwargs)
-        gen_ids = out_ids[0, inp.shape[1]:].tolist()
-        txt = tokenizer.decode(gen_ids, skip_special_tokens=True)
-        try:
-            raw_txt = tokenizer.decode(gen_ids, skip_special_tokens=False)
-        except Exception:
-            raw_txt = txt
-        timing = dict(getattr(model, "last_generation_timing", None) or {})
-
-        # Think-Budget Conclusion Forcing:
-        # `apply_chat_template(..., add_generation_prompt=True)` places `<think>` inside `inp`,
-        # so `gen_ids` begins inside `<think>` and only closes when `</think>` is emitted.
-        think_closed = ("</think>" in raw_txt) or ("</think>" in txt)
-        post_think = raw_txt.split("</think>")[-1] if "</think>" in raw_txt else (txt.split("</think>")[-1] if "</think>" in txt else "")
-        force_prefix: Optional[str] = None
-        if not think_closed:
-            force_prefix = f"\n</think>\n{answer_hint}"
-        elif answer_hint.startswith("Final Answer: \\boxed{") and "\\boxed{" not in post_think:
-            force_prefix = f"\n{answer_hint}"
-        elif answer_hint.startswith("```python") and "def " not in post_think and "class " not in post_think:
-            force_prefix = f"\n{answer_hint}"
-
-        if force_prefix is not None and hasattr(tokenizer, "encode"):
-            try:
-                suffix_enc = tokenizer.encode(force_prefix, add_special_tokens=False)
-                if suffix_enc:
-                    suffix_inp = torch.tensor([suffix_enc], dtype=torch.long, device=device)
-                    cont_kwargs: Dict[str, Any] = {
-                        "max_new_tokens": int(cont_budget),
-                        "temperature": 0.2,
-                        "top_p": 0.95,
-                        "do_sample": False,
-                        "tokenizer": tokenizer,
-                        "stream_print": False,
-                    }
-                    if cache is not None:
-                        cont_kwargs["cache"] = cache
-                        cont_out = model.generate_cached(suffix_inp, **cont_kwargs)
-                        cont_ids = cont_out[0, suffix_inp.shape[1]:].tolist()
-                    else:
-                        full_inp = torch.cat([out_ids, suffix_inp], dim=1)
-                        cont_out = model.generate_cached(full_inp, **cont_kwargs)
-                        cont_ids = cont_out[0, full_inp.shape[1]:].tolist()
-                    cont_txt = tokenizer.decode(cont_ids, skip_special_tokens=True)
-                    txt = txt + force_prefix + cont_txt
-            except Exception:
-                txt = txt + force_prefix
-
-        del cache
-        return txt, round(time.perf_counter() - t0, 3), timing
-
-    hint_map = {
-        "math": "Final Answer: \\boxed{",
-        "mcq": "Final Answer: \\boxed{",
-        "omniscience": "Final Answer: \\boxed{",
-        "graphwalks_f1": "Final Answer: \\boxed{",
-        "mrcr": "Final Answer: \\boxed{",
-        "ifeval": "",
-        "mcp_claims": "",
-        "json": "```json\n",
-        "bfcl_tool": "```json\n",
-        "gdpval": "```json\n",
-        "code": "```python\n",
-        "scicode_sandbox": "```python\n",
-        "swe_sandbox": "```python\n",
-        "swe_hf_patch": "```python\n",
-        "terminal_bench": "```bash\n",
-        "terminal_hf": "```python\n",
-        "gdpval_hf": "",
-    }
-
-    def _score_task_item(item: Dict[str, Any], resp: str) -> Tuple[bool, float, Dict[str, Any]]:
-        v_type = str(item.get("verifier", ""))
-        if v_type == "math":
-            res = verify_math_answer(resp, item["gold"])
-            passed = bool(res.ok)
-            return passed, (100.0 if passed else 0.0), res.detail
-        if v_type == "mcq":
-            res = verify_mcq_choice(resp, item["mcq_spec"])
-            passed = bool(res.ok)
-            return passed, round(float(res.detail.get("score", 1.0 if passed else 0.0)) * 100.0, 2), res.detail
-        if v_type == "ifeval":
-            res = verify_ifeval_constraints(resp, item["ifeval_spec"])
-            passed = bool(res.ok)
-            return passed, round(float(res.detail.get("score", 1.0 if passed else 0.0)) * 100.0, 2), res.detail
-        if v_type == "graphwalks_f1":
-            gw_sc = score_graphwalks_bfs_f1(resp, item["gold_nodes"])
-            return gw_sc["f1"] >= 0.5, round(gw_sc["f1"] * 100.0, 2), gw_sc
-        if v_type == "mrcr":
-            m_sc = score_mrcr_v2_response(resp, item["gold_answer"])
-            return bool(m_sc["exact_match"]), round(m_sc["score"] * 100.0, 2), m_sc
-        if v_type == "mcp_claims":
-            claims = item.get("mcp_claims", [])
-            cleaned_r = extract_answer_segment(resp).lower()
-            hits = 0
-            for cl in claims:
-                words = [w for w in re.findall(r"[a-z0-9]{4,}", str(cl).lower()) if w not in ("that", "this", "with", "from", "have", "were")]
-                if not words or sum(1 for w in words if w in cleaned_r) >= max(1, len(words) // 2):
-                    hits += 1
-            cov = hits / max(1, len(claims))
-            return cov >= 0.5, round(cov * 100.0, 2), {"claim_coverage": round(cov, 4), "claims_total": len(claims)}
-        if v_type == "swe_hf_patch":
-            spec = item["swe_hf_spec"]
-            added = spec.get("added_lines", [])
-            seg = extract_answer_segment(resp)
-            norm_seg = re.sub(r"\s+", "", seg)
-            matched = sum(1 for ln in added if re.sub(r"\s+", "", ln) in norm_seg)
-            sc = matched / max(1, len(added))
-            return sc >= 0.5, round(sc * 100.0, 2), {"matched_added_lines": matched, "total_added_lines": len(added)}
-        if v_type == "terminal_hf":
-            seg = extract_answer_segment(resp)
-            code = extract_code(seg) or seg
-            has_impl = any(kw in code for kw in ("def ", "import ", "#!/", "python", "return "))
-            return has_impl, (100.0 if has_impl else 0.0), {"has_implementation": has_impl}
-        if v_type == "gdpval_hf":
-            criteria = item["gdpval_hf_spec"].get("criteria", [])
-            seg_l = extract_answer_segment(resp).lower()
-            if not criteria:
-                ok_g = len(seg_l) >= 40
-                return ok_g, (100.0 if ok_g else 0.0), {}
-            hits = 0
-            for cr in criteria:
-                kws = [w for w in re.findall(r"[a-z0-9]{4,}", cr.lower()) if w not in ("that", "this", "with", "from", "the", "file", "must", "should")]
-                if not kws or sum(1 for w in kws if w in seg_l) >= max(1, len(kws) // 3):
-                    hits += 1
-            sc = hits / max(1, len(criteria))
-            return sc >= 0.5, round(sc * 100.0, 2), {"criteria_met": hits, "criteria_total": len(criteria)}
-        if v_type == "json":
-            res = verify_json_schema(resp, item["schema"])
-            passed = bool(res.ok)
-            return passed, round(float(res.detail.get("score", 1.0 if passed else 0.0)) * 100.0, 2), res.detail
-        if v_type == "bfcl_tool":
-            res = verify_bfcl_tool_call(resp, item["tool_spec"])
-            passed = bool(res.ok)
-            return passed, round(float(res.detail.get("score", 1.0 if passed else 0.0)) * 100.0, 2), res.detail
-        if v_type == "swe_sandbox":
-            res = verify_swe_patch_in_sandbox(resp, item["swe_spec"])
-            passed = bool(res.ok)
-            return passed, round(float(res.detail.get("score", 1.0 if passed else 0.0)) * 100.0, 2), res.detail
-        if v_type == "scicode_sandbox":
-            res = verify_scicode_in_sandbox(resp, item)
-            passed = bool(res.ok)
-            return passed, round(float(res.detail.get("score", 1.0 if passed else 0.0)) * 100.0, 2), res.detail
-        if v_type == "code":
-            res = verify_code_stdio(resp, item["test_cases"])
-            passed = bool(res.ok)
-            return passed, round(float(res.detail.get("score", 1.0 if passed else 0.0)) * 100.0, 2), res.detail
-        if v_type == "omniscience":
-            omni = score_aa_omniscience_v11(resp, item["gold"], should_abstain=bool(item.get("should_abstain", False)))
-            return bool(omni["passed"]), float(omni["normalized_score"]), omni
-        if v_type == "terminal_bench":
-            res = verify_terminal_bench_task(resp, item["terminal_spec"])
-            passed = bool(res.ok)
-            return passed, round(float(res.detail.get("score", 1.0 if passed else 0.0)) * 100.0, 2), res.detail
-        if v_type == "gdpval":
-            res = verify_gdpval_deliverable(resp, item["gdpval_spec"])
-            passed = bool(res.ok)
-            return passed, round(float(res.detail.get("score", 1.0 if passed else 0.0)) * 100.0, 2), res.detail
-        return False, 0.0, {}
-
-    task_reports: List[Dict[str, Any]] = []
-    hf_evaluated_count = 0
-
-    # 0. Stream & Execute Real Official Hugging Face Dataset Problems First (`[HF-Real]`)
-    if include_hf_streamed:
-        if hf_samples is None:
+    if task_mode not in ("official", "diagnostic"):
+        raise ValueError("task_mode must be 'official' or 'diagnostic'")
+    if max_hf_per_benchmark is not None and int(max_hf_per_benchmark) < 0:
+        raise ValueError("max_hf_per_benchmark cannot be negative")
+    reports: List[Dict[str, Any]] = []
+    dataset_reports: Dict[str, Any] = {}
+    setup_reason = None
+    if hf_samples is None and include_hf_streamed:
+        if task_mode == "official" or max_hf_per_benchmark is None:
+            hf_samples = {}
+            setup_reason = "full_or_official_execution_requires_explicit_pinned_dataset_rows"
+        else:
             hf_samples = try_load_hf_benchmark_samples(max_per_dataset=int(max_hf_per_benchmark))
-        if hf_samples:
-            for b_name, rows in hf_samples.items():
-                added_for_bench = 0
-                for r_idx, row in enumerate(rows):
-                    if added_for_bench >= int(max_hf_per_benchmark):
-                        break
-                    hf_task = convert_hf_row_to_eval_task(b_name, row, row_idx=r_idx)
-                    if hf_task is None:
-                        continue
-                    v_type = str(hf_task["verifier"])
-                    c_budget = 256 if v_type in ("scicode_sandbox", "swe_sandbox", "code", "ifeval") else 128
-                    resp, sec, timing = _generate_one(
-                        hf_task["prompt"],
-                        answer_hint=hint_map.get(v_type, "Final Answer: "),
-                        cont_budget=c_budget,
-                    )
-                    passed, sc, det = _score_task_item(hf_task, resp)
-                    task_reports.append({
-                        "id": hf_task["id"],
-                        "benchmark": hf_task["benchmark"],
-                        "category": hf_task["category"],
-                        "source": "hf_real",
-                        "official_spark_x26_score": hf_task["official_spark_x26_score"],
-                        "passed": passed,
-                        "score": sc,
-                        "details": det,
-                        "latency_sec": sec,
-                        "ttft_ms": timing.get("ttft_ms", 0.0),
-                        "prefill_tok_per_s": timing.get("prefill_tok_per_s", 0.0),
-                        "decode_tok_per_s": timing.get("decode_tok_per_s", 0.0),
-                        "e2e_tok_per_s": timing.get("e2e_tok_per_s", 0.0),
-                        "itl_p50_ms": timing.get("itl_p50_ms", 0.0),
-                    })
-                    added_for_bench += 1
-                    hf_evaluated_count += 1
-
-    # 1. GraphWalks BFS 256k F1
-    gw_item = generate_graphwalks_bfs_instance(num_nodes=graphwalks_nodes, branching=2, target_depth=2, seed=42)
-    gw_resp, gw_sec, gw_timing = _generate_one(gw_item["prompt"], answer_hint="Final Answer: \\boxed{")
-    gw_score = score_graphwalks_bfs_f1(gw_resp, gw_item["gold_nodes"])
-    task_reports.append({
-        "id": "graphwalks_bfs_256k",
-        "benchmark": "Graphwalks bfs 256k f1",
-        "category": "Long Context",
-        "official_spark_x26_score": 92.2,
-        "passed": gw_score["f1"] >= 0.5,
-        "score": round(gw_score["f1"] * 100.0, 2),
-        "details": gw_score,
-        "latency_sec": gw_sec,
-        "ttft_ms": gw_timing.get("ttft_ms", 0.0),
-        "prefill_tok_per_s": gw_timing.get("prefill_tok_per_s", 0.0),
-        "decode_tok_per_s": gw_timing.get("decode_tok_per_s", 0.0),
-        "e2e_tok_per_s": gw_timing.get("e2e_tok_per_s", 0.0),
-        "itl_p50_ms": gw_timing.get("itl_p50_ms", 0.0),
-    })
-
-    # 2. GraphWalks BFS 1M F1 (deeper multi-hop horizon)
-    gw1m_item = generate_graphwalks_bfs_instance(num_nodes=max(96, int(graphwalks_nodes * 1.5)), branching=2, target_depth=3, seed=2026)
-    gw1m_resp, gw1m_sec, gw1m_timing = _generate_one(gw1m_item["prompt"], answer_hint="Final Answer: \\boxed{")
-    gw1m_score = score_graphwalks_bfs_f1(gw1m_resp, gw1m_item["gold_nodes"])
-    task_reports.append({
-        "id": "graphwalks_bfs_1m",
-        "benchmark": "Graphwalks bfs 1m f1",
-        "category": "Long Context",
-        "official_spark_x26_score": 34.2,
-        "passed": gw1m_score["f1"] >= 0.3,
-        "score": round(gw1m_score["f1"] * 100.0, 2),
-        "details": gw1m_score,
-        "latency_sec": gw1m_sec,
-        "ttft_ms": gw1m_timing.get("ttft_ms", 0.0),
-        "prefill_tok_per_s": gw1m_timing.get("prefill_tok_per_s", 0.0),
-        "decode_tok_per_s": gw1m_timing.get("decode_tok_per_s", 0.0),
-        "e2e_tok_per_s": gw1m_timing.get("e2e_tok_per_s", 0.0),
-        "itl_p50_ms": gw1m_timing.get("itl_p50_ms", 0.0),
-    })
-
-    # 3. OpenAI MRCR v2 (256k-512k profile)
-    mrcr_item = generate_mrcr_v2_instance(num_rounds=mrcr_rounds, target_occurrence=3, seed=101)
-    mrcr_resp, mrcr_sec, mrcr_timing = _generate_one(mrcr_item["prompt"], answer_hint="Final Answer: \\boxed{")
-    mrcr_score = score_mrcr_v2_response(mrcr_resp, mrcr_item["gold_answer"])
-    task_reports.append({
-        "id": "openai_mrcr_v2_256k_512k",
-        "benchmark": "Openai_MRCR v2 256k-512k",
-        "category": "Long Context",
-        "official_spark_x26_score": 65.6,
-        "passed": mrcr_score["exact_match"],
-        "score": round(mrcr_score["score"] * 100.0, 2),
-        "details": mrcr_score,
-        "latency_sec": mrcr_sec,
-        "ttft_ms": mrcr_timing.get("ttft_ms", 0.0),
-        "prefill_tok_per_s": mrcr_timing.get("prefill_tok_per_s", 0.0),
-        "decode_tok_per_s": mrcr_timing.get("decode_tok_per_s", 0.0),
-        "e2e_tok_per_s": mrcr_timing.get("e2e_tok_per_s", 0.0),
-        "itl_p50_ms": mrcr_timing.get("itl_p50_ms", 0.0),
-    })
-
-    # 4. OpenAI MRCR v2 (512k-1M deeper multi-round profile)
-    mrcr1m_item = generate_mrcr_v2_instance(num_rounds=max(24, int(mrcr_rounds * 1.5)), target_occurrence=4, seed=2026)
-    mrcr1m_resp, mrcr1m_sec, mrcr1m_timing = _generate_one(mrcr1m_item["prompt"], answer_hint="Final Answer: \\boxed{")
-    mrcr1m_score = score_mrcr_v2_response(mrcr1m_resp, mrcr1m_item["gold_answer"])
-    task_reports.append({
-        "id": "openai_mrcr_v2_512k_1m",
-        "benchmark": "Openai_MRCR v2 512k-1M",
-        "category": "Long Context",
-        "official_spark_x26_score": 26.0,
-        "passed": mrcr1m_score["exact_match"],
-        "score": round(mrcr1m_score["score"] * 100.0, 2),
-        "details": mrcr1m_score,
-        "latency_sec": mrcr1m_sec,
-        "ttft_ms": mrcr1m_timing.get("ttft_ms", 0.0),
-        "prefill_tok_per_s": mrcr1m_timing.get("prefill_tok_per_s", 0.0),
-        "decode_tok_per_s": mrcr1m_timing.get("decode_tok_per_s", 0.0),
-        "e2e_tok_per_s": mrcr1m_timing.get("e2e_tok_per_s", 0.0),
-        "itl_p50_ms": mrcr1m_timing.get("itl_p50_ms", 0.0),
-    })
-
-    # 5. Full Executable Suite Across Math, Long Context, General/Knowledge, Agent, and Sandboxed Code
-    for item in SIGNIFICANT_BENCHMARK_SUITE:
-        v_type = str(item["verifier"])
-        c_budget = 256 if v_type in ("scicode_sandbox", "swe_sandbox", "code", "terminal_bench") else 128
-        resp, sec, timing = _generate_one(
-            item["prompt"],
-            answer_hint=hint_map.get(v_type, "Final Answer: "),
-            cont_budget=c_budget,
-        )
-        passed, sc, det = _score_task_item(item, resp)
-        task_reports.append({
-            "id": item["id"],
-            "benchmark": item["benchmark"],
-            "category": item["category"],
-            "source": "sandbox_suite",
-            "official_spark_x26_score": item["official_spark_x26_score"],
-            "passed": passed,
-            "score": sc,
-            "details": det,
-            "latency_sec": sec,
-            "ttft_ms": timing.get("ttft_ms", 0.0),
-            "prefill_tok_per_s": timing.get("prefill_tok_per_s", 0.0),
-            "decode_tok_per_s": timing.get("decode_tok_per_s", 0.0),
-            "e2e_tok_per_s": timing.get("e2e_tok_per_s", 0.0),
-            "itl_p50_ms": timing.get("itl_p50_ms", 0.0),
-        })
-
-    mean_score = round(sum(r["score"] for r in task_reports) / max(1, len(task_reports)), 2)
-    pass_rate = round(sum(1 for r in task_reports if r["passed"]) / max(1, len(task_reports)) * 100.0, 2)
-    mean_decode_tps = round(sum(float(r.get("decode_tok_per_s", 0.0)) for r in task_reports) / max(1, len(task_reports)), 2)
-    mean_e2e_tps = round(sum(float(r.get("e2e_tok_per_s", 0.0)) for r in task_reports) / max(1, len(task_reports)), 2)
-    return {
-        "num_tasks": len(task_reports),
-        "hf_real_tasks_evaluated": hf_evaluated_count,
-        "pass_rate_pct": pass_rate,
-        "mean_score": mean_score,
-        "mean_decode_tok_per_s": mean_decode_tps,
-        "mean_e2e_tok_per_s": mean_e2e_tps,
-        "tasks": task_reports,
-    }
+    if include_hf_streamed:
+        for name, rows in (hf_samples or {}).items():
+            consumed = 0
+            known_size = len(rows) if hasattr(rows, "__len__") else None
+            exhausted = True
+            for index, row in enumerate(rows):
+                if max_hf_per_benchmark is not None and consumed >= int(max_hf_per_benchmark):
+                    exhausted = False
+                    break
+                consumed += 1
+                task = convert_hf_row_to_eval_task(name, row, index, task_mode=task_mode)
+                reports.append(evaluate_benchmark_task(model, tokenizer, task, max_new_tokens, generation_options))
+            dataset_reports[name] = {"supplied_rows": known_size, "attempted_rows": consumed,
+                                     "rows_exhausted": exhausted, "row_cap": max_hf_per_benchmark,
+                                     "full_official_split_verified": False}
+    if include_smoke:
+        for original in SIGNIFICANT_BENCHMARK_SUITE:
+            item = dict(original)
+            reports.append(evaluate_benchmark_task(model, tokenizer, item, max_new_tokens, generation_options))
+        graph = generate_graphwalks_bfs_instance(num_nodes=graphwalks_nodes, seed=2026)
+        memory = generate_mrcr_v2_instance(num_rounds=mrcr_rounds, seed=2026)
+        for item in (
+            {"id": "smoke_graphwalks", "benchmark": "Smoke / GraphWalks", "prompt": graph["prompt"],
+             "gold_nodes": graph["gold_nodes"], "verifier": "graphwalks_f1"},
+            {"id": "smoke_mrcr", "benchmark": "Smoke / MRCR", "prompt": memory["prompt"],
+             "gold_answer": memory["gold_answer"], "verifier": "mrcr"},
+        ):
+            item.update(evaluation_kind="smoke", source="synthetic", status="ready", official_comparable=False)
+            reports.append(evaluate_benchmark_task(model, tokenizer, item, max_new_tokens, generation_options))
+    counts: Dict[str, int] = {}
+    buckets: Dict[Tuple[str, str, str], List[float]] = {}
+    for result in reports:
+        status = result["status"]
+        counts[status] = counts.get(status, 0) + 1
+        if status == "completed" and result["score"] is not None:
+            key = (str(result.get("benchmark")), str(result.get("protocol")), str(result.get("metric")))
+            buckets.setdefault(key, []).append(result["score"])
+    summaries = [{"benchmark": key[0], "protocol": key[1], "metric": key[2], "scored_rows": len(scores),
+                  "mean_score": statistics.fmean(scores), "official_comparable": False}
+                 for key, scores in buckets.items()]
+    completed = counts.get("completed", 0)
+    all_supplied_complete = bool(reports) and completed == len(reports) and all(
+        r["rows_exhausted"] and r["attempted_rows"] > 0 for r in dataset_reports.values()) and not setup_reason
+    return {"status": "completed_supplied_rows" if all_supplied_complete else ("partial" if completed else "blocked"),
+            "reason": setup_reason or ("no_tasks" if not reports else None), "tasks": reports,
+            "total_tasks": len(reports), "hf_evaluated_count": sum(r.get("source") == "hf_real" and r["status"] == "completed" for r in reports),
+            "status_counts": counts, "dataset_reports": dataset_reports,
+            "download_report": getattr(hf_samples, "load_report", None), "by_benchmark": summaries,
+            "all_supplied_rows_completed": all_supplied_complete, "full_suite_complete": False,
+            "include_smoke": bool(include_smoke), "task_mode": task_mode,
+            "mean_score": None, "pass_rate_pct": None,
+            "aggregate_reason": "heterogeneous_protocol_scores_are_not_comparable"}
 
 
 @_no_grad()
@@ -3161,59 +2757,113 @@ def benchmark_loop72_decode_speed(
     model: Any,
     tokenizer: Any,
     prompt_lengths: Sequence[int] = (512, 2048, 8192, 32768),
-    gen_tokens: int = 64,
+    gen_tokens: int = 512,
+    warmups: int = 1,
+    repeats: int = 3,
+    seed: int = 2026,
 ) -> Dict[str, Any]:
-    """Measure separated TTFT, prefill throughput (`prefill_tok_per_s`), steady-state decode speed (`decode_tok_per_s`),
-    end-to-end throughput (`e2e_tok_per_s`), and inter-token latency percentiles (`itl_p50_ms`, `itl_p95_ms`, `itl_p99_ms`)
-    across multiple context horizons on `Spark-X2.6-4B-Loop72-LSA`.
+    """Repeat synchronized prefill/decode trials with fresh request caches.
+
+    EOS remains enabled: requested and actual output lengths are both recorded,
+    and short runs cannot silently stand in for a 512-token sustained measurement.
+    Warmup requests are excluded. These synthetic prompts measure performance only.
     """
-    if not HAS_TORCH:
-        raise RuntimeError("benchmark_loop72_decode_speed requires PyTorch.")
-
-    device = next(model.base.parameters()).device
-    max_len = max(int(x) for x in prompt_lengths)
-    raw_stream = build_modern_long_eval_stream(target_tokens=max_len + 256, tokenizer=tokenizer)
-    full_ids = tokenizer.encode(raw_stream, add_special_tokens=False)
-    while len(full_ids) < max_len:
-        full_ids = full_ids + full_ids
-
-    rows: List[Dict[str, Any]] = []
-    for p_len in prompt_lengths:
-        p_len_i = int(p_len)
-        inp = torch.tensor([full_ids[:p_len_i]], dtype=torch.long, device=device)
-        cache = model.make_inference_cache(session_id=f"speed_{p_len_i}")
-        _ = model.generate_cached(
-            inp,
-            max_new_tokens=int(gen_tokens),
-            do_sample=False,
-            tokenizer=tokenizer,
-            stream_print=False,
-            cache=cache,
-        )
-        t_rep = dict(getattr(model, "last_generation_timing", None) or {})
-        ledger = cache.memory_ledger()
-        rows.append({
-            "prompt_tokens": p_len_i,
-            "generated_tokens": int(t_rep.get("generated_tokens", gen_tokens)),
-            "ttft_ms": float(t_rep.get("ttft_ms", 0.0)),
-            "prefill_tok_per_s": float(t_rep.get("prefill_tok_per_s", 0.0)),
-            "decode_tok_per_s": float(t_rep.get("decode_tok_per_s", 0.0)),
-            "e2e_tok_per_s": float(t_rep.get("e2e_tok_per_s", 0.0)),
-            "itl_p50_ms": float(t_rep.get("itl_p50_ms", 0.0)),
-            "itl_p95_ms": float(t_rep.get("itl_p95_ms", 0.0)),
-            "itl_p99_ms": float(t_rep.get("itl_p99_ms", 0.0)),
-            "gpu_cache_mib": round(float(ledger.get("m1_gpu_total_mib", 0.0)), 2),
-            "host_cold_mib": round(float(ledger.get("m2_host_cold_pages_mib", 0.0)), 2),
-        })
-        del cache
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    return {
-        "gen_tokens": int(gen_tokens),
-        "total_virtual_layers": int(getattr(model, "total_virtual_layers", 72)),
-        "horizons": rows,
+    if int(gen_tokens) < 1 or int(repeats) < 1 or int(warmups) < 0:
+        raise ValueError("gen_tokens/repeats must be positive and warmups nonnegative")
+    lengths = [int(n) for n in prompt_lengths]
+    if any(n < 1 for n in lengths):
+        raise ValueError("prompt lengths must be positive")
+    report: Dict[str, Any] = {
+        "status": "not_run", "gen_tokens": int(gen_tokens), "warmups": int(warmups),
+        "repeats": int(repeats), "seed": int(seed), "horizons": [],
+        "evaluation_kind": "synthetic_performance", "eos_enabled": True,
+        "total_virtual_layers": getattr(model, "total_virtual_layers", None),
+        "generation_options": {"do_sample": False, "repetition_penalty": 1.0,
+                               "force_think_close": False, "top_k": 0, "top_p": 1.0},
     }
+    if not lengths:
+        report.update(status="blocked", reason="no_prompt_lengths")
+        return report
+    if not HAS_TORCH or model is None or tokenizer is None:
+        report.update(status="blocked", reason="model_tokenizer_and_pytorch_required")
+        report["horizons"] = [{"prompt_tokens": n, "status": "blocked", "reason": report["reason"]} for n in lengths]
+        return report
+    if "force_think_close" not in inspect.signature(model.generate_cached).parameters:
+        report.update(status="unsupported", reason="runtime_cannot_disable_forced_thinking_close")
+        return report
+    device = next(model.base.parameters()).device
+    report["device"] = str(device)
+    context_limit = _configured_context_limit(model)
+    report["configured_context_limit"] = context_limit
+    valid_lengths = [n for n in lengths if context_limit is None or n + int(gen_tokens) <= context_limit]
+    max_len = max(valid_lengths, default=0)
+    ids = tokenizer.encode(build_modern_long_eval_stream(target_tokens=max_len + 256, tokenizer=tokenizer), add_special_tokens=False) if max_len else []
+    if max_len and not ids:
+        raise ValueError("tokenizer produced an empty performance stream")
+    while len(ids) < max_len:
+        ids += ids
+    required_metrics = ("ttft_ms", "prefill_tok_per_s", "decode_tok_per_s", "e2e_tok_per_s",
+                        "itl_p50_ms", "itl_p95_ms", "itl_p99_ms")
+    for length in lengths:
+        row: Dict[str, Any] = {"prompt_tokens": length, "requested_generated_tokens": int(gen_tokens),
+                               "status": "not_run", "trials": [], "warmups_completed": 0}
+        report["horizons"].append(row)
+        if context_limit is not None and length + int(gen_tokens) > context_limit:
+            row.update(status="blocked", reason="prompt_plus_output_budget_exceeds_configured_context")
+            continue
+        for trial_idx in range(int(warmups) + int(repeats)):
+            cache = None
+            try:
+                torch.manual_seed(int(seed))
+                inp = torch.tensor([ids[:length]], dtype=torch.long, device=device)
+                cache = model.make_inference_cache(session_id=f"speed_{length}_{trial_idx}")
+                model.last_generation_timing = None
+                start = time.perf_counter()
+                out = model.generate_cached(inp, max_new_tokens=int(gen_tokens), do_sample=False,
+                                            repetition_penalty=1.0, force_think_close=False,
+                                            top_p=1.0, top_k=0, tokenizer=tokenizer, stream_print=False, cache=cache)
+                if getattr(device, "type", str(device).split(":")[0]) == "cuda":
+                    torch.cuda.synchronize(device)
+                wall = time.perf_counter() - start
+                timing = dict(getattr(model, "last_generation_timing", None) or {})
+                actual = int(out.shape[1]) - length
+                if actual < 0 or actual > int(gen_tokens):
+                    raise RuntimeError("runtime returned invalid output length")
+                if any(key not in timing for key in required_metrics) or timing.get("generated_tokens") != actual:
+                    raise RuntimeError("missing_or_inconsistent_generation_timing")
+                ledger = cache.memory_ledger()
+                trial = {"trial": trial_idx - int(warmups), "status": "completed",
+                         "generated_tokens": actual, "decode_steps": max(0, actual - 1),
+                         "wall_time_sec": wall, "finish_reason": timing.get("finish_reason", "unknown"),
+                         "timing": timing, "memory_ledger": ledger}
+                if trial_idx < int(warmups):
+                    row["warmups_completed"] += 1
+                else:
+                    row["trials"].append(trial)
+            except Exception as exc:
+                row.update(status="error", reason=f"performance_trial_error:{type(exc).__name__}:{exc}")
+                if trial_idx >= int(warmups):
+                    row["trials"].append({"trial": trial_idx - int(warmups), "status": "error", "reason": row["reason"]})
+                break
+            finally:
+                del cache
+        successful = [trial for trial in row["trials"] if trial["status"] == "completed"]
+        if len(successful) == int(repeats) and row["warmups_completed"] == int(warmups):
+            row["status"] = "completed"
+        if successful:
+            for key in required_metrics:
+                row[key] = statistics.median(float(trial["timing"][key]) for trial in successful)
+            row["generated_tokens"] = statistics.median(trial["generated_tokens"] for trial in successful)
+            row["min_generated_tokens"] = min(trial["generated_tokens"] for trial in successful)
+            row["max_generated_tokens"] = max(trial["generated_tokens"] for trial in successful)
+            row["requested_output_length_reached_in_all_trials"] = all(trial["generated_tokens"] == int(gen_tokens) for trial in successful)
+            row["sustained_512_token_decode_measured"] = all(trial["generated_tokens"] >= 512 for trial in successful) and row["status"] == "completed"
+            row["gpu_cache_mib"] = max(float(trial["memory_ledger"].get("m1_gpu_total_mib", 0.0)) for trial in successful)
+            row["host_cold_mib"] = max(float(trial["memory_ledger"].get("m2_host_cold_pages_mib", 0.0)) for trial in successful)
+    complete = all(row["status"] == "completed" for row in report["horizons"])
+    report["status"] = "completed" if complete else ("partial" if any(row["trials"] for row in report["horizons"]) else "blocked")
+    report["summary_statistic"] = "median_over_successful_measured_trials"
+    return report
 
 
 @_no_grad()
@@ -3224,133 +2874,66 @@ def run_full_length_1m_context_benchmark(
     max_live_tokens: int = 32_768,
     gen_tokens: int = 16,
 ) -> Dict[str, Any]:
-    """Run the Full-Length `1M` (`1,048,576`-Token) Context Window Capability & Scaling Suite:
-      1. Exact 72-visit memory capacity & compression ledger across `32K`, `128K`, `256K`, `512K`, and `1,048,576` (`1M`) tokens.
-      2. High-horizon `GraphWalks BFS 1M` (`openai/graphwalks`) & `OpenAI MRCR v2 512k-1M` (`openai/mrcr`) multi-round stress synthesis.
-      3. Live chunked prefill + steady-state decode on all horizons `<= max_live_tokens` (set `max_live_tokens=1_048_576` on A100/H100 to run the full 1M live forward pass).
+    """Report capacity arithmetic and optional synthetic live load probes.
+
+    Kept under its historical name for compatibility. Arithmetic and a repeated
+    token-stream forward pass do not establish usable context quality. Actual
+    GraphWalks/MRCR quality belongs to the pinned full-dataset runner.
     """
-    capacity_by_horizon: Dict[int, Dict[str, Any]] = {}
-    for h_tok in horizons:
-        capacity_by_horizon[int(h_tok)] = compute_loop72_capacity_table(n_tokens=int(h_tok))
-
-    gw_1m = generate_graphwalks_bfs_instance(num_nodes=256, branching=3, target_depth=3, seed=2026)
-    mrcr_1m = generate_mrcr_v2_instance(num_rounds=64, target_occurrence=5, seed=2026)
-
-    live_runs: List[Dict[str, Any]] = []
-    if HAS_TORCH and model is not None and tokenizer is not None:
-        device = next(model.base.parameters()).device
-        live_horizons = [int(h) for h in horizons if int(h) <= int(max_live_tokens)]
-        if live_horizons:
-            max_h = max(live_horizons)
-            base_text = build_modern_long_eval_stream(target_tokens=min(max_h, 16384), tokenizer=tokenizer)
-            base_ids = tokenizer.encode(base_text, add_special_tokens=False)
-            for h_tok in live_horizons:
-                rep_factor = (h_tok // max(1, len(base_ids))) + 1
-                seq_ids = (base_ids * rep_factor)[:h_tok]
-                inp = torch.tensor([seq_ids], dtype=torch.long, device=device)
-                cache = model.make_inference_cache(session_id=f"ctx1m_{h_tok}")
-                _ = model.generate_cached(
-                    inp,
-                    max_new_tokens=int(gen_tokens),
-                    do_sample=False,
-                    tokenizer=tokenizer,
-                    stream_print=False,
-                    cache=cache,
-                )
-                t_rep = dict(getattr(model, "last_generation_timing", None) or {})
-                ledger = cache.memory_ledger()
-                live_runs.append({
-                    "context_tokens": int(h_tok),
-                    "ttft_ms": float(t_rep.get("ttft_ms", 0.0)),
-                    "prefill_tok_per_s": float(t_rep.get("prefill_tok_per_s", 0.0)),
-                    "decode_tok_per_s": float(t_rep.get("decode_tok_per_s", 0.0)),
-                    "e2e_tok_per_s": float(t_rep.get("e2e_tok_per_s", 0.0)),
-                    "itl_p50_ms": float(t_rep.get("itl_p50_ms", 0.0)),
-                    "m1_gpu_total_mib": round(float(ledger.get("m1_gpu_total_mib", 0.0)), 2),
-                    "m2_host_cold_pages_mib": round(float(ledger.get("m2_host_cold_pages_mib", 0.0)), 2),
-                })
-                del cache
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-    cap_1m = capacity_by_horizon.get(1_048_576) or compute_loop72_capacity_table(n_tokens=1_048_576)
-    return {
-        "context_limit_tokens": 1_048_576,
-        "horizons": [int(h) for h in horizons],
-        "capacity_1m_summary": {
-            "unbounded_all72_bf16_gib": cap_1m["unbounded_all72_bf16_gib"],
-            "local_54_rings_mib": cap_1m["local_rings_mib"],
-            "global_18_bf16_gib": cap_1m["global_payload_gib"]["16bit_gib"],
-            "global_18_mixed_rotary_bf16_gib": cap_1m["mixed_rotary_bf16_gib"],
-            "global_18_int4_gib": cap_1m["global_payload_gib"]["4bit_gib"],
-        },
-        "capacity_by_horizon": capacity_by_horizon,
-        "graphwalks_1m_spec": {
-            "num_nodes": gw_1m["num_nodes"],
-            "num_edges": gw_1m["num_edges"],
-            "target_depth": gw_1m["target_depth"],
-            "gold_nodes_count": len(gw_1m["gold_nodes"]),
-        },
-        "mrcr_v2_1m_spec": {
-            "num_rounds": mrcr_1m["num_rounds"],
-            "target_occurrence": mrcr_1m["target_occurrence"],
-            "gold_answer": mrcr_1m["gold_answer"],
-        },
-        "live_runs": live_runs,
-    }
+    horizons = [int(h) for h in horizons]
+    if any(h < 1 for h in horizons):
+        raise ValueError("horizons must be positive")
+    capacity = {h: compute_loop72_capacity_table(n_tokens=h) for h in horizons}
+    cap_1m = capacity.get(1_048_576) or compute_loop72_capacity_table(n_tokens=1_048_576)
+    horizon_status = []
+    live_runs = []
+    for horizon in horizons:
+        if horizon > int(max_live_tokens):
+            horizon_status.append({"context_tokens": horizon, "status": "not_run", "reason": "above_explicit_live_probe_cap"})
+            continue
+        if not HAS_TORCH or model is None or tokenizer is None:
+            horizon_status.append({"context_tokens": horizon, "status": "blocked", "reason": "model_tokenizer_and_pytorch_required"})
+            continue
+        measured = benchmark_loop72_decode_speed(model, tokenizer, (horizon,), gen_tokens=gen_tokens, warmups=0, repeats=1)
+        row = dict(measured.get("horizons", [{}])[0]) if measured.get("horizons") else {"status": measured["status"], "reason": measured.get("reason")}
+        row.update(context_tokens=horizon, evaluation_kind="synthetic_load_probe", quality_validated=False)
+        horizon_status.append(row)
+        live_runs.append(row)
+    observed = [row["context_tokens"] for row in live_runs if row["status"] == "completed"]
+    all_executed = bool(horizons) and len(observed) == len(horizons)
+    return {"status": "load_probes_completed" if all_executed else ("partial" if observed else "not_run"),
+            "context_limit_tokens": _configured_context_limit(model) if model is not None else None,
+            "target_context_tokens": 1_048_576, "validated_context_tokens": None,
+            "observed_max_live_tokens": max(observed) if observed else None,
+            "quality_validated": False, "full_quality_suite_complete": False,
+            "all_requested_load_probes_completed": all_executed,
+            "horizons": horizons, "max_live_tokens": int(max_live_tokens),
+            "capacity_1m_summary": {
+                "unbounded_all72_bf16_gib": cap_1m["unbounded_all72_bf16_gib"],
+                "local_54_rings_mib": cap_1m["local_rings_mib"],
+                "global_18_bf16_gib": cap_1m["global_payload_gib"]["16bit_gib"],
+                "global_18_mixed_rotary_bf16_gib": cap_1m["mixed_rotary_bf16_gib"],
+                "global_18_int4_gib": cap_1m["global_payload_gib"]["4bit_gib"],
+            }, "capacity_by_horizon": capacity,
+            "capacity_is_payload_arithmetic_not_observed_peak_vram": True,
+            "horizon_status": horizon_status, "live_runs": live_runs}
 
 
 def generate_omp_models_yaml(
     output_path: Optional[str] = None,
     port: int = 8000,
     model_id: str = "spark-x2.6-4b-loop72-dlsa",
-    context_window: int = 1_048_576,
-    max_tokens: int = 32_768,
+    context_window: int = 131_072,
+    max_tokens: int = 4096,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
-    """Generate an `Oh My Pi` (`can1357/oh-my-pi`, `~/.omp/agent/models.yml`) provider configuration connecting
-    `omp` to the local `Spark-X2.6-4B-Loop72-LSA` OpenAI-compatible `/v1/chat/completions` endpoint with full
-    `1,048,576`-token (`1M`) context window support.
+    """Return the pinned OMP configuration; explicit writes safely merge providers.
+
+    Client budgets are declarations, not validated context capacity. Use the
+    endpoint health limits for an actual run. See docs/OMP_EVALUATION.md.
     """
-    import os
-
-    yaml_text = (
-        "# Oh My Pi (omp) Custom Model Configuration for Spark-X2.6-4B-Loop72-LSA\n"
-        "providers:\n"
-        "  spark_loop72_local:\n"
-        f"    baseUrl: http://127.0.0.1:{int(port)}/v1\n"
-        "    apiKey: spark-local-loop72\n"
-        "    api: openai-completions\n"
-        "    models:\n"
-        f"      - id: {model_id}\n"
-        "        name: Spark-X2.6-4B-Loop72-LSA (72 Visits + Paged D-LSA 1M Context)\n"
-        "        reasoning: true\n"
-        "        input:\n"
-        "          - text\n"
-        f"        contextWindow: {int(context_window)}\n"
-        f"        maxTokens: {int(max_tokens)}\n"
-        "        cost:\n"
-        "          input: 0\n"
-        "          output: 0\n"
-        "          cacheRead: 0\n"
-        "          cacheWrite: 0\n"
-    )
-    written_path: Optional[str] = None
-    if output_path is not None:
-        expanded = os.path.expanduser(output_path)
-        os.makedirs(os.path.dirname(os.path.abspath(expanded)), exist_ok=True)
-        with open(expanded, "w", encoding="utf-8") as f:
-            f.write(yaml_text)
-        written_path = expanded
-
-    return {
-        "model_id": model_id,
-        "base_url": f"http://127.0.0.1:{int(port)}/v1",
-        "context_window": int(context_window),
-        "max_tokens": int(max_tokens),
-        "written_path": written_path,
-        "yaml": yaml_text,
-        "omp_cli_example": f"omp --model spark_loop72_local/{model_id}",
-    }
+    from sparkx_omp_server import generate_omp_models_yaml as generate
+    return generate(output_path, port, model_id, context_window, max_tokens, **kwargs)
 
 
 def start_loop72_openai_compatible_server(
@@ -3360,109 +2943,11 @@ def start_loop72_openai_compatible_server(
     port: int = 8000,
     model_id: str = "spark-x2.6-4b-loop72-dlsa",
     background: bool = True,
+    **kwargs: Any,
 ) -> Any:
-    """Start a lightweight OpenAI-compatible HTTP server (`/v1/models`, `/v1/chat/completions`) backed by
-    `model.generate_cached` so `Oh My Pi` (`omp`), `Terminal-Bench` (Harbor), or OpenAI SDK clients can connect directly.
-    """
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    import threading
-
-    device = next(model.base.parameters()).device
-
-    class _Loop72Handler(BaseHTTPRequestHandler):
-        def log_message(self, format: str, *args: Any) -> None:
-            return
-
-        def _send_json(self, status_code: int, payload: Dict[str, Any]) -> None:
-            raw = json.dumps(payload).encode("utf-8")
-            self.send_response(status_code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
-
-        def do_GET(self) -> None:
-            if self.path.rstrip("/") in ("/v1/models", "/models"):
-                self._send_json(
-                    200,
-                    {
-                        "object": "list",
-                        "data": [
-                            {
-                                "id": model_id,
-                                "object": "model",
-                                "created": int(time.time()),
-                                "owned_by": "spark-x2.6-loop72-dlsa",
-                                "context_window": 1_048_576,
-                            }
-                        ],
-                    },
-                )
-            else:
-                self._send_json(200, {"status": "ok", "model": model_id, "context_window": 1_048_576})
-
-        def do_POST(self) -> None:
-            if self.path.rstrip("/") not in ("/v1/chat/completions", "/chat/completions"):
-                self._send_json(404, {"error": f"Unknown endpoint {self.path}"})
-                return
-            length = int(self.headers.get("Content-Length", "0"))
-            body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-            messages = body.get("messages", [])
-            max_tokens = int(body.get("max_tokens", body.get("max_completion_tokens", 512)))
-            temperature = float(body.get("temperature", 0.2))
-            top_p = float(body.get("top_p", 0.95))
-            do_sample = temperature > 1e-4
-
-            try:
-                chat_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
-                if hasattr(chat_ids, "input_ids"):
-                    chat_ids = chat_ids.input_ids
-                inp = torch.tensor([chat_ids], dtype=torch.long, device=device)
-            except Exception:
-                joined = "\n".join(f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages)
-                enc = tokenizer.encode(joined, add_special_tokens=True)
-                inp = torch.tensor([enc], dtype=torch.long, device=device)
-
-            out_ids = model.generate_cached(
-                inp,
-                max_new_tokens=max_tokens,
-                temperature=max(temperature, 1e-4),
-                top_p=top_p,
-                do_sample=do_sample,
-                tokenizer=tokenizer,
-                stream_print=False,
-            )
-            gen_ids = out_ids[0, inp.shape[1]:].tolist()
-            reply = tokenizer.decode(gen_ids, skip_special_tokens=True)
-            timing = dict(getattr(model, "last_generation_timing", None) or {})
-            self._send_json(
-                200,
-                {
-                    "id": f"chatcmpl-{int(time.time() * 1000)}",
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": model_id,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": reply},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                    "usage": {
-                        "prompt_tokens": int(inp.shape[1]),
-                        "completion_tokens": len(gen_ids),
-                        "total_tokens": int(inp.shape[1]) + len(gen_ids),
-                    },
-                    "loop72_timing": timing,
-                },
-            )
-
-    server = ThreadingHTTPServer((host, int(port)), _Loop72Handler)
-    if background:
-        t = threading.Thread(target=server.serve_forever, daemon=True)
-        t.start()
-    return server
+    """Start the serialized, token-streaming native Spark tool-call bridge."""
+    from sparkx_omp_server import create_loop72_server
+    return create_loop72_server(model, tokenizer, host, port, model_id, background, **kwargs)
 
 
 def evaluate_cold_kv_codecs_summary() -> Dict[str, Dict[str, float]]:
@@ -3491,40 +2976,34 @@ def evaluate_cold_kv_codecs_summary() -> Dict[str, Dict[str, float]]:
 
 
 def format_official_comparison_markdown(live_task_results: Optional[Dict[str, Any]] = None) -> str:
-    """Format a Markdown comparison table referencing the official Spark X2.6-4B benchmark table alongside live Loop72-LSA results."""
-    live_buckets: Dict[str, List[float]] = {}
-    if live_task_results and "tasks" in live_task_results:
-        for t in live_task_results["tasks"]:
-            b_key = str(t["benchmark"])
-            live_buckets.setdefault(b_key, []).append(float(t["score"]))
+    """Keep the published reference separate from noncomparable local results.
 
-    live_by_bench: Dict[str, float] = {}
-    norm_scores_for_avg: List[float] = []
-    for b_key, vals in live_buckets.items():
-        mean_pct = sum(vals) / max(1, len(vals))
-        norm_scores_for_avg.append(mean_pct)
-        row_meta = OFFICIAL_BENCHMARK_TABLE.get(b_key, {})
-        scale = float(row_meta.get("scale", 100.0))
-        live_by_bench[b_key] = round(mean_pct * (scale / 100.0), 2)
-
-    if norm_scores_for_avg and "Average" not in live_by_bench:
-        live_by_bench["Average"] = round(sum(norm_scores_for_avg) / len(norm_scores_for_avg), 2)
-
+    Only independently verified, complete, same-protocol benchmark summaries may
+    populate the comparison column. Per-task smoke/diagnostic/sample results never
+    do, and no new cross-benchmark average is invented from missing or mixed scores.
+    """
+    comparable: Dict[str, float] = {}
+    for row in (live_task_results or {}).get("verified_official_summaries", []):
+        if (row.get("benchmark") != "Average" and row.get("official_comparable") is True
+                and row.get("full_split_complete") is True and row.get("protocol_verified") is True
+                and row.get("sampling_verified") is True and row.get("dataset_revision")
+                and row.get("evaluator_revision") and row.get("score") is not None):
+            comparable[str(row["benchmark"])] = float(row["score"])
     lines = [
-        "| Category | Benchmark | Official Spark X2.6-4B | Spark X2.5-4B | Qwen3.5 9B | Qwen3.5 4B | Gemma4 12B | Loop72 + D-LSA (Live) |",
+        "Published reference values are not measurements of this variant. Local smoke, sampled, or modified-protocol scores are excluded from this comparison.",
+        "", "| Category | Benchmark | Official Spark X2.6-4B | Spark X2.5-4B | Qwen3.5 9B | Qwen3.5 4B | Gemma4 12B | Verified comparable Loop72 + D-LSA |",
         "| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
     ]
-    def _fmt(v: Any, bold: bool = False) -> str:
-        if v is None:
-            return "-"
-        s = f"{float(v):.1f}"
-        return f"**{s}**" if bold else s
 
-    for b_name, row in OFFICIAL_BENCHMARK_TABLE.items():
-        live_val = f"**{live_by_bench[b_name]:.1f}**" if b_name in live_by_bench else "—"
-        lines.append(
-            f"| {row['category']} | **{b_name}** | {_fmt(row.get('Spark_X2.6_4B'), bold=True)} | "
-            f"{_fmt(row.get('Spark_X2.5_4B'))} | {_fmt(row.get('Qwen3.5_9B'))} | {_fmt(row.get('Qwen3.5_4B'))} | "
-            f"{_fmt(row.get('Gemma4_12B'))} | {live_val} |"
-        )
+    def fmt(value: Any, bold: bool = False) -> str:
+        if value is None:
+            return "-"
+        text = f"{float(value):.1f}"
+        return f"**{text}**" if bold else text
+
+    for name, row in OFFICIAL_BENCHMARK_TABLE.items():
+        value = fmt(comparable[name], True) if name in comparable else "—"
+        lines.append(f"| {row['category']} | **{name}** | {fmt(row.get('Spark_X2.6_4B'), True)} | "
+                     f"{fmt(row.get('Spark_X2.5_4B'))} | {fmt(row.get('Qwen3.5_9B'))} | "
+                     f"{fmt(row.get('Qwen3.5_4B'))} | {fmt(row.get('Gemma4_12B'))} | {value} |")
     return "\n".join(lines)

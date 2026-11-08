@@ -226,8 +226,10 @@ class TestLoop72TorchComponents(unittest.TestCase):
         self.assertEqual(pos2.tolist(), list(range(24, 40)))
 
         # Visit 3 is global (layer 3): feed 48 tokens, verify gather_selected matches exact tokens
-        k_glob = torch.randn(1, 4, 48, 16)
-        v_glob = torch.randn(1, 4, 48, 16)
+        # The BF16 archive is lossless for BF16 inputs, not arbitrary FP32 values.
+        # Match the model KV dtype and require exact recovery across cold pages.
+        k_glob = torch.randn(1, 4, 48, 16).to(torch.bfloat16)
+        v_glob = torch.randn(1, 4, 48, 16).to(torch.bfloat16)
         slot_g = cache.append_global_visit(3, k_glob[:, :, :24], v_glob[:, :, :24])
         cache.append_global_visit(3, k_glob[:, :, 24:], v_glob[:, :, 24:])
         self.assertEqual(slot_g.logical_seq_length, 48)
@@ -236,8 +238,8 @@ class TestLoop72TorchComponents(unittest.TestCase):
         sel_pos = torch.tensor([0, 1, 10, 11, 25, 47], dtype=torch.long)
         k_sel, v_sel, g_pos = slot_g.gather_selected(sel_pos)
         self.assertEqual(g_pos.tolist(), sel_pos.tolist())
-        self.assertTrue(torch.allclose(k_sel[0], k_glob[0, :, sel_pos, :], atol=1e-5))
-        self.assertTrue(torch.allclose(v_sel[0], v_glob[0, :, sel_pos, :], atol=1e-5))
+        self.assertTrue(torch.equal(k_sel[0], k_glob[0, :, sel_pos, :]))
+        self.assertTrue(torch.equal(v_sel[0], v_glob[0, :, sel_pos, :]))
 
     def test_paged_dlsa_global_attention_strict_causality(self):
         g = torch.Generator().manual_seed(99)
@@ -372,7 +374,7 @@ class TestLoop72BenchmarkSuiteAndNotebook(unittest.TestCase):
 
         gw = generate_graphwalks_bfs_instance(num_nodes=48, branching=2, target_depth=2, seed=42)
         self.assertEqual(len(gw["gold_nodes"]), 4)
-        gw_perfect = score_graphwalks_bfs_f1("\\boxed{" + ", ".join(gw["gold_nodes"]) + "}", gw["gold_nodes"])
+        gw_perfect = score_graphwalks_bfs_f1("Final Answer: [" + ", ".join(gw["gold_nodes"]) + "]", gw["gold_nodes"])
         self.assertEqual(gw_perfect["f1"], 1.0)
 
         mrcr = generate_mrcr_v2_instance(num_rounds=16, target_occurrence=3, seed=101)
@@ -442,16 +444,21 @@ class TestLoop72BenchmarkSuiteAndNotebook(unittest.TestCase):
                 )
                 self.assertTrue(gdp_ok.ok)
 
-        # Verify 100% of rows in OFFICIAL_BENCHMARK_TABLE are populated with zero `—` cells when all tasks are evaluated
+        # Local synthetic answers cannot fill an official comparison table.
         all_bench_names = [b for b in OFFICIAL_BENCHMARK_TABLE.keys() if b != "Average"]
         synthetic_live = {"tasks": [{"benchmark": b, "score": 100.0} for b in all_bench_names]}
         md_full = format_official_comparison_markdown(synthetic_live)
-        self.assertNotIn("| — |", md_full)
-        self.assertIn("**150.0**", md_full)  # Gaokao 2026 scaled to 150.0 points
+        self.assertIn("| — |", md_full)
+        self.assertNotIn("**150.0**", md_full)
+        self.assertIn("excluded from this comparison", md_full)
 
         # Test 1M context window benchmark suite (capacity + long-context specs)
         ctx_1m = run_full_length_1m_context_benchmark(model=None, tokenizer=None)
-        self.assertEqual(ctx_1m["context_limit_tokens"], 1_048_576)
+        self.assertIsNone(ctx_1m["context_limit_tokens"])
+        self.assertEqual(ctx_1m["target_context_tokens"], 1_048_576)
+        self.assertEqual(ctx_1m["status"], "not_run")
+        self.assertIsNone(ctx_1m["validated_context_tokens"])
+        self.assertFalse(ctx_1m["quality_validated"])
         self.assertAlmostEqual(ctx_1m["capacity_1m_summary"]["global_18_bf16_gib"], 72.0, places=2)
         self.assertAlmostEqual(ctx_1m["capacity_1m_summary"]["global_18_int4_gib"], 18.0, places=2)
         self.assertAlmostEqual(ctx_1m["capacity_1m_summary"]["local_54_rings_mib"], 108.0, places=2)
@@ -466,8 +473,9 @@ class TestLoop72BenchmarkSuiteAndNotebook(unittest.TestCase):
         )
         self.assertTrue(omp_v.ok)
         omp_yaml = generate_omp_models_yaml(output_path=None, port=8000)
-        self.assertEqual(omp_yaml["context_window"], 1_048_576)
-        self.assertIn("contextWindow: 1048576", omp_yaml["yaml"])
+        self.assertEqual(omp_yaml["context_window"], 131_072)
+        self.assertIn('"contextWindow": 131072', omp_yaml["yaml"])
+        self.assertIn('"supportsUsageInStreaming": true', omp_yaml["yaml"])
 
         json_ok = verify_json_schema(
             '```json\n{"model": "Spark", "total_visits": 72, "thinking_mode": true}\n```',

@@ -8,13 +8,13 @@ BF16 RoPE, Checkpointed Cut-Cross-Entropy, Zero-Sync Sorted MoE Dispatch), and
 Runtime-Only Zero-Collapse O(n log n) Log-Linear NoPE KV Cache.
 """
 from __future__ import annotations
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import copy
 import dataclasses
 import importlib
 import math
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -256,6 +256,12 @@ class LoopV03Settings:
     construct_engram: bool = True
     preserve_native_activation: bool = False
     runtime_identity: str = 'legacy_silu_v03'
+    recurrence_mode: str = 'auto'
+    mhc_gain_mode: str = 'legacy_tanh'
+    mhc_schema_version: int = 1
+    mhc_init_p2_gain: float = 0.01
+    mhc_init_p3_gain: float = 0.005
+    mhc_extra_pass_gate_multiplier: float = 1.0
     prefill_chunk_tokens: int = 2048
     use_paged_hybrid_cache: bool = False
     dynamic_mhc: bool = True
@@ -287,6 +293,24 @@ class LoopV03Settings:
         )
         defaults.update(overrides)
         return cls(**defaults)
+
+
+@contextmanager
+def _attention_visit_context(attention, physical_layer: int, virtual_visit: int, visit_ordinal: int = 0):
+    """Carry explicit visit identity through uncached attention and checkpoint replay."""
+    if attention is None:
+        yield
+        return
+    missing = object()
+    previous = getattr(attention, '_sparkx_active_visit', missing)
+    attention._sparkx_active_visit = (int(physical_layer), int(virtual_visit), int(visit_ordinal))
+    try:
+        yield
+    finally:
+        if previous is missing:
+            delattr(attention, '_sparkx_active_visit')
+        else:
+            attention._sparkx_active_visit = previous
 
 
 class _CacheLayersView:
@@ -2413,10 +2437,16 @@ class TwoStreamMHC(nn.Module):
         pass_adapter_rank: int = 16,
         max_passes: int = 4,
         rmsnorm_eps: float = 1e-6,
+        gain_mode: str = 'legacy_tanh',
+        init_p2_gain: float = 0.01,
+        init_p3_gain: float = 0.005,
+        extra_pass_gate_multiplier: float = 1.0,
     ):
         super().__init__()
         if streams != 2:
             raise ValueError('TwoStreamMHC expects 2 streams')
+        if gain_mode not in ('legacy_tanh', 'sigmoid'):
+            raise ValueError(f'Unsupported TwoStreamMHC gain_mode: {gain_mode}')
         self.width = width
         self.streams = streams
         self.n = streams
@@ -2426,20 +2456,28 @@ class TwoStreamMHC(nn.Module):
         self.pass_adapter_rank = pass_adapter_rank
         self.max_passes = max_passes
         self.norm_eps = rmsnorm_eps
+        self.gain_mode = str(gain_mode)
+        self.schema_version = 2 if self.gain_mode == 'sigmoid' else 1
+        self.init_p2_gain = float(init_p2_gain)
+        self.init_p3_gain = float(init_p3_gain)
+        self.extra_pass_gate_multiplier = float(extra_pass_gate_multiplier)
+
+        p2_init_logit = self._gain_to_raw_logit(self.init_p2_gain) if self.gain_mode == 'sigmoid' else 0.0
+        p3_init_logit = self._gain_to_raw_logit(self.init_p3_gain) if self.gain_mode == 'sigmoid' else 0.0
 
         # Primary / Attention mHC parameters (aligned with v0.2 for exact warm-start & Step-0 parity)
         self.mix_logits = nn.Parameter(torch.tensor([[4.0, -4.0], [-4.0, 4.0]], dtype=torch.float32))
         self.read_logits = nn.Parameter(torch.tensor([5.0, -5.0], dtype=torch.float32))
         self.write_logits = nn.Parameter(torch.tensor([5.0, -5.0], dtype=torch.float32))
-        self.extra_gain = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
-        self.p3_extra_gain = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.extra_gain = nn.Parameter(torch.tensor(p2_init_logit, dtype=torch.float32))
+        self.p3_extra_gain = nn.Parameter(torch.tensor(p3_init_logit, dtype=torch.float32))
 
         # Sublayer FFN mHC parameters
         self.ffn_mix_logits = nn.Parameter(torch.tensor([[4.0, -4.0], [-4.0, 4.0]], dtype=torch.float32))
         self.ffn_read_logits = nn.Parameter(torch.tensor([5.0, -5.0], dtype=torch.float32))
         self.ffn_write_logits = nn.Parameter(torch.tensor([5.0, -5.0], dtype=torch.float32))
-        self.ffn_extra_gain = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
-        self.p3_ffn_extra_gain = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.ffn_extra_gain = nn.Parameter(torch.tensor(p2_init_logit, dtype=torch.float32))
+        self.p3_ffn_extra_gain = nn.Parameter(torch.tensor(p3_init_logit, dtype=torch.float32))
 
         self.pass_routing_bias = nn.Parameter(torch.zeros(max_passes, 2, 8, dtype=torch.float32))
 
@@ -2471,6 +2509,11 @@ class TwoStreamMHC(nn.Module):
             self.pass_down = None
             self.pass_up = None
 
+    @staticmethod
+    def _gain_to_raw_logit(prob: float) -> float:
+        p = min(max(float(prob), 1e-6), 1.0 - 1e-6)
+        return float(math.log(p / (1.0 - p)))
+
     @property
     def attn_extra_gain(self) -> nn.Parameter:
         return self.extra_gain
@@ -2480,18 +2523,60 @@ class TwoStreamMHC(nn.Module):
         return self.p3_extra_gain
 
     @torch.no_grad()
+    def set_gain_mode(
+        self,
+        gain_mode: str = 'sigmoid',
+        init_p2_gain: Optional[float] = None,
+        init_p3_gain: Optional[float] = None,
+        extra_pass_gate_multiplier: Optional[float] = None,
+        reset_gains: bool = False,
+    ) -> None:
+        """Switch controller gain parameterization between `legacy_tanh` (v1) and `sigmoid` (v2 in `[0, 1]`)."""
+        if gain_mode not in ('legacy_tanh', 'sigmoid'):
+            raise ValueError(f'Unsupported TwoStreamMHC gain_mode: {gain_mode}')
+        self.gain_mode = str(gain_mode)
+        self.schema_version = 2 if self.gain_mode == 'sigmoid' else 1
+        if init_p2_gain is not None:
+            self.init_p2_gain = float(init_p2_gain)
+        if init_p3_gain is not None:
+            self.init_p3_gain = float(init_p3_gain)
+        if extra_pass_gate_multiplier is not None:
+            self.extra_pass_gate_multiplier = float(extra_pass_gate_multiplier)
+        if reset_gains:
+            if self.gain_mode == 'sigmoid':
+                p2_logit = self._gain_to_raw_logit(self.init_p2_gain)
+                p3_logit = self._gain_to_raw_logit(self.init_p3_gain)
+                self.extra_gain.fill_(p2_logit)
+                self.ffn_extra_gain.fill_(p2_logit)
+                self.p3_extra_gain.fill_(p3_logit)
+                self.p3_ffn_extra_gain.fill_(p3_logit)
+            else:
+                self.extra_gain.zero_()
+                self.ffn_extra_gain.zero_()
+                self.p3_extra_gain.zero_()
+                self.p3_ffn_extra_gain.zero_()
+
+    @torch.no_grad()
     def reset_parameters_to_step0(self):
-        """Restore TwoStreamMHC to exact Step-0 zero-gated identity initialization."""
+        """Restore TwoStreamMHC to Step-0 identity initialization (`0.0` in legacy_tanh, `init_p2/p3_gain` in sigmoid)."""
         self.mix_logits.copy_(torch.tensor([[4.0, -4.0], [-4.0, 4.0]], dtype=torch.float32, device=self.mix_logits.device))
         self.read_logits.copy_(torch.tensor([5.0, -5.0], dtype=torch.float32, device=self.read_logits.device))
         self.write_logits.copy_(torch.tensor([5.0, -5.0], dtype=torch.float32, device=self.write_logits.device))
-        self.extra_gain.zero_()
-        self.p3_extra_gain.zero_()
         self.ffn_mix_logits.copy_(torch.tensor([[4.0, -4.0], [-4.0, 4.0]], dtype=torch.float32, device=self.ffn_mix_logits.device))
         self.ffn_read_logits.copy_(torch.tensor([5.0, -5.0], dtype=torch.float32, device=self.ffn_read_logits.device))
         self.ffn_write_logits.copy_(torch.tensor([5.0, -5.0], dtype=torch.float32, device=self.ffn_write_logits.device))
-        self.ffn_extra_gain.zero_()
-        self.p3_ffn_extra_gain.zero_()
+        if getattr(self, 'gain_mode', 'legacy_tanh') == 'sigmoid':
+            p2_logit = self._gain_to_raw_logit(getattr(self, 'init_p2_gain', 0.01))
+            p3_logit = self._gain_to_raw_logit(getattr(self, 'init_p3_gain', 0.005))
+            self.extra_gain.fill_(p2_logit)
+            self.ffn_extra_gain.fill_(p2_logit)
+            self.p3_extra_gain.fill_(p3_logit)
+            self.p3_ffn_extra_gain.fill_(p3_logit)
+        else:
+            self.extra_gain.zero_()
+            self.p3_extra_gain.zero_()
+            self.ffn_extra_gain.zero_()
+            self.p3_ffn_extra_gain.zero_()
         self.pass_routing_bias.zero_()
         if self.dynamic and self.dynamic_proj is not None:
             self.norm_weight.fill_(1.0)
@@ -2593,6 +2678,12 @@ class TwoStreamMHC(nn.Module):
     def _effective_gain(self, gain_param: torch.Tensor, pass_idx: int = 0, extra: bool = False) -> torch.Tensor | float:
         if not extra:
             return 1.0
+        mode = getattr(self, 'gain_mode', 'legacy_tanh')
+        if mode == 'sigmoid':
+            gate_mult = float(getattr(self, 'extra_pass_gate_multiplier', 1.0))
+            if gate_mult <= 0.0:
+                return gain_param.float() * 0.0
+            return gate_mult * torch.sigmoid(gain_param.float())
         raw = torch.tanh(gain_param.float())
         min_g = float(
             getattr(self, 'min_p3_gain', 0.0) if pass_idx >= 2 else getattr(self, 'min_extra_gain', 0.0)
@@ -2615,7 +2706,19 @@ class TwoStreamMHC(nn.Module):
         r_f = self.ffn_read_logits.float().softmax(dim=0)
         w_f = self.ffn_write_logits.float().softmax(dim=0)
         m_f = self.mixing_matrix(base_logits=self.ffn_mix_logits.float())
+        gains = {
+            'p2_attn': g_p2_a, 'p2_ffn': g_p2_f,
+            'p3_attn': g_p3_a, 'p3_ffn': g_p3_f,
+        }
+        eye = torch.eye(2, device=m_a.device, dtype=m_a.dtype)
+        effective_mix_min = {
+            name: float((eye + gain * ((m_f if name.endswith('ffn') else m_a) - eye)).min().item())
+            for name, gain in gains.items()
+        }
         return {
+            'gain_mode': str(getattr(self, 'gain_mode', 'legacy_tanh')),
+            'schema_version': int(getattr(self, 'schema_version', 1)),
+            'extra_pass_gate_multiplier': float(getattr(self, 'extra_pass_gate_multiplier', 1.0)),
             'gain_p2_attn': round(g_p2_a, 5),
             'gain_p2_ffn': round(g_p2_f, 5),
             'gain_p3_attn': round(g_p3_a, 5),
@@ -2626,7 +2729,9 @@ class TwoStreamMHC(nn.Module):
             'read_s1_prob_ffn': round(float(r_f[1].item()), 5),
             'write_s0_prob_ffn': round(float(w_f[0].item()), 5),
             'swap_prob_ffn': round(float(m_f[0, 1].item()), 5),
-            'gain_collapsed': (abs(g_p2_a) < 0.03 and abs(g_p2_f) < 0.03),
+            'gain_collapsed': (abs(g_p2_a) < 0.002 and abs(g_p2_f) < 0.002),
+            'gains_outside_unit_interval': [name for name, gain in gains.items() if not 0.0 <= gain <= 1.0],
+            'static_effective_mix_min_entry': effective_mix_min,
         }
 
     def _apply_pass_adapter(self, x: torch.Tensor, pass_idx: int) -> torch.Tensor:
@@ -2794,6 +2899,8 @@ class SparkXLoopV03(nn.Module):
         self.offload_checkpoint_to_cpu = self.settings.offload_checkpoint_to_cpu
 
         self._validate_loop()
+        gain_mode = str(getattr(self.settings, 'mhc_gain_mode', 'legacy_tanh'))
+        self.settings.mhc_schema_version = 2 if gain_mode == 'sigmoid' else 1
         self.controllers = nn.ModuleDict({
             str(i): TwoStreamMHC(
                 width=width,
@@ -2802,6 +2909,10 @@ class SparkXLoopV03(nn.Module):
                 sublayer_mhc=self.settings.sublayer_mhc,
                 pass_adapter_rank=self.settings.pass_adapter_rank,
                 max_passes=self.settings.max_passes,
+                gain_mode=gain_mode,
+                init_p2_gain=float(getattr(self.settings, 'mhc_init_p2_gain', 0.01)),
+                init_p3_gain=float(getattr(self.settings, 'mhc_init_p3_gain', 0.005)),
+                extra_pass_gate_multiplier=float(getattr(self.settings, 'mhc_extra_pass_gate_multiplier', 1.0)),
             )
             for i in range(self.loop_start, self.loop_end)
         })
@@ -2900,6 +3011,88 @@ class SparkXLoopV03(nn.Module):
             'schedule': sched_rows,
         }
 
+    def effective_recurrence_mode(self, training: Optional[bool] = None) -> str:
+        """Name the recurrence actually executed, including the current train/eval dispatch.
+
+        The native GELU highway uses fixed mixing coefficients and does not call the
+        learned mHC controllers. It still executes the configured layer visits, but
+        its outputs are not an equivalent optimization of learned mHC.
+        """
+        requested = str(getattr(self.settings, 'recurrence_mode', 'auto'))
+        if requested not in ('auto', 'learned_mhc', 'depth_matched_highway'):
+            raise ValueError(f'Unsupported recurrence_mode: {requested}')
+        if not self.mhc_enabled:
+            return 'plain_recurrence'
+        if requested == 'learned_mhc':
+            return 'learned_mhc'
+        if requested == 'depth_matched_highway':
+            if not bool(getattr(self.settings, 'preserve_native_activation', False)) or self.engram_enabled:
+                raise ValueError('depth_matched_highway requires native activation and disabled Engram')
+            return 'native_gelu_depth_matched_highway'
+        is_training = self.training if training is None else bool(training)
+        controllers_trainable = is_training and any(
+            p.requires_grad for p in self.controllers.parameters()
+        )
+        if (
+            bool(getattr(self.settings, 'preserve_native_activation', False))
+            and not self.engram_enabled
+            and not controllers_trainable
+        ):
+            return 'native_gelu_depth_matched_highway'
+        return 'learned_mhc'
+
+    @torch.no_grad()
+    def set_mhc_gain_mode(
+        self,
+        gain_mode: str = 'sigmoid',
+        init_p2_gain: float = 0.01,
+        init_p3_gain: float = 0.005,
+        extra_pass_gate_multiplier: float = 1.0,
+        reset_gains: bool = True,
+    ) -> dict[str, Any]:
+        """Configure all 24 `TwoStreamMHC` controllers with the versioned `gain_mode` (`sigmoid` v2 or `legacy_tanh` v1)."""
+        if gain_mode not in ('legacy_tanh', 'sigmoid'):
+            raise ValueError(f'Unsupported mhc_gain_mode: {gain_mode}')
+        self.settings.mhc_gain_mode = str(gain_mode)
+        self.settings.mhc_schema_version = 2 if gain_mode == 'sigmoid' else 1
+        self.settings.mhc_init_p2_gain = float(init_p2_gain)
+        self.settings.mhc_init_p3_gain = float(init_p3_gain)
+        self.settings.mhc_extra_pass_gate_multiplier = float(extra_pass_gate_multiplier)
+        for ctrl in self.controllers.values():
+            ctrl.set_gain_mode(
+                gain_mode=gain_mode,
+                init_p2_gain=init_p2_gain,
+                init_p3_gain=init_p3_gain,
+                extra_pass_gate_multiplier=extra_pass_gate_multiplier,
+                reset_gains=reset_gains,
+            )
+        return self.controller_summary()
+
+    @torch.no_grad()
+    def controller_summary(self) -> dict[str, Any]:
+        """Return parameter count, gain schema version, and mean/min/max P2/P3 effective gains across all 24 controllers."""
+        total_params = sum(p.numel() for p in self.controllers.parameters())
+        telems = [c.controller_telemetry() for c in self.controllers.values()]
+        p2_a = [t['gain_p2_attn'] for t in telems]
+        p2_f = [t['gain_p2_ffn'] for t in telems]
+        p3_a = [t['gain_p3_attn'] for t in telems]
+        p3_f = [t['gain_p3_ffn'] for t in telems]
+        outside_unit = sorted({name for t in telems for name in t['gains_outside_unit_interval']})
+        min_mix_entry = min(min(t['static_effective_mix_min_entry'].values()) for t in telems) if telems else 1.0
+        return {
+            'num_controllers': len(self.controllers),
+            'total_controller_parameters': int(total_params),
+            'gain_mode': str(getattr(self.settings, 'mhc_gain_mode', 'legacy_tanh')),
+            'mhc_schema_version': int(getattr(self.settings, 'mhc_schema_version', 1)),
+            'extra_pass_gate_multiplier': float(getattr(self.settings, 'mhc_extra_pass_gate_multiplier', 1.0)),
+            'mean_gain_p2_attn': round(sum(p2_a) / max(1, len(p2_a)), 6),
+            'mean_gain_p2_ffn': round(sum(p2_f) / max(1, len(p2_f)), 6),
+            'mean_gain_p3_attn': round(sum(p3_a) / max(1, len(p3_a)), 6),
+            'mean_gain_p3_ffn': round(sum(p3_f) / max(1, len(p3_f)), 6),
+            'gains_outside_unit_interval': outside_unit,
+            'min_static_effective_mix_entry': round(float(min_mix_entry), 6),
+        }
+
     def execution_manifest(self) -> dict[str, Any]:
         """Return runtime identity, visit topology, activation mode, and memory tier manifest."""
         sched = self.visit_schedule_summary()
@@ -2907,19 +3100,52 @@ class SparkXLoopV03(nn.Module):
         swiglu_patched = bool(getattr(mlp_cls, '_sparkx_triton_swiglu_patched', False)) if mlp_cls is not None else False
         dlsa_bank = getattr(self, 'dlsa_index_bank', None)
         dlsa_params = int(dlsa_bank.total_map_parameters()) if (dlsa_bank is not None and hasattr(dlsa_bank, 'total_map_parameters')) else 0
+        recurrence_mode = self.effective_recurrence_mode()
+        train_mode = self.effective_recurrence_mode(training=True)
+        eval_mode = self.effective_recurrence_mode(training=False)
         return {
             'runtime_identity': str(getattr(self.settings, 'runtime_identity', 'legacy_silu_v03')),
+            'recurrence_mode_requested': str(getattr(self.settings, 'recurrence_mode', 'auto')),
+            'behavior_identity': f"{getattr(self.settings, 'runtime_identity', 'legacy_silu_v03')}:{recurrence_mode}",
+            'base_model': dict(getattr(self, 'base_runtime_info', {
+                'source': getattr(self.base.config, '_name_or_path', None),
+                'requested_revision': None,
+                'resolved_revision': getattr(self.base.config, '_commit_hash', None),
+                'tokenizer_source': None,
+                'tokenizer_resolved_revision': None,
+            })),
             'total_virtual_layers': int(sched['total_visits']),
             'global_visits': int(sched['global_visits']),
             'local_visits': int(sched['local_visits']),
             'preserve_native_activation': bool(getattr(self.settings, 'preserve_native_activation', False)),
             'mlp_swiglu_patched': swiglu_patched,
+            'attention_runtime': str(getattr(self, 'attention_runtime', 'unknown')),
+            'attention_training_supported': getattr(self, 'attention_training_supported', None),
             'engram_constructed': bool(self.engram is not None),
             'engram_enabled': bool(self.engram_enabled),
             'esm_enabled': bool(self.esm_enabled),
             'dlsa_attached': bool(dlsa_bank is not None),
             'dlsa_num_global_visits': int(len(dlsa_bank.visit_indexers)) if dlsa_bank is not None else 0,
             'dlsa_selector_parameters': dlsa_params,
+            'effective_recurrence_mode': recurrence_mode,
+            'recurrence_train_mode': train_mode,
+            'recurrence_eval_mode': eval_mode,
+            'recurrence_train_eval_mismatch': train_mode != eval_mode,
+            'mhc_requested': bool(self.mhc_enabled),
+            'mhc_executed': recurrence_mode == 'learned_mhc',
+            'mhc_gain_mode': str(getattr(self.settings, 'mhc_gain_mode', 'legacy_tanh')),
+            'mhc_schema_version': int(getattr(self.settings, 'mhc_schema_version', 1)),
+            'mhc_extra_pass_gate_multiplier': float(getattr(self.settings, 'mhc_extra_pass_gate_multiplier', 1.0)),
+            'highway_coefficients': {
+                'p2_entry_feedback': 0.05,
+                'p2_output_blend': 0.15,
+                'p3_entry_feedback': 0.03,
+                'p3_output_delta': 0.08,
+            } if recurrence_mode == 'native_gelu_depth_matched_highway' else None,
+            'selector_checkpoint_status': dict(getattr(self, 'dlsa_checkpoint_status', {
+                'initialization': 'unknown' if dlsa_bank is not None else 'not_attached',
+                'quality_evidence': 'not_evaluated_in_loader',
+            })),
             'visit_schedule': sched,
         }
 
@@ -3633,7 +3859,7 @@ class SparkXLoopV03(nn.Module):
                 )
         return (masks, rope), cache_position
 
-    def _apply_layer(self, idx, h, masks, ropes, past_key_values=None, cache_position=None, virtual_idx: Optional[int] = None, read_only_kv: bool = False):
+    def _apply_layer(self, idx, h, masks, ropes, past_key_values=None, cache_position=None, virtual_idx: Optional[int] = None, read_only_kv: bool = False, visit_ordinal: int = 0):
         layer = self.base.model.layers[idx]
         kind = layer.layer_type
         rp, mk = ropes[kind], masks[kind]
@@ -3643,16 +3869,20 @@ class SparkXLoopV03(nn.Module):
             if past_key_values is not None else None
         )
         def step(x, _layer=layer, _rp=rp, _mk=mk, _vc=v_cache, _cp=cache_position):
-            out = _layer(x.float(), position_embeddings=_rp, attention_mask=_mk,
-                         past_key_values=_vc, cache_position=_cp)
+            with _attention_visit_context(getattr(_layer, 'self_attn', None), idx,
+                                          virtual_idx if virtual_idx is not None else idx, visit_ordinal):
+                out = _layer(x.float(), position_embeddings=_rp, attention_mask=_mk,
+                             past_key_values=_vc, cache_position=_cp)
             return out.to(x.dtype)
         if v_cache is None and self.training and self.enable_checkpoint and (
             h.requires_grad or any(p.requires_grad for p in layer.parameters())
         ):
             ckpt_in = h.to(kv_dtype) if h.shape[1] >= 8192 else h
             return checkpoint(step, ckpt_in, use_reentrant=False).float()
-        return layer(h, position_embeddings=rp, attention_mask=mk,
-                     past_key_values=v_cache, cache_position=cache_position)
+        with _attention_visit_context(getattr(layer, 'self_attn', None), idx,
+                                      virtual_idx if virtual_idx is not None else idx, visit_ordinal):
+            return layer(h, position_embeddings=rp, attention_mask=mk,
+                         past_key_values=v_cache, cache_position=cache_position)
 
     def forward_hidden(self, input_ids: torch.LongTensor, attention_mask=None,
                        past_key_values=None, cache_position=None,
@@ -3721,7 +3951,7 @@ class SparkXLoopV03(nn.Module):
             if cap_hook is not None:
                 cap_hook(idx, v_idx, 0, 'pre_block', h)
             h = self._apply_layer(idx, h, masks, ropes, past_key_values=past_key_values,
-                                  cache_position=cache_position, virtual_idx=virtual_idx)
+                                  cache_position=cache_position, virtual_idx=virtual_idx, visit_ordinal=v_idx)
             if cap_hook is not None:
                 cap_hook(idx, v_idx, 0, 'post_layer', h)
             if self.engram_enabled:
@@ -3741,7 +3971,8 @@ class SparkXLoopV03(nn.Module):
         if self.enable_p3 and self.loop_passes >= 2:
             pass_spans.append((2, self.p3_start, self.p3_end))
 
-        if not self.mhc_enabled:
+        recurrence_mode = self.effective_recurrence_mode()
+        if recurrence_mode == 'plain_recurrence':
             for p, s_idx, e_idx in pass_spans:
                 for idx in range(s_idx, e_idx):
                     v_idx = visit_counts.get(idx, 0)
@@ -3753,7 +3984,8 @@ class SparkXLoopV03(nn.Module):
                     if cap_hook is not None:
                         cap_hook(idx, v_idx, p, 'pre_block', h)
                     h = self._apply_layer(idx, h, masks, ropes, past_key_values=past_key_values,
-                                          cache_position=cache_position, virtual_idx=eff_v_idx, read_only_kv=share_ro)
+                                          cache_position=cache_position, virtual_idx=eff_v_idx, read_only_kv=share_ro,
+                                          visit_ordinal=v_idx)
                     if cap_hook is not None:
                         cap_hook(idx, v_idx, p, 'post_layer', h)
                     if self.engram_enabled and str(idx) in self.backbone_engrams:
@@ -3767,13 +3999,11 @@ class SparkXLoopV03(nn.Module):
                     if cap_hook is not None:
                         cap_hook(idx, v_idx, p, 'post_block', h)
                     virtual_idx += 1
-        elif bool(getattr(self.settings, 'preserve_native_activation', False)) and not self.engram_enabled and not (
-            self.training and any(p.requires_grad for p in self.controllers.parameters())
-        ):
-            # Depth-Matched Two-Stream Recurrent Highway for native GELU Loop72-LSA (`XHToken/Spark-X2.6-4B`):
-            # - `s0_hwy` maintains the depth-27 highway (`h_L27`), while `s_work` enters Pass 2 at depth 3 (`h_L3`)
-            #   and Pass 3 at depth 11 (`h_L11`) so every layer visit `0..71` operates strictly in-distribution at its
-            #   native pre-trained depth without 240 per-sublayer FP32 dynamic routing kernel launches per token.
+        elif recurrence_mode == 'native_gelu_depth_matched_highway':
+            # Fixed-coefficient highway recurrence for native GELU Loop72-LSA.
+            # This executes all configured visits while bypassing learned mHC.
+            # Feedback changes the residual distribution; quality and compatibility
+            # with trained mHC checkpoints require separate evaluation.
             h_prelude_entry = h
             h_p3_entry = h
             h_p3_exit_ref: Optional[torch.Tensor] = None
@@ -3800,6 +4030,7 @@ class SparkXLoopV03(nn.Module):
                         cache_position=cache_position,
                         virtual_idx=eff_v_idx,
                         read_only_kv=share_ro,
+                        visit_ordinal=v_idx,
                     )
                     if cap_hook is not None:
                         cap_hook(idx, v_idx, p, 'post_layer', s_work)
@@ -3861,9 +4092,10 @@ class SparkXLoopV03(nn.Module):
                         else None
                     )
                     virtual_idx += 1
-                    def step(s, _ctrl=ctrl, _layer=layer, _rp=rp, _mk=mk, _extra=(p > 0), _p=p, _vc=v_cache, _cp=cache_position, _eng=eng_mod, _idx=idx, _v_idx=v_idx, _pf=engram_pass_filter):
-                        s_out = _ctrl(s, _layer, _rp, _mk, extra=_extra, pass_idx=_p,
-                                      past_key_values=_vc, cache_position=_cp)
+                    def step(s, _ctrl=ctrl, _layer=layer, _rp=rp, _mk=mk, _extra=(p > 0), _p=p, _vc=v_cache, _cp=cache_position, _eng=eng_mod, _idx=idx, _v_idx=v_idx, _virtual_idx=eff_v_idx, _pf=engram_pass_filter):
+                        with _attention_visit_context(getattr(_layer, 'self_attn', None), _idx, _virtual_idx, _v_idx):
+                            s_out = _ctrl(s, _layer, _rp, _mk, extra=_extra, pass_idx=_p,
+                                          past_key_values=_vc, cache_position=_cp)
                         if cap_hook is not None:
                             cap_hook(_idx, _v_idx, _p, 'post_layer', s_out[0])
                         if _eng is not None and (_pf is None or _p in _pf):
@@ -3897,7 +4129,7 @@ class SparkXLoopV03(nn.Module):
             if cap_hook is not None:
                 cap_hook(idx, v_idx, 0, 'pre_block', h)
             h = self._apply_layer(idx, h, masks, ropes, past_key_values=past_key_values,
-                                  cache_position=cache_position, virtual_idx=virtual_idx)
+                                  cache_position=cache_position, virtual_idx=virtual_idx, visit_ordinal=v_idx)
             if cap_hook is not None:
                 cap_hook(idx, v_idx, 0, 'post_layer', h)
             if self.engram_enabled and str(idx) in self.backbone_engrams:
@@ -3923,6 +4155,11 @@ class SparkXLoopV03(nn.Module):
         logits_to_keep: Optional[int] = None,
         chunk_size: Optional[int] = None,
     ):
+        """Return logits, optionally retaining only the final positive number of tokens.
+
+        ``logits_to_keep=None`` or a non-positive value retains every token.
+        Chunked prefill retains the requested tail even across a chunk boundary.
+        """
         input_ids = _unwrap_input_ids(input_ids)
         seq_len = int(input_ids.shape[1]) if input_ids.ndim == 2 else 0
         if (
@@ -3933,7 +4170,8 @@ class SparkXLoopV03(nn.Module):
         ):
             step = int(chunk_size)
             h_chunks: list[torch.Tensor] = []
-            keep_all_h = logits_to_keep is None or int(logits_to_keep) >= seq_len
+            keep_all_h = logits_to_keep is None or int(logits_to_keep) <= 0 or int(logits_to_keep) >= seq_len
+            tail_start = 0 if keep_all_h else max(0, seq_len - int(logits_to_keep))
             cur_prev = prev_ids
             for start in range(0, seq_len, step):
                 end = min(seq_len, start + step)
@@ -3949,12 +4187,8 @@ class SparkXLoopV03(nn.Module):
                 )
                 if keep_all_h:
                     h_chunks.append(h_sub)
-                elif end == seq_len:
-                    k_keep = max(1, int(logits_to_keep))
-                    if h_sub.shape[1] >= k_keep:
-                        h_chunks = [h_sub[:, -k_keep:, :]]
-                    else:
-                        h_chunks.append(h_sub)
+                elif end > tail_start:
+                    h_chunks.append(h_sub[:, max(0, tail_start - start):, :])
                 cur_prev = input_ids[:, max(0, end - 2):end]
             h = torch.cat(h_chunks, dim=1) if len(h_chunks) > 1 else h_chunks[0]
         else:
@@ -4025,10 +4259,23 @@ class SparkXLoopV03(nn.Module):
         tokenizer=None,
         think_budget_tokens: Optional[int] = None,
         stream_print: bool = True,
+        force_think_close: bool = True,
+        token_callback: Optional[Callable[[int], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
         **kwargs,
     ):
-        """Pure, un-distorted 72-visit BF16 KV-cached looped generation."""
+        """KV-cached generation using the model's configured recurrence.
+
+        ``token_callback`` receives each appended output token once, including EOS
+        and budget-injected closing tokens. ``should_stop`` cancels between model
+        steps by raising ``InterruptedError``. Neither hook changes sampling.
+        ``force_think_close=False`` disables budget-injected closing tokens.
+        """
         from transformers.cache_utils import DynamicCache
+        if token_callback is not None and not callable(token_callback):
+            raise TypeError('token_callback must be callable or None')
+        if should_stop is not None and not callable(should_stop):
+            raise TypeError('should_stop must be callable or None')
         input_ids = _unwrap_input_ids(input_ids)
         prev_train = self.training
         self.eval()
@@ -4080,7 +4327,9 @@ class SparkXLoopV03(nn.Module):
 
         min_think_tokens = int(kwargs.get('min_think_tokens', 0) or 0)
         eff_think_budget: Optional[int] = None
-        if think_budget_tokens is not None and int(think_budget_tokens) > 0:
+        if not force_think_close:
+            eff_think_budget = None
+        elif think_budget_tokens is not None and int(think_budget_tokens) > 0:
             eff_think_budget = min(int(think_budget_tokens), max(64, int(max_new_tokens) - 256))
         else:
             # Default safety ceiling so generation never hits max_new_tokens while still inside <think>
@@ -4110,6 +4359,11 @@ class SparkXLoopV03(nn.Module):
         t_decode_start = t_start
         ttft_sec: float = 0.0
         itl_ms_list: list[float] = []
+        finish_reason = 'length'
+
+        def _check_cancelled() -> None:
+            if should_stop is not None and should_stop():
+                raise InterruptedError('Generation cancelled between model steps')
 
         def _sample_step(step_logits: torch.Tensor, cur_gen: list[int], is_closed: bool) -> torch.Tensor:
             logits_1d = step_logits[0, -1, :].float().clone()
@@ -4165,6 +4419,9 @@ class SparkXLoopV03(nn.Module):
             return torch.multinomial(probs, num_samples=1).unsqueeze(0)
 
         try:
+            _check_cancelled()
+            if int(max_new_tokens) <= 0:
+                return out_buf[:, :cur_len]
             logits = self.forward_logits(
                 out_buf[:, :cur_len],
                 past_key_values=cache,
@@ -4182,16 +4439,21 @@ class SparkXLoopV03(nn.Module):
             prev_tok = out_buf[:, max(0, cur_len - 2) : cur_len]
             out_buf[:, cur_len : cur_len + 1].copy_(next_id)
             cur_len += 1
+            if token_callback is not None:
+                token_callback(tok_int)
             if tok_int in stop_ids:
+                finish_reason = 'stop'
                 return out_buf[:, :cur_len]
             step_i = 1
             while step_i < max_new_tokens:
+                _check_cancelled()
                 t_step_0 = time.perf_counter()
                 # Enforce think_budget_tokens so the model NEVER truncates mid-thought without emitting </think>
                 if not think_closed and eff_think_budget is not None and len(gen_list) >= eff_think_budget:
                     for cid in close_seq_ids:
                         if step_i >= max_new_tokens:
                             break
+                        _check_cancelled()
                         _ = self.forward_logits(next_id, past_key_values=cache, prev_ids=prev_tok, logits_to_keep=1)
                         prev_tok = out_buf[:, max(0, cur_len - 2) : cur_len]
                         next_id = torch.tensor([[cid]], dtype=out_buf.dtype, device=out_buf.device)
@@ -4199,6 +4461,8 @@ class SparkXLoopV03(nn.Module):
                         out_buf[:, cur_len : cur_len + 1].copy_(next_id)
                         cur_len += 1
                         step_i += 1
+                        if token_callback is not None:
+                            token_callback(cid)
                     in_think = False
                     think_closed = True
                     if stream_print:
@@ -4214,6 +4478,7 @@ class SparkXLoopV03(nn.Module):
                         break
                     t_step_0 = time.perf_counter()
 
+                _check_cancelled()
                 logits = self.forward_logits(next_id, past_key_values=cache, prev_ids=prev_tok, logits_to_keep=1)
                 prev_tok = out_buf[:, max(0, cur_len - 2) : cur_len]
                 if not think_closed and tokenizer is not None and (len(gen_list) <= 16 or len(gen_list) % 8 == 0):
@@ -4243,6 +4508,8 @@ class SparkXLoopV03(nn.Module):
                 out_buf[:, cur_len : cur_len + 1].copy_(next_id)
                 cur_len += 1
                 step_i += 1
+                if token_callback is not None:
+                    token_callback(tok_int)
 
                 if stream_print and tokenizer is not None and len(gen_list) % 128 == 0:
                     dec_dt = max(1e-3, time.perf_counter() - t_decode_start)
@@ -4256,6 +4523,7 @@ class SparkXLoopV03(nn.Module):
                     )
 
                 if tok_int in stop_ids:
+                    finish_reason = 'stop'
                     if stream_print:
                         dec_dt = max(1e-3, time.perf_counter() - t_decode_start)
                         e2e_dt = max(1e-3, time.perf_counter() - t_start)
@@ -4266,6 +4534,12 @@ class SparkXLoopV03(nn.Module):
                             flush=True,
                         )
                     break
+        except InterruptedError:
+            finish_reason = 'cancelled'
+            raise
+        except Exception:
+            finish_reason = 'error'
+            raise
         finally:
             t_end = time.perf_counter()
             e2e_sec = max(1e-6, t_end - t_start)
@@ -4277,6 +4551,7 @@ class SparkXLoopV03(nn.Module):
                 "prompt_tokens": prompt_len,
                 "generated_tokens": len(gen_list),
                 "decode_steps": decode_steps,
+                "finish_reason": finish_reason,
                 "ttft_sec": round(ttft_sec, 4),
                 "ttft_ms": round(ttft_sec * 1000.0, 2),
                 "prefill_tok_per_s": round(prompt_len / max(1e-6, ttft_sec), 2),
@@ -4414,6 +4689,9 @@ def loop_v03_state_dict(model: SparkXLoopV03, include_tier1b: bool = True) -> di
         'use_pass_gain_schedule': bool(getattr(model.engram, 'use_pass_gain_schedule', False)) if model.engram is not None else False,
         'esm_enabled': bool(getattr(model, 'esm_enabled', False)),
         'esm_visits': str(getattr(model, 'esm_visits', 'first')),
+        'mhc_gain_mode': str(getattr(model.settings, 'mhc_gain_mode', 'legacy_tanh')),
+        'mhc_schema_version': int(getattr(model.settings, 'mhc_schema_version', 1)),
+        'mhc_extra_pass_gate_multiplier': float(getattr(model.settings, 'mhc_extra_pass_gate_multiplier', 1.0)),
     }
     esm_state = {}
     if hasattr(model, 'esm'):
@@ -4429,9 +4707,9 @@ def loop_v03_state_dict(model: SparkXLoopV03, include_tier1b: bool = True) -> di
         'version': 'v0.3-en4b-a1b',
         'settings': dataclasses.asdict(model.settings),
         'active_meta': active_meta,
-        'controllers': {k: v.detach().cpu() for k, v in model.controllers.state_dict().items()},
-        'engram': ({k: v.detach().cpu() for k, v in model.engram.state_dict().items()} if model.engram is not None else {}),
-        'backbone_engrams': {k: v.detach().cpu() for k, v in model.backbone_engrams.state_dict().items()},
+        'controllers': {k: v.detach().cpu().clone() for k, v in model.controllers.state_dict().items()},
+        'engram': ({k: v.detach().cpu().clone() for k, v in model.engram.state_dict().items()} if model.engram is not None else {}),
+        'backbone_engrams': {k: v.detach().cpu().clone() for k, v in model.backbone_engrams.state_dict().items()},
         'tier1b_cold': tier1b,
         'esm': esm_state,
         'dlsa_index_bank': dlsa_state,
@@ -4441,6 +4719,22 @@ def loop_v03_state_dict(model: SparkXLoopV03, include_tier1b: bool = True) -> di
 def load_loop_v03_state_dict(model: SparkXLoopV03, state: dict, strict: bool = False) -> dict:
     """Restore v0.3 loop state (including mHC controllers, ESM shards, D-LSA index bank, and optional MoE-Engrams)."""
     meta = state.get('active_meta', {})
+    saved_settings = state.get('settings', {})
+    if 'recurrence_mode' in saved_settings:
+        model.settings.recurrence_mode = str(saved_settings['recurrence_mode'])
+        model.effective_recurrence_mode()  # Reject an invalid saved mode before loading weights.
+    saved_gain_mode = str(saved_settings.get('mhc_gain_mode', meta.get('mhc_gain_mode', getattr(model.settings, 'mhc_gain_mode', 'legacy_tanh'))))
+    saved_p2_init = float(saved_settings.get('mhc_init_p2_gain', getattr(model.settings, 'mhc_init_p2_gain', 0.01)))
+    saved_p3_init = float(saved_settings.get('mhc_init_p3_gain', getattr(model.settings, 'mhc_init_p3_gain', 0.005)))
+    saved_gate_mult = float(saved_settings.get('mhc_extra_pass_gate_multiplier', meta.get('mhc_extra_pass_gate_multiplier', getattr(model.settings, 'mhc_extra_pass_gate_multiplier', 1.0))))
+    if hasattr(model, 'set_mhc_gain_mode'):
+        model.set_mhc_gain_mode(
+            gain_mode=saved_gain_mode,
+            init_p2_gain=saved_p2_init,
+            init_p3_gain=saved_p3_init,
+            extra_pass_gate_multiplier=saved_gate_mult,
+            reset_gains=False,
+        )
     if model.engram is not None:
         act_e = int(meta.get('engram_active_experts', model.engram.active_experts))
         act_k = int(meta.get('engram_active_top_k', model.engram.active_top_k))
@@ -4489,6 +4783,8 @@ def load_loop_v03_state_dict(model: SparkXLoopV03, state: dict, strict: bool = F
         'backbone_engrams': b_res,
         'esm_layers_loaded': esm_loaded,
         'dlsa_index_bank': dlsa_res,
+        'mhc_gain_mode': str(getattr(model.settings, 'mhc_gain_mode', 'legacy_tanh')),
+        'mhc_schema_version': int(getattr(model.settings, 'mhc_schema_version', 1)),
     }
 
 

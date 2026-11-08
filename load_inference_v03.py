@@ -1,6 +1,7 @@
 """One-call loader for Spark-X2.6-4B-En4B-A1B (SparkX-Loop v0.3: 8.34B Total / 5.33B Active, 72 Effective Layers)."""
 from __future__ import annotations
 import dataclasses
+import hashlib
 import json
 import os
 from typing import Optional
@@ -17,6 +18,14 @@ from sparkx_loop_v03_core import (
     patch_spark_attention_for_lsa,
     patch_spark_for_unsloth_triton,
 )
+
+
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, 'rb') as source_file:
+        for block in iter(lambda: source_file.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _patch_transformers_v5_tied_weights() -> None:
@@ -270,6 +279,7 @@ def configure_model_for_loop72_lsa(
     model: SparkXLoopV03,
     config: Optional[dict] = None,
     dlsa_checkpoint: Optional[str] = None,
+    attach_sparse_attention: bool = True,
 ) -> dict:
     """Configure an existing `SparkXLoopV03` instance for the Loop72 + Per-Visit Paged D-LSA runtime."""
     from sparkx_dlsa import DLSAIndexConfig, VisitAwareDLSAIndexBank
@@ -284,17 +294,36 @@ def configure_model_for_loop72_lsa(
     cache_cfg = cfg.get('cache', cfg.get('runtime', {}))
     prefill_cfg = cfg.get('prefill', cfg.get('runtime', {}))
     mem_cfg = cfg.get('memory', {})
+    if not attach_sparse_attention:
+        if dlsa_checkpoint is not None:
+            raise ValueError('A D-LSA checkpoint requires attach_sparse_attention=True')
+        if any(getattr(getattr(layer, 'self_attn', None), '_sparkx_loop72_dlsa_attached', False)
+               for layer in model.base.model.layers):
+            raise ValueError('Load a fresh model with attach_sparse_attention=False for differentiable training')
 
     preserve_native = bool(model_cfg.get('preserve_native_activation', True))
     runtime_identity = str(model_cfg.get('runtime_identity', 'native_gelu_loop72'))
     model.settings.preserve_native_activation = preserve_native
     model.settings.runtime_identity = runtime_identity
-    model.settings.use_paged_hybrid_cache = True
+    model.settings.recurrence_mode = str(loop_cfg.get(
+        'recurrence_mode', getattr(model.settings, 'recurrence_mode', 'auto')
+    ))
+    model.settings.use_paged_hybrid_cache = bool(attach_sparse_attention)
     model.settings.prefill_chunk_tokens = int(prefill_cfg.get('hidden_chunk_tokens', 2048))
     model.settings.ce_chunk_tokens = int(prefill_cfg.get('ce_chunk_tokens', 2048))
 
     patch_spark_for_unsloth_triton(model.base, preserve_native_activation=preserve_native)
-    if hasattr(model, 'controllers'):
+    if 'mhc_gain_mode' in loop_cfg and hasattr(model, 'set_mhc_gain_mode'):
+        model.set_mhc_gain_mode(
+            gain_mode=str(loop_cfg['mhc_gain_mode']),
+            init_p2_gain=float(loop_cfg.get('mhc_init_p2_gain', getattr(model.settings, 'mhc_init_p2_gain', 0.01))),
+            init_p3_gain=float(loop_cfg.get('mhc_init_p3_gain', getattr(model.settings, 'mhc_init_p3_gain', 0.005))),
+            extra_pass_gate_multiplier=float(loop_cfg.get('mhc_extra_pass_gate_multiplier', getattr(model.settings, 'mhc_extra_pass_gate_multiplier', 1.0))),
+            reset_gains=bool(loop_cfg.get('reset_mhc_controllers', False)),
+        )
+    # Reconfiguration must preserve trained controller state loaded by the caller.
+    # Pristine controllers are already initialized at construction time.
+    if bool(loop_cfg.get('reset_mhc_controllers', False)) and hasattr(model, 'controllers'):
         for ctrl in model.controllers.values():
             if hasattr(ctrl, 'reset_parameters_to_step0'):
                 ctrl.reset_parameters_to_step0()
@@ -318,6 +347,22 @@ def configure_model_for_loop72_lsa(
                 esm_mod.gpu_resident_budget_bytes = esm_gpu_b
             if hasattr(esm_mod, 'persistent_shard_budget_bytes'):
                 esm_mod.persistent_shard_budget_bytes = esm_disk_b
+
+    if not attach_sparse_attention:
+        # The loader constructed this model with the native differentiable Spark
+        # SDPA path, including partial RoPE and the sigmoid output gate. Do not
+        # route training through the detached inference KV archive.
+        model.attention_runtime = 'native_differentiable_sdpa'
+        model.attention_training_supported = True
+        model.dlsa_checkpoint_status = {
+            'initialization': 'not_attached',
+            'quality_evidence': 'not_evaluated_in_loader',
+        }
+        return {
+            'manifest': model.execution_manifest(),
+            'attach_info': {'status': 'disabled', 'reason': 'differentiable_native_attention'},
+            'dlsa_map_parameters': 0,
+        }
 
     pool_sz = int(attn_cfg.get('pool_size', attn_cfg.get('n_pool', 4)))
     cluster_blk = int(attn_cfg.get('cluster_block_tokens', attn_cfg.get('n_cluster', 512)))
@@ -369,9 +414,35 @@ def configure_model_for_loop72_lsa(
         n_layers=int(model.n_layers),
     ).to(device)
 
-    if dlsa_checkpoint is not None and os.path.exists(dlsa_checkpoint):
+    model.dlsa_checkpoint_status = {
+        'initialization': 'random_orthogonal',
+        'quality_evidence': 'not_evaluated_in_loader',
+        'checkpoint_name': None,
+        'checkpoint_sha256': None,
+        'load_report': None,
+    }
+    if dlsa_checkpoint is not None:
+        if not os.path.isfile(dlsa_checkpoint):
+            raise FileNotFoundError(f'D-LSA checkpoint does not exist: {dlsa_checkpoint}')
         ckpt_data = torch.load(dlsa_checkpoint, map_location='cpu')
-        bank.load_from_checkpoint_dict(ckpt_data)
+        load_report = bank.load_from_checkpoint_dict(ckpt_data)
+        if int(load_report.get('loaded_modules', 0)) == 0:
+            raise ValueError('D-LSA checkpoint did not load any selector modules')
+        prov = load_report.get('provenance') if isinstance(load_report, dict) else None
+        cur_rec_mode = model.effective_recurrence_mode(training=False)
+        rec_match = (
+            None
+            if not isinstance(prov, dict) or not prov.get('recurrence_mode')
+            else (str(prov.get('recurrence_mode')) == cur_rec_mode)
+        )
+        model.dlsa_checkpoint_status.update({
+            'initialization': 'checkpoint_loaded_unverified',
+            'checkpoint_name': os.path.basename(dlsa_checkpoint),
+            'checkpoint_sha256': _file_sha256(dlsa_checkpoint),
+            'load_report': load_report,
+            'provenance': dict(prov) if isinstance(prov, dict) else {},
+            'recurrence_mode_match': rec_match,
+        })
 
     gpu_hot_tok = int(cache_cfg.get('global_hot_tokens_per_visit', 8192))
     sparse_cfg = SparseAttentionConfig(
@@ -403,7 +474,7 @@ def configure_model_for_loop72_lsa(
         persistent_token_latents=bool(cache_cfg.get('persistent_token_latents', False)),
         context_limit_tokens=int(cache_cfg.get('context_limit_tokens', model_cfg.get('context_limit_tokens', 1048576))),
         model_revision=str(model_cfg.get('base', model_cfg.get('backbone_id', 'XHToken/Spark-X2.6-4B'))),
-        behavior_fingerprint=runtime_identity,
+        behavior_fingerprint=f'{runtime_identity}:{model.effective_recurrence_mode(training=False)}',
     )
     attach_info = attach_loop72_dlsa_attention(model, index_bank=bank, sparse_cfg=sparse_cfg)
     return {
@@ -424,6 +495,9 @@ def load_sparkx_loop72_lsa(
     use_pristine_base: bool = True,
     token: Optional[str] = None,
     return_meta: bool = False,
+    revision: Optional[str] = None,
+    recurrence_mode: Optional[str] = None,
+    attach_sparse_attention: bool = True,
 ):
     """Load the Spark-X2.6-4B-Loop72-LSA architecture strictly atop the original `XHToken/Spark-X2.6-4B` model
     (72 visits = 18 global + 54 local, native GELU, 0 Engram params)."""
@@ -432,11 +506,14 @@ def load_sparkx_loop72_lsa(
         base_repo = str(model_id)
         repo_or_dir = str(model_id)
     cfg = load_loop72_lsa_yaml_config(config_path)
+    if recurrence_mode is not None:
+        cfg = {**cfg, 'loop': {**cfg.get('loop', {}), 'recurrence_mode': str(recurrence_mode)}}
     if token is None:
         token = os.environ.get('HF_TOKEN') or None
 
     meta: dict = {'base': base_repo, 'merged_standalone': False}
     state: Optional[dict] = None
+    state_path: Optional[str] = None
     if os.path.isdir(repo_or_dir):
         for cname in ('loop_config_v03.json', 'loop_config.json'):
             p = os.path.join(repo_or_dir, cname)
@@ -448,14 +525,15 @@ def load_sparkx_loop72_lsa(
             p = os.path.join(repo_or_dir, sname)
             if os.path.exists(p):
                 state = torch.load(p, map_location='cpu')
+                state_path = p
                 break
 
     backbone_source = repo_or_dir if (os.path.isdir(repo_or_dir) and not bool(use_pristine_base)) else base_repo
 
     try:
-        tok = AutoTokenizer.from_pretrained(backbone_source, trust_remote_code=True, token=token)
+        tok = AutoTokenizer.from_pretrained(backbone_source, trust_remote_code=True, token=token, revision=revision)
     except Exception:
-        tok = AutoTokenizer.from_pretrained(base_repo, trust_remote_code=True, token=token)
+        tok = AutoTokenizer.from_pretrained(base_repo, trust_remote_code=True, token=token, revision=revision)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
 
@@ -465,6 +543,7 @@ def load_sparkx_loop72_lsa(
         dtype=dtype,
         low_cpu_mem_usage=True,
         token=token,
+        revision=revision,
     ).to(device)
 
     settings = LoopV03Settings.for_loop72_lsa(checkpoint_layers=False, offload_checkpoint_to_cpu=False)
@@ -473,13 +552,41 @@ def load_sparkx_loop72_lsa(
     if hasattr(model, 'esm'):
         model.esm.to(device=device)
 
+    model.base_runtime_info = {
+        'source': backbone_source,
+        'requested_revision': revision,
+        'resolved_revision': getattr(base.config, '_commit_hash', None),
+        'tokenizer_source': getattr(tok, 'name_or_path', backbone_source),
+        'tokenizer_resolved_revision': getattr(tok, 'init_kwargs', {}).get('_commit_hash'),
+    }
+    embedded_dlsa_state = state.get('dlsa_index_bank') if state is not None else None
     if state is not None:
         load_loop_v03_state_dict(model, state, strict=False)
         del state
 
-    loop72_info = configure_model_for_loop72_lsa(model, config=cfg, dlsa_checkpoint=dlsa_checkpoint)
-    model.loaded_meta = {**meta, 'loop72_lsa': loop72_info}
+    loop72_info = configure_model_for_loop72_lsa(
+        model, config=cfg, dlsa_checkpoint=dlsa_checkpoint,
+        attach_sparse_attention=attach_sparse_attention,
+    )
+    # The bank does not exist during load_loop_v03_state_dict above. Restore its
+    # saved payload after attachment; an explicit D-LSA checkpoint takes precedence.
+    if embedded_dlsa_state is not None and dlsa_checkpoint is None and attach_sparse_attention:
+        load_report = model.dlsa_index_bank.load_from_checkpoint_dict(embedded_dlsa_state)
+        if int(load_report.get('loaded_modules', 0)) == 0:
+            raise ValueError('Loop state did not restore any D-LSA selector modules')
+        model.dlsa_checkpoint_status = {
+            'initialization': 'loop_state_checkpoint_loaded_unverified',
+            'quality_evidence': 'not_evaluated_in_loader',
+            'checkpoint_name': os.path.basename(state_path) if state_path else None,
+            'checkpoint_sha256': _file_sha256(state_path) if state_path else None,
+            'load_report': load_report,
+        }
+    elif embedded_dlsa_state is not None and not attach_sparse_attention:
+        model.dlsa_checkpoint_status['saved_selector_payload_not_attached'] = True
+    del embedded_dlsa_state
     model.eval()
+    loop72_info['manifest'] = model.execution_manifest()
+    model.loaded_meta = {**meta, 'base_runtime': model.base_runtime_info, 'loop72_lsa': loop72_info}
     if return_meta:
         return model, tok, model.loaded_meta
     return model, tok

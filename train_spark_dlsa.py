@@ -291,15 +291,75 @@ def distill_single_visit_indexer(
     }
 
 
+def stamp_bank_provenance(
+    bank: "VisitAwareDLSAIndexBank",
+    model: Optional[Any] = None,
+    mhc_checkpoint_path: Optional[str] = None,
+    mhc_checkpoint_sha256: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Stamp the exact mHC checkpoint SHA256, recurrence mode, and schema version into `bank.provenance` (Stage E lock)."""
+    import hashlib
+    import os
+
+    sha = mhc_checkpoint_sha256
+    if sha is None and mhc_checkpoint_path and os.path.isfile(mhc_checkpoint_path):
+        h = hashlib.sha256()
+        with open(mhc_checkpoint_path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        sha = h.hexdigest()
+    elif sha is None and model is not None and hasattr(model, "controllers"):
+        h = hashlib.sha256()
+        for k, v in sorted(model.controllers.state_dict().items()):
+            h.update(k.encode("utf-8"))
+            h.update(v.detach().cpu().float().numpy().tobytes())
+        sha = h.hexdigest()
+
+    rec_mode = None
+    gain_mode = None
+    schema_ver = None
+    base_rev = None
+    if model is not None:
+        if hasattr(model, "effective_recurrence_mode"):
+            rec_mode = str(model.effective_recurrence_mode(training=False))
+        settings = getattr(model, "settings", None)
+        if settings is not None:
+            gain_mode = str(getattr(settings, "mhc_gain_mode", "legacy_tanh"))
+            schema_ver = int(getattr(settings, "mhc_schema_version", 1))
+        base_info = getattr(model, "base_runtime_info", {})
+        if isinstance(base_info, dict):
+            base_rev = base_info.get("resolved_revision") or base_info.get("requested_revision")
+
+    if hasattr(bank, "set_provenance"):
+        return bank.set_provenance(
+            mhc_checkpoint_sha256=sha,
+            mhc_checkpoint_path=os.path.basename(mhc_checkpoint_path) if mhc_checkpoint_path else None,
+            recurrence_mode=rec_mode,
+            mhc_gain_mode=gain_mode,
+            mhc_schema_version=schema_ver,
+            base_model_revision=base_rev,
+        )
+    return {}
+
+
 def distill_loop72_visit_bank(
     bank: "VisitAwareDLSAIndexBank",
     visit_qkv_samples: Dict[int, Sequence[Tuple["torch.Tensor", "torch.Tensor"]]],
     cfg: Optional[VisitDistillConfig] = None,
+    model: Optional[Any] = None,
+    mhc_checkpoint_path: Optional[str] = None,
+    mhc_checkpoint_sha256: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run PCA initialization + sampled-query KL distillation across all 18 global visits of `VisitAwareDLSAIndexBank`."""
     if not HAS_TORCH:
         raise RuntimeError("distill_loop72_visit_bank requires PyTorch.")
     t0 = time.perf_counter()
+    prov = stamp_bank_provenance(
+        bank,
+        model=model,
+        mhc_checkpoint_path=mhc_checkpoint_path,
+        mhc_checkpoint_sha256=mhc_checkpoint_sha256,
+    )
     pca_rep = fit_loop72_visit_bank_pca(bank, visit_qkv_samples)
     distill_rep: Dict[int, Dict[str, Any]] = {}
     for gv_idx in range(len(LOOP72_GLOBAL_VISIT_SCHEDULE)):
@@ -314,6 +374,7 @@ def distill_loop72_visit_bank(
         "num_global_visits": len(LOOP72_GLOBAL_VISIT_SCHEDULE),
         "total_map_parameters": bank.total_map_parameters(),
         "elapsed_sec": round(time.perf_counter() - t0, 3),
+        "provenance": prov,
         "pca_init": pca_rep,
         "distill": distill_rep,
     }

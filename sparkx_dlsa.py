@@ -794,8 +794,30 @@ class FaithfulDLSAIndexer(nn.Module):
         return (F.softplus(raw.float()) - base).clamp(min=0.0, max=8.0)
 
     def dist_alpha_over_tau(self) -> float:
+        # Selector scalars are constant during inference. Avoid two GPU-to-host
+        # synchronizations per sparse query while invalidating on standard
+        # parameter updates, checkpoint loads, replacement, or device/dtype moves.
+        cache_key = None
+        if not self.training:
+            raw = getattr(self, 'raw_dist_alpha', None)
+            try:
+                cache_key = (
+                    id(self.log_tau), self.log_tau._version, self.log_tau.device, self.log_tau.dtype,
+                    id(raw), raw._version if raw is not None else None,
+                    raw.device if raw is not None else None, raw.dtype if raw is not None else None,
+                )
+            except RuntimeError:
+                # Inference tensors without version counters cannot safely reuse
+                # a value across arbitrary mutation.
+                cache_key = None
+            if cache_key is not None and cache_key == getattr(self, '_distance_prior_cache_key', None):
+                return self._distance_prior_cache_value
         tau = float(self.log_tau.detach().float().exp().clamp(1.0, 64.0).item())
-        return float(self.dist_alpha().detach().item()) / tau
+        value = float(self.dist_alpha().detach().item()) / tau
+        if cache_key is not None:
+            self._distance_prior_cache_key = cache_key
+            self._distance_prior_cache_value = value
+        return value
 
     # ---- projections
     def project_q(self, q_in: torch.Tensor) -> torch.Tensor:
@@ -1745,6 +1767,7 @@ class VisitAwareDLSAIndexBank(nn.Module):
             self.indexers = nn.ModuleDict({str(l_idx): _make_ix() for l_idx in unique_layers})
 
         self.per_visit_budget_overrides: Dict[int, int] = {}
+        self.provenance: Dict[str, Any] = {}
         merged_overrides: Dict[Any, int] = {}
         if per_visit_budget_overrides:
             merged_overrides.update(per_visit_budget_overrides)
@@ -1880,6 +1903,11 @@ class VisitAwareDLSAIndexBank(nn.Module):
         for ix in self.indexers.values():
             ix.reset_decode_cache()
 
+    def set_provenance(self, **kwargs: Any) -> Dict[str, Any]:
+        """Record mHC checkpoint SHA256, recurrence mode, and schema version used to calibrate this selector bank."""
+        self.provenance.update({k: v for k, v in kwargs.items() if v is not None})
+        return dict(self.provenance)
+
     def parameter_manifest(self) -> Dict[str, Any]:
         map_params = self.total_map_parameters()
         total_params = sum(p.numel() for p in self.parameters())
@@ -1893,11 +1921,13 @@ class VisitAwareDLSAIndexBank(nn.Module):
             "search_mode": self.search_mode,
             "default_k_long_range": self.k_long_range,
             "per_visit_budget_overrides": dict(self.per_visit_budget_overrides),
+            "provenance": dict(self.provenance),
         }
 
     def export_manifest_state(self) -> Dict[str, Any]:
         return {
             "manifest": self.parameter_manifest(),
+            "provenance": dict(self.provenance),
             "global_schedule": [dict(r) for r in self.global_schedule],
             "state_dict": {k: v.detach().cpu() for k, v in self.state_dict().items()},
         }
@@ -1907,11 +1937,18 @@ class VisitAwareDLSAIndexBank(nn.Module):
     def load_from_legacy_or_visit_checkpoint(self, ckpt_data: Dict[str, Any], strict: bool = False) -> Dict[str, Any]:
         """Load either an 18-visit `VisitAwareDLSAIndexBank` checkpoint or broadcast a 9-layer `LSA-F2` checkpoint
         across each physical layer's visits."""
+        prov = ckpt_data.get("provenance") or ckpt_data.get("manifest", {}).get("provenance")
+        if isinstance(prov, dict):
+            self.provenance = dict(prov)
         if "state_dict" in ckpt_data and isinstance(ckpt_data["state_dict"], dict):
             sd = ckpt_data["state_dict"]
             if any(k.startswith("indexers.") for k in sd.keys()):
                 self.load_state_dict(sd, strict=strict)
-                return {"mode": "visit_bank_state_dict", "loaded_modules": len(self.indexers)}
+                return {
+                    "mode": "visit_bank_state_dict",
+                    "loaded_modules": len(self.indexers),
+                    "provenance": dict(self.provenance),
+                }
         raw_visits = ckpt_data.get("visit_indexers")
         if isinstance(raw_visits, dict) and self.maps_per_global_visit:
             loaded = 0
@@ -1921,7 +1958,11 @@ class VisitAwareDLSAIndexBank(nn.Module):
                     self.indexers[str(gid)].load_state_dict(src_sd, strict=strict)
                     loaded += 1
             if loaded > 0:
-                return {"mode": "visit_indexers_dict", "loaded_modules": loaded}
+                return {
+                    "mode": "visit_indexers_dict",
+                    "loaded_modules": loaded,
+                    "provenance": dict(self.provenance),
+                }
 
         raw_layers = ckpt_data.get("indexers", ckpt_data.get("layers", ckpt_data))
         loaded = 0
@@ -1944,7 +1985,11 @@ class VisitAwareDLSAIndexBank(nn.Module):
                 if isinstance(src_sd, dict):
                     ix.load_state_dict(src_sd, strict=strict)
                     loaded += 1
-        return {"mode": "broadcast_layer_indexers", "loaded_modules": loaded}
+        return {
+            "mode": "broadcast_layer_indexers",
+            "loaded_modules": loaded,
+            "provenance": dict(self.provenance),
+        }
 
     def load_from_checkpoint_dict(self, ckpt_data: Dict[str, Any], strict: bool = False) -> Dict[str, Any]:
         """Alias for `load_from_legacy_or_visit_checkpoint` used by `load_inference_v03.py` and `train_spark_dlsa.py`."""

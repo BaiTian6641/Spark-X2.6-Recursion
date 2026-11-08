@@ -551,6 +551,8 @@ def attach_loop72_dlsa_attention(
 
     loop_model.dlsa_index_bank = index_bank
     loop_model.sparse_attention_cfg = cfg
+    loop_model.attention_runtime = 'paged_dlsa_inference'
+    loop_model.attention_training_supported = False
     telemetry = SparseRuntimeTelemetry()
     loop_model.sparse_telemetry = telemetry
 
@@ -568,6 +570,12 @@ def attach_loop72_dlsa_attention(
             cache_position: Optional[torch.Tensor] = None,
             **kwargs,
         ):
+            if torch.is_grad_enabled() and (self_attn.training or hidden_states.requires_grad):
+                raise RuntimeError(
+                    'Paged D-LSA attention uses detached inference KV storage and cannot train mHC. '
+                    'Load with attach_sparse_attention=False and recurrence_mode="learned_mhc" '
+                    'for differentiable native attention training.'
+                )
             input_shape = hidden_states.shape[:-1]
             bsz, q_len = int(input_shape[0]), int(input_shape[1])
             h_dim = int(getattr(self_attn, "head_dim", 256) or 256)
@@ -638,7 +646,17 @@ def attach_loop72_dlsa_attention(
 
             # Check if `past_key_values` is a `_VisitCache` wrapping `Loop72HybridPagedCache`
             raw_cache = getattr(past_key_values, "cache", past_key_values)
-            v_idx = int(getattr(past_key_values, "virtual_idx", phys_idx)) if past_key_values is not None else phys_idx
+            visit_context = getattr(self_attn, '_sparkx_active_visit', None)
+            if visit_context is not None and int(visit_context[0]) != phys_idx:
+                raise RuntimeError('Attention visit context belongs to a different physical layer')
+            if past_key_values is not None:
+                v_idx = int(getattr(past_key_values, 'virtual_idx', phys_idx))
+            elif visit_context is not None:
+                v_idx = int(visit_context[1])
+            elif len(getattr(loop_model, 'execution_plan', layers)) > len(layers):
+                raise RuntimeError('Uncached looped D-LSA requires explicit visit identity; call the loop model forward')
+            else:
+                v_idx = phys_idx
             read_only = bool(getattr(past_key_values, "read_only", False))
 
             if isinstance(raw_cache, Loop72HybridPagedCache):
@@ -728,7 +746,7 @@ def attach_loop72_dlsa_attention(
                     )
                 else:
                     # Uncached global visit: route through a transient `GlobalPagedVisitSlot` so sparse causality & per-visit D-LSA still run!
-                    v_ord = int(getattr(self_attn, "_active_visit_ordinal", 0))
+                    v_ord = int(visit_context[2]) if visit_context is not None else 0
                     ix = index_bank.get_indexer(phys_idx, virtual_visit=v_idx, layer_visit_ordinal=v_ord)
                     visit_budget = index_bank.get_visit_budget(phys_idx, virtual_visit=v_idx, layer_visit_ordinal=v_ord)
                     gid = index_bank.resolve_global_visit_id(phys_idx, virtual_visit=v_idx, layer_visit_ordinal=v_ord)

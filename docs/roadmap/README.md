@@ -4,6 +4,8 @@
 > On top of LB we build **vertical long-term memory**: Episodic Side Memory (ESM) written during sleep by closed-form null-space writes, and consolidated into MoE-Engram. The horizontal window stays working attention (hot KV + D-LSA cold tier).
 > Thesis: **the loop manipulates, the vertical memory stores.**
 
+> **Current 4B Loop72 variant:** MoE-Engram is deferred. The next work is explicit mHC training, then selectors trained against that checkpoint, followed by measured serving and context expansion. Documents 09–10 supersede older benchmark/full-context assumptions for this variant. Historical milestone results below retain their original scope and do not certify the new variant.
+
 ## Documents
 
 | # | Document | Contents |
@@ -17,6 +19,10 @@
 | 06 | [MoE-Engram Problem Analysis](06_ENGRAM_PROBLEM_ANALYSIS.md) | Verified symptoms S1–S6, hypotheses H1–H6 with tests/fixes, post-long-run decision tree, what SI-SRSI v2 can and cannot fix |
 | 07 | [Faithful D-LSA, Dynamic Memory & Backbone↔Engram Integration](07_LSA_FAITHFUL_AND_DYNAMIC_MEMORY.md) | Honest D-LSA status (G2 was vacuous), faithful module design, LSA-F1…F8 gates, 1–2M memory arithmetic, dynamic memory graph / recall / consolidation, BIE experiments |
 | 08 | [Spark X2.6 4B Loop72 LSA Review & Plan](08_LOOP72_DLSA_REVIEW_AND_PLAN.md) | `loop72-dlsa` branch specification (`P0–P8`): 72-visit Loop72 runtime (`18` global + `54` local visits, native `GELU`, `0` Engram allocation), per-visit `VisitAwareDLSAIndexBank` (`1.77M` params), `Loop72HybridPagedCache` (`M0/M1/M2`), `sparkx_kv_codec.py`, strictly causal tiled sparse prefill/decode (`sparkx_sparse_attention.py`), and `EpisodicSideMemory` serialization |
+| 09 | [mHC Training and Validation Plan](09_LOOP72_MHC_TRAINING_AND_VALIDATION.md) | Explicit recurrence, bounded-gain proposal, staged frozen-base mHC training, D-LSA alignment, training and inference optimization, KV mathematics, complete benchmark requirements and 5M research gates |
+| 10 | [Training and Evaluation Runbook](10_LOOP72_RUNBOOK.md) | Actual loading, CPU checks, speed trials, pinned full-data CLI, context probes, OMP execution and the remaining trainer/environment work |
+
+The [review validation record](../LOOP72_REVIEW_VALIDATION.md) distinguishes CPU/protocol evidence from unexecuted GPU/model gates. [OMP_EVALUATION.md](../OMP_EVALUATION.md) documents the real harness bridge.
 
 ## Status Legend
 `⬜ todo` · `🟨 in progress` · `🟩 gate passed` · `🟥 blocked / failed gate` · `⏸ deferred`
@@ -53,6 +59,8 @@
 | **Loop72 + Per-Visit Paged D-LSA Branch (`loop72-dlsa`, Work Packages `P0–P8`)**: native `GELU` preservation, zero Engram allocation (`construct_engram=False`), 72-visit schedule (`18` global + `54` local), 18-visit `VisitAwareDLSAIndexBank` (`1,769,472` selector params), 72-slot `Loop72HybridPagedCache` (`M0` 512-tok ring + `M1` hot GPU + `M2` cold paged archive with `bf16`/`int8`/`int4`/`mixed_rotary_bf16`), strictly causal tiled sparse prefill/decode + YaRN global RoPE scaling, chunked hidden prefill + `logits_to_keep=1`, and `EpisodicSideMemory` SHA-256 serialization | M×L | LSA-F1…F8 | doc 08 `P0–P8` | 🟩 implemented & unit-tested on branch `loop72-dlsa` (`144` unit tests passing) | `08_LOOP72_DLSA_REVIEW_AND_PLAN.md`, `configs/spark4b_loop72_lsa.yaml`, `sparkx_kv_codec.py`, `sparkx_paged_cache.py`, `sparkx_sparse_attention.py`, `train_spark_dlsa.py` |
 
 ## Two Tracks, One Base
+
+Current review milestone (`loop72-review-20261108`, based on `0ebce51`): **220 CPU tests passed**; actual OMP v18.18.1 scripted protocol passed. Runtime/benchmark repairs are implemented. Real model/GPU validation, dedicated mHC trainer, bounded-gain schema and complete external suite adapters remain **in progress or blocked on execution resources**. No new 34 tok/s, 1M/5M quality or trained-mHC score is claimed.
 
 ```mermaid
 flowchart LR
