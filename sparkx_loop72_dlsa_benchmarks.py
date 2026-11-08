@@ -2863,6 +2863,7 @@ def benchmark_loop72_decode_speed(
     complete = all(row["status"] == "completed" for row in report["horizons"])
     report["status"] = "completed" if complete else ("partial" if any(row["trials"] for row in report["horizons"]) else "blocked")
     report["summary_statistic"] = "median_over_successful_measured_trials"
+    report["by_horizon"] = report["horizons"]
     return report
 
 

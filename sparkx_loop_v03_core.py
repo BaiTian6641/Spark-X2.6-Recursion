@@ -3146,6 +3146,10 @@ class SparkXLoopV03(nn.Module):
                 'initialization': 'unknown' if dlsa_bank is not None else 'not_attached',
                 'quality_evidence': 'not_evaluated_in_loader',
             })),
+            'dlsa_selector': dict(getattr(self, 'dlsa_checkpoint_status', {
+                'initialization': 'unknown' if dlsa_bank is not None else 'not_attached',
+                'quality_evidence': 'not_evaluated_in_loader',
+            })),
             'visit_schedule': sched,
         }
 
