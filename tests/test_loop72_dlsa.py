@@ -309,6 +309,7 @@ class TestLoop72TorchComponents(unittest.TestCase):
 class TestLoop72BenchmarkSuiteAndNotebook(unittest.TestCase):
 
     def test_official_benchmark_table_and_modern_stream(self):
+        import json
         from sparkx_loop72_dlsa_benchmarks import (
             OFFICIAL_BENCHMARK_TABLE,
             OFFICIAL_SPARK_X26_SAMPLING,
@@ -325,10 +326,13 @@ class TestLoop72BenchmarkSuiteAndNotebook(unittest.TestCase):
             score_aa_omniscience_v11,
             score_graphwalks_bfs_f1,
             score_mrcr_v2_response,
+            verify_bfcl_tool_call,
             verify_code_stdio,
             verify_gdpval_deliverable,
             verify_json_schema,
             verify_math_answer,
+            verify_scicode_in_sandbox,
+            verify_swe_patch_in_sandbox,
             verify_terminal_bench_task,
         )
 
@@ -346,10 +350,22 @@ class TestLoop72BenchmarkSuiteAndNotebook(unittest.TestCase):
         self.assertEqual(OFFICIAL_BENCHMARK_TABLE["IFBench"]["Spark_X2.6_4B"], 75.8)
         self.assertEqual(OFFICIAL_BENCHMARK_TABLE["GPQA Diamond"]["Spark_X2.6_4B"], 77.1)
         self.assertEqual(OFFICIAL_BENCHMARK_TABLE["BFCL-V4"]["Spark_X2.6_4B"], 71.8)
+        self.assertEqual(OFFICIAL_BENCHMARK_TABLE["SWE Pro"]["Spark_X2.6_4B"], 54.3)
+        self.assertEqual(OFFICIAL_BENCHMARK_TABLE["SWE Verified"]["Spark_X2.6_4B"], 62.8)
+        self.assertEqual(OFFICIAL_BENCHMARK_TABLE["SWE Multilingual"]["Spark_X2.6_4B"], 64.7)
         self.assertEqual(OFFICIAL_BENCHMARK_TABLE["SciCode"]["Spark_X2.6_4B"], 36.8)
         self.assertIn("AA-Omniscience v1.1", OFFICIAL_BENCHMARK_TABLE)
         self.assertIn("Terminal-Bench 4.0", OFFICIAL_BENCHMARK_TABLE)
         self.assertIn("openai/gdpval", OFFICIAL_BENCHMARK_TABLE)
+
+        # Verify Gaokao 2026 recurrence gold is 2944 ((3*8 - 1) * 2^7 = 23 * 128 = 2944)
+        gk_item = next(it for it in SIGNIFICANT_BENCHMARK_SUITE if it["id"] == "gaokao_2026_seq_recurrence")
+        self.assertEqual(gk_item["gold"], "2944")
+
+        # Verify unclosed `<think>` fallback and physics unit stripping on GPQA Diamond
+        self.assertTrue(verify_math_answer("<think>Reasoning step 1... \\boxed{2944}", "2944").ok)
+        self.assertTrue(verify_math_answer("<think>Threshold energy is 7 m_p c^2</think>\\boxed{7 m_p c^2}", "7").ok)
+        self.assertTrue(verify_math_answer("<think>Net bill is $103,000 USD. Therefore final answer = $103,000", "103000").ok)
 
         stream = build_modern_long_eval_stream(target_tokens=1024)
         self.assertGreater(len(stream.split()), 700)
@@ -367,6 +383,43 @@ class TestLoop72BenchmarkSuiteAndNotebook(unittest.TestCase):
             if item["verifier"] == "math":
                 res = verify_math_answer(f"\\boxed{{{item['gold']}}}", item["gold"])
                 self.assertTrue(res.ok, f"Failed gold verification for {item['id']}")
+            elif item["verifier"] == "bfcl_tool":
+                t_spec = item["tool_spec"]
+                # Verify both `{"name": ..., "arguments": ...}` and `<tool_call>` formats execute in sandbox
+                payload_name = {"name": t_spec["expected_tool"], "arguments": t_spec["expected_args"]}
+                res_name = verify_bfcl_tool_call(f"<tool_call>{json.dumps(payload_name)}</tool_call>", t_spec)
+                self.assertTrue(res_name.ok, f"Failed tool verification for {item['id']}: {res_name.detail}")
+                self.assertTrue(res_name.detail.get("sandbox_executed"))
+            elif item["verifier"] == "swe_sandbox":
+                if item["id"] == "swe_pro_lru_page_eviction_bug":
+                    fix_code = (
+                        "```python\n"
+                        "class HotPageLRU:\n"
+                        "    def __init__(self, capacity: int):\n"
+                        "        self.capacity = int(capacity)\n"
+                        "        self.order = OrderedDict()\n"
+                        "    def access(self, page_id: int) -> list:\n"
+                        "        if page_id in self.order:\n"
+                        "            self.order.move_to_end(page_id)\n"
+                        "        else:\n"
+                        "            if len(self.order) >= self.capacity:\n"
+                        "                self.order.popitem(last=False)\n"
+                        "            self.order[page_id] = True\n"
+                        "        return list(self.order.keys())\n"
+                        "```"
+                    )
+                elif item["id"] == "swe_verified_fenwick_range_query_bug":
+                    fix_code = "```python\ndef range_token_mass(weights: list, left: int, right: int) -> int:\n    return sum(weights[left : right + 1])\n```"
+                else:
+                    fix_code = "```python\ndef truncate_utf8_bytes(text: str, max_bytes: int) -> str:\n    return text.encode('utf-8')[:max_bytes].decode('utf-8', errors='ignore')\n```"
+                swe_res = verify_swe_patch_in_sandbox(fix_code, item["swe_spec"])
+                self.assertTrue(swe_res.ok, f"Failed SWE sandbox for {item['id']}: {swe_res.detail}")
+            elif item["verifier"] == "scicode_sandbox":
+                sci_res = verify_scicode_in_sandbox(
+                    "```python\nimport sys\nsa, sb = map(int, sys.stdin.readline().split())\nx1, x2, y1, y2 = map(float, sys.stdin.readline().split())\nprint(f'{(sa*sb)/(sa+sb)*((x1-y1)**2+(x2-y2)**2):.4f}')\n```",
+                    item,
+                )
+                self.assertTrue(sci_res.ok)
             elif item["verifier"] == "omniscience":
                 omni_ok = score_aa_omniscience_v11(f"\\boxed{{{item['gold']}}}", item["gold"])
                 self.assertTrue(omni_ok["passed"])
@@ -377,16 +430,24 @@ class TestLoop72BenchmarkSuiteAndNotebook(unittest.TestCase):
                 self.assertEqual(omni_bad["omniscience_index"], -100.0)
             elif item["verifier"] == "terminal_bench":
                 tb_ok = verify_terminal_bench_task(
-                    "```bash\ngit worktree add /srv/loop72-bench loop72-dlsa\npython3 -m unittest discover -s tests -p \"test_*.py\"\n```",
+                    "```bash\ngit worktree add /srv/loop72-bench loop72-dlsa\ncd /srv/loop72-bench && python3 -m unittest discover -s tests -p \"test_*.py\"\n```",
                     item["terminal_spec"],
                 )
                 self.assertTrue(tb_ok.ok)
+                self.assertTrue(tb_ok.detail.get("sandbox_ok"))
             elif item["verifier"] == "gdpval":
                 gdp_ok = verify_gdpval_deliverable(
                     '```json\n{"global_bf16_gib": 72.0, "global_int4_gib": 18.0, "gib_saved_per_session": 54.0, "gpu_hot_kv_mib": 684, "recommended_tiering": "M1_GPU_Hot_M2_Host_Cold"}\n```',
                     item["gdpval_spec"],
                 )
                 self.assertTrue(gdp_ok.ok)
+
+        # Verify 100% of rows in OFFICIAL_BENCHMARK_TABLE are populated with zero `—` cells when all tasks are evaluated
+        all_bench_names = [b for b in OFFICIAL_BENCHMARK_TABLE.keys() if b != "Average"]
+        synthetic_live = {"tasks": [{"benchmark": b, "score": 100.0} for b in all_bench_names]}
+        md_full = format_official_comparison_markdown(synthetic_live)
+        self.assertNotIn("| — |", md_full)
+        self.assertIn("**150.0**", md_full)  # Gaokao 2026 scaled to 150.0 points
 
         # Test 1M context window benchmark suite (capacity + long-context specs)
         ctx_1m = run_full_length_1m_context_benchmark(model=None, tokenizer=None)
