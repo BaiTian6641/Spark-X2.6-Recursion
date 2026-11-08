@@ -314,15 +314,22 @@ class TestLoop72BenchmarkSuiteAndNotebook(unittest.TestCase):
             OFFICIAL_SPARK_X26_SAMPLING,
             SIGNIFICANT_BENCHMARK_SUITE,
             build_modern_long_eval_stream,
+            compute_omp_hashline_tag,
             evaluate_cold_kv_codecs_summary,
+            evaluate_oh_my_pi_hashline_task,
             format_official_comparison_markdown,
             generate_graphwalks_bfs_instance,
             generate_mrcr_v2_instance,
+            generate_omp_models_yaml,
+            run_full_length_1m_context_benchmark,
+            score_aa_omniscience_v11,
             score_graphwalks_bfs_f1,
             score_mrcr_v2_response,
             verify_code_stdio,
+            verify_gdpval_deliverable,
             verify_json_schema,
             verify_math_answer,
+            verify_terminal_bench_task,
         )
 
         self.assertTrue(OFFICIAL_SPARK_X26_SAMPLING["thinking_mode"])
@@ -340,6 +347,9 @@ class TestLoop72BenchmarkSuiteAndNotebook(unittest.TestCase):
         self.assertEqual(OFFICIAL_BENCHMARK_TABLE["GPQA Diamond"]["Spark_X2.6_4B"], 77.1)
         self.assertEqual(OFFICIAL_BENCHMARK_TABLE["BFCL-V4"]["Spark_X2.6_4B"], 71.8)
         self.assertEqual(OFFICIAL_BENCHMARK_TABLE["SciCode"]["Spark_X2.6_4B"], 36.8)
+        self.assertIn("AA-Omniscience v1.1", OFFICIAL_BENCHMARK_TABLE)
+        self.assertIn("Terminal-Bench 4.0", OFFICIAL_BENCHMARK_TABLE)
+        self.assertIn("openai/gdpval", OFFICIAL_BENCHMARK_TABLE)
 
         stream = build_modern_long_eval_stream(target_tokens=1024)
         self.assertGreater(len(stream.split()), 700)
@@ -357,6 +367,46 @@ class TestLoop72BenchmarkSuiteAndNotebook(unittest.TestCase):
             if item["verifier"] == "math":
                 res = verify_math_answer(f"\\boxed{{{item['gold']}}}", item["gold"])
                 self.assertTrue(res.ok, f"Failed gold verification for {item['id']}")
+            elif item["verifier"] == "omniscience":
+                omni_ok = score_aa_omniscience_v11(f"\\boxed{{{item['gold']}}}", item["gold"])
+                self.assertTrue(omni_ok["passed"])
+                self.assertEqual(omni_ok["omniscience_index"], 100.0)
+                omni_abs = score_aa_omniscience_v11("\\boxed{ABSTAIN}", item["gold"])
+                self.assertEqual(omni_abs["omniscience_index"], 0.0)
+                omni_bad = score_aa_omniscience_v11("\\boxed{999}", item["gold"])
+                self.assertEqual(omni_bad["omniscience_index"], -100.0)
+            elif item["verifier"] == "terminal_bench":
+                tb_ok = verify_terminal_bench_task(
+                    "```bash\ngit worktree add /srv/loop72-bench loop72-dlsa\npython3 -m unittest discover -s tests -p \"test_*.py\"\n```",
+                    item["terminal_spec"],
+                )
+                self.assertTrue(tb_ok.ok)
+            elif item["verifier"] == "gdpval":
+                gdp_ok = verify_gdpval_deliverable(
+                    '```json\n{"global_bf16_gib": 72.0, "global_int4_gib": 18.0, "gib_saved_per_session": 54.0, "gpu_hot_kv_mib": 684, "recommended_tiering": "M1_GPU_Hot_M2_Host_Cold"}\n```',
+                    item["gdpval_spec"],
+                )
+                self.assertTrue(gdp_ok.ok)
+
+        # Test 1M context window benchmark suite (capacity + long-context specs)
+        ctx_1m = run_full_length_1m_context_benchmark(model=None, tokenizer=None)
+        self.assertEqual(ctx_1m["context_limit_tokens"], 1_048_576)
+        self.assertAlmostEqual(ctx_1m["capacity_1m_summary"]["global_18_bf16_gib"], 72.0, places=2)
+        self.assertAlmostEqual(ctx_1m["capacity_1m_summary"]["global_18_int4_gib"], 18.0, places=2)
+        self.assertAlmostEqual(ctx_1m["capacity_1m_summary"]["local_54_rings_mib"], 108.0, places=2)
+
+        # Test Oh My Pi (omp) hashline edit verification & models.yml generation
+        src_lines = ["def f():", "    x = 1", "    return x"]
+        tag_2 = compute_omp_hashline_tag(2, src_lines[1]).split("|")[0]
+        omp_v = evaluate_oh_my_pi_hashline_task(
+            f'```json\n{{"anchor": "{tag_2}", "replacement": "    x = 72"}}\n```',
+            src_lines,
+            "x = 72",
+        )
+        self.assertTrue(omp_v.ok)
+        omp_yaml = generate_omp_models_yaml(output_path=None, port=8000)
+        self.assertEqual(omp_yaml["context_window"], 1_048_576)
+        self.assertIn("contextWindow: 1048576", omp_yaml["yaml"])
 
         json_ok = verify_json_schema(
             '```json\n{"model": "Spark", "total_visits": 72, "thinking_mode": true}\n```',
@@ -375,6 +425,42 @@ class TestLoop72BenchmarkSuiteAndNotebook(unittest.TestCase):
         md = format_official_comparison_markdown()
         self.assertIn("Graphwalks bfs 256k f1", md)
         self.assertIn("Gaokao 2026", md)
+        self.assertIn("AA-Omniscience v1.1", md)
+        self.assertIn("Terminal-Bench 4.0", md)
+        self.assertIn("openai/gdpval", md)
+
+    def test_loader_and_module_interface_contracts_static(self):
+        import ast
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        files = [
+            "sparkx_dlsa.py",
+            "sparkx_paged_cache.py",
+            "sparkx_sparse_attention.py",
+            "sparkx_loop_v03_core.py",
+            "load_inference_v03.py",
+            "train_spark_dlsa.py",
+            "sparkx_loop72_dlsa_benchmarks.py",
+        ]
+        trees = {}
+        for fn in files:
+            p = os.path.join(root, fn)
+            with open(p, "r", encoding="utf-8") as f:
+                trees[fn] = ast.parse(f.read(), filename=fn)
+
+        dlsa_defs = {n.name for n in ast.walk(trees["sparkx_dlsa.py"]) if isinstance(n, (ast.ClassDef, ast.FunctionDef))}
+        self.assertIn("DLSAIndexConfig", dlsa_defs)
+        self.assertIn("VisitAwareDLSAIndexBank", dlsa_defs)
+        self.assertIn("get_visit_indexer", dlsa_defs)
+        self.assertIn("total_map_parameters", dlsa_defs)
+        self.assertIn("select_with_buckets", dlsa_defs)
+
+        cache_defs = {n.name for n in ast.walk(trees["sparkx_paged_cache.py"]) if isinstance(n, (ast.ClassDef, ast.FunctionDef))}
+        self.assertIn("Loop72HybridPagedCache", cache_defs)
+        self.assertIn("is_fully_gpu_resident", cache_defs)
+        self.assertIn("get_resident_prefix", cache_defs)
+        self.assertIn("update_local_visit", cache_defs)
+        self.assertIn("append_global_visit", cache_defs)
 
     def test_colab_benchmark_notebook_valid_json_and_syntax(self):
         import ast

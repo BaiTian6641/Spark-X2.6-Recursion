@@ -15,6 +15,7 @@ Implements §3.1, §5.3, §5.4, §6.5, and §8 of the Loop72 LSA Review and Deve
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import math
 import types
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,11 +25,16 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
     HAS_TORCH = True
+    try:
+        _SDPA_SUPPORTS_ENABLE_GQA = "enable_gqa" in inspect.signature(F.scaled_dot_product_attention).parameters
+    except Exception:
+        _SDPA_SUPPORTS_ENABLE_GQA = False
 except ImportError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
     nn = None  # type: ignore[assignment]
     F = None  # type: ignore[assignment]
     HAS_TORCH = False
+    _SDPA_SUPPORTS_ENABLE_GQA = False
 
 if HAS_TORCH:
     from sparkx_dlsa import FaithfulDLSAIndexer, PagedLatentIndex, VisitAwareDLSAIndexBank, _dummy_q
@@ -47,15 +53,31 @@ class SparseAttentionConfig:
     sinks: int = 4
     recent_tokens: int = 512
     long_range_tokens: int = 4096
+    exact_threshold: int = 4612
+    gpu_resident_max_tokens: int = 8192
+    local_window: int = 512
     rerank: int = 1
     sparse_query_tile_tokens: int = 16
     selection_reuse: bool = False
+    enable_native_gqa: bool = True
     residual_compensation: bool = False
+    residual_block_compensation: Optional[bool] = None
     unbounded_dense_fallback: bool = False
     yarn_scale_factor: float = 1.0
     yarn_orig_max_position: int = 1048576
+    yarn_original_max_position: Optional[int] = None
     yarn_beta_fast: float = 32.0
     yarn_beta_slow: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.residual_block_compensation is not None:
+            self.residual_compensation = bool(self.residual_block_compensation)
+        else:
+            self.residual_block_compensation = bool(self.residual_compensation)
+        if self.yarn_original_max_position is not None:
+            self.yarn_orig_max_position = int(self.yarn_original_max_position)
+        else:
+            self.yarn_original_max_position = int(self.yarn_orig_max_position)
 
 
 @dataclasses.dataclass
@@ -65,6 +87,7 @@ class SparseRuntimeTelemetry:
     exact_short_calls: int = 0
     local_sliding_calls: int = 0
     dense_fallback_calls: int = 0
+    selection_reuse_hits: int = 0
     total_selected_keys: int = 0
     total_sparse_queries: int = 0
 
@@ -76,6 +99,7 @@ class SparseRuntimeTelemetry:
             "exact_short_calls": self.exact_short_calls,
             "local_sliding_calls": self.local_sliding_calls,
             "dense_fallback_calls": self.dense_fallback_calls,
+            "selection_reuse_hits": self.selection_reuse_hits,
             "total_selected_keys": self.total_selected_keys,
             "total_sparse_queries": self.total_sparse_queries,
             "mean_selected_keys_per_query": round(mean_sel, 2),
@@ -92,6 +116,42 @@ def _expand_gqa_kv(
     return key.repeat_interleave(groups, dim=1), value.repeat_interleave(groups, dim=1)
 
 
+def _sdpa_gqa(
+    query: "torch.Tensor",
+    key: "torch.Tensor",
+    value: "torch.Tensor",
+    attn_mask: Optional["torch.Tensor"] = None,
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+    enable_native_gqa: bool = True,
+) -> "torch.Tensor":
+    """Execute `F.scaled_dot_product_attention` using native `enable_gqa=True` when supported by PyTorch, avoiding
+    4x KV head `repeat_interleave` allocations (`~1.55 GiB/token` saved across 72 visits)."""
+    h_q = int(query.shape[1])
+    h_kv = int(key.shape[1])
+    if h_q != h_kv and enable_native_gqa and _SDPA_SUPPORTS_ENABLE_GQA:
+        return F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=is_causal,
+            scale=scale,
+            enable_gqa=True,
+        )
+    k_exp, v_exp = _expand_gqa_kv(key, value, h_q)
+    return F.scaled_dot_product_attention(
+        query,
+        k_exp,
+        v_exp,
+        attn_mask=attn_mask,
+        dropout_p=0.0,
+        is_causal=is_causal,
+        scale=scale,
+    )
+
+
 def local_sliding_attention_forward(
     query: "torch.Tensor",
     key: "torch.Tensor",
@@ -101,18 +161,32 @@ def local_sliding_attention_forward(
     sliding_window: int = 512,
     scaling: Optional[float] = None,
     tile_q: int = 256,
+    window_already_bounded: bool = False,
+    enable_native_gqa: bool = True,
 ) -> "torch.Tensor":
     """Offset-aware local sliding-window attention (`[B, H_q, Q, D]`).
 
     Uses explicit absolute `q_positions` (`[Q]`) and `k_positions` (`[K]`) so ring-buffer eviction on `LocalSlidingRingSlot`
-    never misaligns columns, and chunked prefill produces bit-identical results across `511/512/513` boundaries."""
+    never misaligns columns, and chunked prefill produces bit-identical results across `511/512/513` boundaries.
+    During single-token decode (`q_len == 1`) when `window_already_bounded=True` and `K <= W`, skips mask construction
+    and dispatches directly to `_sdpa_gqa(..., attn_mask=None)`."""
     bsz, h_q, q_len, head_dim = query.shape
     scale = float(scaling) if scaling is not None else (1.0 / math.sqrt(head_dim))
     w = max(1, int(sliding_window))
+    if q_len == 1 and window_already_bounded and int(key.shape[-2]) <= w:
+        return _sdpa_gqa(
+            query,
+            key,
+            value,
+            attn_mask=None,
+            is_causal=False,
+            scale=scale,
+            enable_native_gqa=enable_native_gqa,
+        )
+
     dev = query.device
     q_pos = q_positions.to(device=dev, dtype=torch.long).reshape(-1)
     k_pos = k_positions.to(device=dev, dtype=torch.long).reshape(-1)
-    k_exp, v_exp = _expand_gqa_kv(key, value, h_q)
 
     outs: List["torch.Tensor"] = []
     step = max(1, int(tile_q))
@@ -124,14 +198,14 @@ def local_sliding_attention_forward(
         diff = qp_tile - kp_row
         valid = (diff >= 0) & (diff < w)        # [Tq, Tk]
         outs.append(
-            F.scaled_dot_product_attention(
+            _sdpa_gqa(
                 q_tile,
-                k_exp,
-                v_exp,
+                key,
+                value,
                 attn_mask=valid.unsqueeze(0).unsqueeze(0),
-                dropout_p=0.0,
                 is_causal=False,
                 scale=scale,
+                enable_native_gqa=enable_native_gqa,
             )
         )
     return torch.cat(outs, dim=2) if len(outs) > 1 else outs[0]
@@ -145,25 +219,47 @@ def _select_for_single_query(
     q_abs_pos: int,
     budget: int,
     slot: Optional["GlobalPagedVisitSlot"] = None,
+    selection_reuse: bool = False,
+    telemetry: Optional[SparseRuntimeTelemetry] = None,
 ) -> "torch.Tensor":
     """Select exact causal key positions `<= q_abs_pos` for a single query `q_single` (`[H_q, 1, D]`)."""
     upto = int(q_abs_pos) + 1
     if upto <= indexer.n_sink + indexer.window + budget:
         return torch.arange(0, upto, device=q_single.device, dtype=torch.long)
 
-    dummy_k = torch.zeros((indexer.n_kv, 1, indexer.head_dim), device=q_single.device, dtype=q_single.dtype)
-    q_in, _ = indexer.inputs(q_single, dummy_k)
+    q_in = indexer._group_free_query_features(q_single)
     q_proj = indexer.project_q(q_in)
+
+    # Optional query-coherence selection reuse across consecutive single-token decode steps
+    max_reuse = max(2 if selection_reuse else 1, int(getattr(indexer, "selection_reuse_steps", 1)))
+    if slot is not None and max_reuse > 1:
+        last_q = slot.dlsa_state_slot.get("last_q_proj")
+        last_sel = slot.dlsa_state_slot.get("last_sel")
+        reuse_cnt = int(slot.dlsa_state_slot.get("reuse_count", 0))
+        if (
+            isinstance(last_q, torch.Tensor)
+            and isinstance(last_sel, torch.Tensor)
+            and reuse_cnt + 1 < max_reuse
+        ):
+            cos_sim = float((q_proj.reshape(-1) * last_q.reshape(-1)).sum().item())
+            if cos_sim >= float(getattr(indexer, "reuse_cos_threshold", 0.96)):
+                slot.dlsa_state_slot["reuse_count"] = reuse_cnt + 1
+                new_tail = torch.tensor([upto - 1], device=last_sel.device, dtype=torch.long)
+                reused = torch.unique(torch.cat([last_sel[last_sel < upto], new_tail], dim=0), sorted=True)
+                slot.dlsa_state_slot["last_sel"] = reused
+                if telemetry is not None:
+                    telemetry.selection_reuse_hits += 1
+                return reused
 
     def _cand_fn(mid_indices: "torch.Tensor") -> "torch.Tensor":
         if slot is not None:
-            k_cand, _ = slot.gather_selected(mid_indices, device=q_single.device, dtype=q_single.dtype)
+            k_cand, _ = slot.gather_selected(mid_indices, device=q_single.device, dtype=q_single.dtype, return_positions=False)
             k0_c = k_cand[0]
             _, k_in_c = indexer.inputs(_dummy_q(k0_c), k0_c)
             return indexer.project_k(k_in_c)
         raise RuntimeError("candidate_key_fn requires a GlobalPagedVisitSlot when persistent_token_latents=False")
 
-    return idx_obj.select(
+    sel = idx_obj.select(
         q_proj,
         budget=budget,
         upto=upto,
@@ -171,74 +267,148 @@ def _select_for_single_query(
         search_mode=indexer.search_mode,
         candidate_key_fn=_cand_fn if (slot is not None and not idx_obj.persistent_token_latents and indexer.rerank > 1) else None,
     )
+    if slot is not None and max_reuse > 1:
+        slot.dlsa_state_slot["last_q_proj"] = q_proj.detach()
+        slot.dlsa_state_slot["last_sel"] = sel.detach()
+        slot.dlsa_state_slot["reuse_count"] = 0
+    return sel
 
 
 def paged_dlsa_global_attention_forward(
-    query: "torch.Tensor",
-    slot: "GlobalPagedVisitSlot",
-    indexer: "FaithfulDLSAIndexer",
-    q_positions: "torch.Tensor",
+    query: Optional["torch.Tensor"] = None,
+    slot: Optional["GlobalPagedVisitSlot"] = None,
+    indexer: Optional["FaithfulDLSAIndexer"] = None,
+    q_positions: Optional["torch.Tensor"] = None,
     budget: Optional[int] = None,
     scaling: Optional[float] = None,
     query_tile_tokens: int = 16,
     telemetry: Optional[SparseRuntimeTelemetry] = None,
+    *,
+    module: Any = None,
+    sparse_cfg: Optional[SparseAttentionConfig] = None,
+    known_upto: Optional[int] = None,
 ) -> "torch.Tensor":
     """Execute strictly causal D-LSA sparse attention against a `GlobalPagedVisitSlot` (both prefill and decode).
 
-    - Short sequences (`upto <= n_sink + window + budget`): gathers all causal keys `[0..upto)` from `slot` and runs
-      exact causal attention (Step 1 of §5.4).
+    - Short sequences (`upto <= eff_exact_threshold`): uses zero-copy GPU resident slice when `slot.is_fully_gpu_resident(max_upto)`
+      or gathers `[0..upto)` from `slot`, and runs exact causal attention with native GQA (Step 1 of §5.4).
     - Single-query decode (`q_len == 1`, Step 2–3 of §5.4): selects `sel` for `upto = q_pos + 1`, gathers `(k_sel, v_sel)`
       from `slot`, and computes attention over `sel`.
     - Multi-query prefill (`q_len > 1`, Step 4 of §5.4): tiles queries in blocks of `query_tile_tokens = 16`. Each query `i`
       at absolute position `p_i` computes its own strictly causal selection `S_i` from `upto = p_i + 1`. The tile union
       `S_union` is gathered once from `slot` and masked per query by `(k_pos in S_i) & (k_pos <= p_i)` so future tokens
       can never leak into earlier queries' selection or attention."""
+    if query is None or slot is None or indexer is None:
+        raise ValueError("paged_dlsa_global_attention_forward requires `query`, `slot`, and `indexer`")
     bsz, h_q, q_len, head_dim = query.shape
     if bsz != 1:
         raise ValueError(f"paged_dlsa_global_attention_forward currently expects batch_size=1, got {bsz}")
     scale = float(scaling) if scaling is not None else (1.0 / math.sqrt(head_dim))
     eff_budget = int(budget if budget is not None else indexer.k_long_range)
+    if sparse_cfg is not None:
+        query_tile_tokens = int(sparse_cfg.sparse_query_tile_tokens)
+        enable_native_gqa = bool(sparse_cfg.enable_native_gqa)
+        selection_reuse = bool(sparse_cfg.selection_reuse)
+        eff_exact_threshold = (
+            int(sparse_cfg.exact_threshold)
+            if int(sparse_cfg.exact_threshold) > 0
+            else (indexer.n_sink + indexer.window + eff_budget)
+        )
+    else:
+        enable_native_gqa = True
+        selection_reuse = False
+        idx_cfg = getattr(indexer, "cfg", None)
+        cfg_thresh = int(getattr(idx_cfg, "exact_threshold", 0) or 0)
+        eff_exact_threshold = (
+            min(cfg_thresh, indexer.n_sink + indexer.window + eff_budget)
+            if cfg_thresh > 0
+            else (indexer.n_sink + indexer.window + eff_budget)
+        )
+
     dev = query.device
-    q_pos = q_positions.to(device=dev, dtype=torch.long).reshape(-1)
-    max_upto = int(q_pos[-1].item()) + 1 if q_pos.numel() > 0 else slot.logical_seq_length
+    if known_upto is not None and q_len == 1:
+        max_upto = int(known_upto)
+        q_pos = None
+    elif q_positions is not None and q_positions.numel() > 0:
+        q_pos = q_positions.to(device=dev, dtype=torch.long).reshape(-1)
+        max_upto = int(q_pos[-1].item()) + 1
+    else:
+        max_upto = int(slot.logical_seq_length)
+        q_pos = torch.arange(max(0, max_upto - q_len), max_upto, device=dev, dtype=torch.long)
 
     idx_obj: Optional[PagedLatentIndex] = slot.dlsa_state_slot.get("index")
 
-    # Fast path 1: Sequence is within the exact budget threshold -> gather all `[0..max_upto)` and apply exact causal mask
-    if max_upto <= indexer.n_sink + indexer.window + eff_budget or idx_obj is None:
+    # Fast path 1: Sequence is within the exact budget threshold -> zero-copy GPU resident slice or gather `[0..max_upto)`
+    if max_upto <= eff_exact_threshold or idx_obj is None:
         if telemetry is not None:
             telemetry.exact_short_calls += 1
-        all_pos = torch.arange(0, max_upto, device=dev, dtype=torch.long)
-        k_all, v_all = slot.gather_selected(all_pos, device=dev, dtype=query.dtype)
-        k_exp, v_exp = _expand_gqa_kv(k_all, v_all, h_q)
+        if slot.is_fully_gpu_resident(max_upto):
+            k_all, v_all = slot.get_resident_prefix(max_upto)
+        else:
+            all_pos = torch.arange(0, max_upto, device=dev, dtype=torch.long)
+            k_all, v_all = slot.gather_selected(all_pos, device=dev, dtype=query.dtype, return_positions=False)
+
         if q_len == 1:
-            return F.scaled_dot_product_attention(
-                query, k_exp, v_exp, attn_mask=None, dropout_p=0.0, is_causal=False, scale=scale
+            return _sdpa_gqa(
+                query,
+                k_all,
+                v_all,
+                attn_mask=None,
+                is_causal=False,
+                scale=scale,
+                enable_native_gqa=enable_native_gqa,
             )
+        if max_upto == q_len and q_pos is not None and int(q_pos[0].item()) == 0:
+            return _sdpa_gqa(
+                query,
+                k_all,
+                v_all,
+                attn_mask=None,
+                is_causal=True,
+                scale=scale,
+                enable_native_gqa=enable_native_gqa,
+            )
+        if q_pos is None:
+            q_pos = torch.arange(max(0, max_upto - q_len), max_upto, device=dev, dtype=torch.long)
+        all_pos = torch.arange(0, max_upto, device=dev, dtype=torch.long)
         causal_mask = all_pos.unsqueeze(0) <= q_pos.unsqueeze(1)  # [q_len, max_upto]
-        return F.scaled_dot_product_attention(
+        return _sdpa_gqa(
             query,
-            k_exp,
-            v_exp,
+            k_all,
+            v_all,
             attn_mask=causal_mask.unsqueeze(0).unsqueeze(0),
-            dropout_p=0.0,
             is_causal=False,
             scale=scale,
+            enable_native_gqa=enable_native_gqa,
         )
 
     # Path 2: Single-query sparse decode (`q_len == 1`)
     if q_len == 1:
-        p0 = int(q_pos[0].item())
-        sel = _select_for_single_query(indexer, idx_obj, query[0], p0, eff_budget, slot=slot)
+        p0 = max_upto - 1
+        sel = _select_for_single_query(
+            indexer,
+            idx_obj,
+            query[0],
+            p0,
+            eff_budget,
+            slot=slot,
+            selection_reuse=selection_reuse,
+            telemetry=telemetry,
+        )
         slot.sparse_Step_calls += 1
         if telemetry is not None:
             telemetry.sparse_decode_calls += 1
             telemetry.total_selected_keys += int(sel.numel())
             telemetry.total_sparse_queries += 1
-        k_sel, v_sel = slot.gather_selected(sel, device=dev, dtype=query.dtype)
-        k_exp, v_exp = _expand_gqa_kv(k_sel, v_sel, h_q)
-        return F.scaled_dot_product_attention(
-            query, k_exp, v_exp, attn_mask=None, dropout_p=0.0, is_causal=False, scale=scale
+        k_sel, v_sel = slot.gather_selected(sel, device=dev, dtype=query.dtype, return_positions=False)
+        return _sdpa_gqa(
+            query,
+            k_sel,
+            v_sel,
+            attn_mask=None,
+            is_causal=False,
+            scale=scale,
+            enable_native_gqa=enable_native_gqa,
         )
 
     # Path 3: Tiled multi-query strictly causal sparse prefill (`q_len > 1`)
@@ -247,6 +417,9 @@ def paged_dlsa_global_attention_forward(
     slot.sparse_Step_calls += 1
     tile_sz = max(1, int(query_tile_tokens))
     outs: List["torch.Tensor"] = []
+    if q_pos is None:
+        q_pos = torch.arange(max(0, max_upto - q_len), max_upto, device=dev, dtype=torch.long)
+    q_pos_list: List[int] = [int(x) for x in q_pos.tolist()]
 
     for s_i in range(0, q_len, tile_sz):
         e_i = min(q_len, s_i + tile_sz)
@@ -254,9 +427,16 @@ def paged_dlsa_global_attention_forward(
         q_tile = query[:, :, s_i:e_i, :]
         sels_tile: List["torch.Tensor"] = []
         for local_i in range(t_len):
-            p_abs = int(q_pos[s_i + local_i].item())
+            p_abs = q_pos_list[s_i + local_i]
             sel_i = _select_for_single_query(
-                indexer, idx_obj, query[0, :, s_i + local_i : s_i + local_i + 1, :], p_abs, eff_budget, slot=slot
+                indexer,
+                idx_obj,
+                query[0, :, s_i + local_i : s_i + local_i + 1, :],
+                p_abs,
+                eff_budget,
+                slot=slot,
+                selection_reuse=False,
+                telemetry=telemetry,
             )
             sels_tile.append(sel_i)
             if telemetry is not None:
@@ -265,7 +445,6 @@ def paged_dlsa_global_attention_forward(
 
         union_pos = torch.cat(sels_tile, dim=0).unique()  # sorted ascending `[U]`
         u_len = int(union_pos.numel())
-        # Build exact `[t_len, u_len]` boolean mask where row `local_i` is True iff `union_pos[j] in sel_i` and `<= p_abs`
         allow_mask = torch.zeros((t_len, u_len), dtype=torch.bool, device=dev)
         for local_i, sel_i in enumerate(sels_tile):
             idx_in_u = torch.searchsorted(union_pos, sel_i)
@@ -273,20 +452,20 @@ def paged_dlsa_global_attention_forward(
             matched = union_pos.index_select(0, idx_in_u) == sel_i
             allow_mask[local_i, idx_in_u[matched]] = True
 
-        k_u, v_u = slot.gather_selected(union_pos, device=dev, dtype=query.dtype)
-        k_exp, v_exp = _expand_gqa_kv(k_u, v_u, h_q)
+        k_u, v_u = slot.gather_selected(union_pos, device=dev, dtype=query.dtype, return_positions=False)
         outs.append(
-            F.scaled_dot_product_attention(
+            _sdpa_gqa(
                 q_tile,
-                k_exp,
-                v_exp,
+                k_u,
+                v_u,
                 attn_mask=allow_mask.unsqueeze(0).unsqueeze(0),
-                dropout_p=0.0,
                 is_causal=False,
                 scale=scale,
+                enable_native_gqa=enable_native_gqa,
             )
         )
     return torch.cat(outs, dim=2)
+
 
 
 def compute_yarn_partial_rope_cos_sin(
@@ -406,6 +585,30 @@ def attach_loop72_dlsa_attention(
 
             cos, sin = position_embeddings
             rot_dim = int(cos.shape[-1])
+            if not is_sliding and float(cfg.yarn_scale_factor) > 1.0:
+                raw_cache_tmp = getattr(past_key_values, "cache", past_key_values)
+                v_idx_tmp = int(getattr(past_key_values, "virtual_idx", phys_idx)) if past_key_values is not None else phys_idx
+                if cache_position is not None and cache_position.numel() == q_len:
+                    pos_for_yarn = cache_position.to(device=hidden_states.device, dtype=torch.long)
+                elif isinstance(raw_cache_tmp, Loop72HybridPagedCache):
+                    s_p_y = raw_cache_tmp.get_visit_slot(v_idx_tmp).logical_seq_length
+                    pos_for_yarn = torch.arange(s_p_y, s_p_y + q_len, device=hidden_states.device, dtype=torch.long)
+                else:
+                    pos_for_yarn = torch.arange(0, q_len, device=hidden_states.device, dtype=torch.long)
+                cos_y, sin_y = compute_yarn_partial_rope_cos_sin(
+                    pos_for_yarn,
+                    head_dim=h_dim,
+                    rope_theta=5_000_000.0,
+                    partial_rotary_factor=float(rot_dim) / float(h_dim),
+                    scale_factor=float(cfg.yarn_scale_factor),
+                    orig_max_position=int(cfg.yarn_orig_max_position),
+                    beta_fast=float(cfg.yarn_beta_fast),
+                    beta_slow=float(cfg.yarn_beta_slow),
+                    device=hidden_states.device,
+                )
+                cos = cos_y.unsqueeze(0).to(dtype=cos.dtype)
+                sin = sin_y.unsqueeze(0).to(dtype=sin.dtype)
+
             if apply_rope_fn is not None:
                 q_rot = apply_rope_fn(query_states[..., :rot_dim], cos, sin).to(query_states.dtype)
                 k_rot = apply_rope_fn(key_states[..., :rot_dim], cos, sin).to(key_states.dtype)
@@ -414,6 +617,16 @@ def attach_loop72_dlsa_attention(
                     key_states = torch.cat([k_rot, key_states[..., rot_dim:]], dim=-1)
                 else:
                     query_states, key_states = q_rot, k_rot
+
+            if getattr(self_attn, "_capture_sleep_qkv", False):
+                self_attn._sleep_last_qkv = (
+                    query_states.detach(),
+                    key_states.detach(),
+                    value_states.detach(),
+                )
+                visit_qkv_log = getattr(self_attn, "_sleep_visit_qkv_list", None)
+                if isinstance(visit_qkv_log, list):
+                    visit_qkv_log.append(self_attn._sleep_last_qkv)
 
             # Check if `past_key_values` is a `_VisitCache` wrapping `Loop72HybridPagedCache`
             raw_cache = getattr(past_key_values, "cache", past_key_values)
@@ -424,6 +637,8 @@ def attach_loop72_dlsa_attention(
                 slot = raw_cache.get_visit_slot(v_idx)
                 if cache_position is not None and cache_position.numel() == q_len:
                     q_pos = cache_position.to(device=hidden_states.device, dtype=torch.long)
+                elif q_len == 1:
+                    q_pos = None
                 else:
                     s_p = slot.logical_seq_length
                     q_pos = torch.arange(s_p, s_p + q_len, device=hidden_states.device, dtype=torch.long)
@@ -435,9 +650,19 @@ def attach_loop72_dlsa_attention(
                     else:
                         k_win, v_win = slot.keys, slot.values
                     k_pos = slot.last_returned_positions if slot.last_returned_positions is not None else q_pos
+                    if q_pos is None:
+                        q_pos = k_pos[-1:] if k_pos is not None else torch.tensor([slot.logical_seq_length - 1], device=hidden_states.device, dtype=torch.long)
                     sw = int(getattr(self_attn, "_sparkx_sliding_window", None) or getattr(self_attn, "sliding_window", None) or default_sw)
                     attn_out = local_sliding_attention_forward(
-                        query_states, k_win, v_win, q_positions=q_pos, k_positions=k_pos, sliding_window=sw, scaling=scaling
+                        query_states,
+                        k_win,
+                        v_win,
+                        q_positions=q_pos,
+                        k_positions=k_pos,
+                        sliding_window=sw,
+                        scaling=scaling,
+                        window_already_bounded=(q_len == 1 and not read_only),
+                        enable_native_gqa=cfg.enable_native_gqa,
                     )
                 else:
                     assert isinstance(slot, GlobalPagedVisitSlot)
@@ -464,6 +689,8 @@ def attach_loop72_dlsa_attention(
                         scaling=scaling,
                         query_tile_tokens=cfg.sparse_query_tile_tokens,
                         telemetry=telemetry,
+                        sparse_cfg=cfg,
+                        known_upto=slot.logical_seq_length if q_len == 1 else None,
                     )
             else:
                 # Uncached or standard cache path
@@ -482,7 +709,14 @@ def attach_loop72_dlsa_attention(
                     sw = int(getattr(self_attn, "_sparkx_sliding_window", None) or getattr(self_attn, "sliding_window", None) or default_sw)
                     k_pos = torch.arange(max(0, seq_k - int(key_states.shape[-2])), seq_k, device=hidden_states.device, dtype=torch.long)
                     attn_out = local_sliding_attention_forward(
-                        query_states, key_states, value_states, q_positions=q_pos, k_positions=k_pos, sliding_window=sw, scaling=scaling
+                        query_states,
+                        key_states,
+                        value_states,
+                        q_positions=q_pos,
+                        k_positions=k_pos,
+                        sliding_window=sw,
+                        scaling=scaling,
+                        enable_native_gqa=cfg.enable_native_gqa,
                     )
                 else:
                     # Uncached global visit: route through a transient `GlobalPagedVisitSlot` so sparse causality & per-visit D-LSA still run!
@@ -513,6 +747,7 @@ def attach_loop72_dlsa_attention(
                         scaling=scaling,
                         query_tile_tokens=cfg.sparse_query_tile_tokens,
                         telemetry=telemetry,
+                        sparse_cfg=cfg,
                     )
 
             # Apply Spark's native head-wise sigmoid output gate (`sigmoid(g_proj(LN h))`) before `out_proj`

@@ -319,22 +319,30 @@ def configure_model_for_loop72_lsa(
     cluster_blk = int(attn_cfg.get('cluster_block_tokens', attn_cfg.get('n_cluster', 512)))
     avg_b_tok = int(attn_cfg.get('average_bucket_tokens', 16))
     k_clust = int(attn_cfg.get('k_clusters', max(4, cluster_blk // max(1, avg_b_tok))))
+    sinks_val = int(attn_cfg.get('sinks', 4))
+    recent_val = int(attn_cfg.get('recent_tokens', 512))
+    lr_tokens = int(attn_cfg.get('long_range_tokens', attn_cfg.get('max_selected_keys_default', 4096)))
+    default_exact_thresh = sinks_val + recent_val + lr_tokens
+    exact_thresh_val = int(attn_cfg.get('exact_threshold', default_exact_thresh))
     base_idx_cfg = DLSAIndexConfig(
         d_idx=int(attn_cfg.get('index_dim', attn_cfg.get('d_idx', 64))),
         n_pool=pool_sz,
         n_cluster=cluster_blk,
         k_clusters=k_clust,
-        sinks=int(attn_cfg.get('sinks', 4)),
-        recent_tokens=int(attn_cfg.get('recent_tokens', 512)),
-        max_selected_keys=int(attn_cfg.get('long_range_tokens', attn_cfg.get('max_selected_keys_default', 2048))),
-        exact_threshold=int(attn_cfg.get('exact_threshold', 2048)),
+        sinks=sinks_val,
+        recent_tokens=recent_val,
+        max_selected_keys=lr_tokens,
+        exact_threshold=exact_thresh_val,
         search_mode=str(attn_cfg.get('search', 'flat')),
         branching_factor=int(attn_cfg.get('tree_branching_factor', 16)),
         beam_width=int(attn_cfg.get('tree_beam_width', 32)),
         residual_block_compensation=bool(attn_cfg.get('residual_compensation', attn_cfg.get('residual_block_compensation', False))),
         persistent_token_latents=bool(cache_cfg.get('persistent_token_latents', attn_cfg.get('persistent_token_latents', False))),
+        selection_reuse_steps=int(attn_cfg.get('selection_reuse_steps', 2 if bool(attn_cfg.get('selection_reuse', False)) else 1)),
     )
-    per_layer_budgets = attn_cfg.get('per_visit_budget_overrides') or attn_cfg.get('per_layer_max_selected_keys', {3: 3072, 31: 1536, 35: 1536})
+    per_layer_budgets = attn_cfg.get('per_visit_budget_overrides')
+    if per_layer_budgets is None:
+        per_layer_budgets = attn_cfg.get('per_layer_max_selected_keys', {3: 3072, 31: 1536, 35: 1536})
     per_visit_budgets: dict = {}
     if isinstance(per_layer_budgets, dict):
         for k_lyr, v_bud in per_layer_budgets.items():
@@ -361,22 +369,35 @@ def configure_model_for_loop72_lsa(
         ckpt_data = torch.load(dlsa_checkpoint, map_location='cpu')
         bank.load_from_checkpoint_dict(ckpt_data)
 
+    gpu_hot_tok = int(cache_cfg.get('global_hot_tokens_per_visit', 8192))
     sparse_cfg = SparseAttentionConfig(
-        exact_threshold=int(attn_cfg.get('exact_threshold', 2048)),
+        index_dim=int(base_idx_cfg.d_idx),
+        maps_per_global_visit=bool(attn_cfg.get('maps_per_global_visit', True)),
+        search=str(base_idx_cfg.search_mode),
+        pool_size=pool_sz,
+        cluster_block_tokens=cluster_blk,
+        average_bucket_tokens=avg_b_tok,
+        sinks=sinks_val,
+        recent_tokens=recent_val,
+        long_range_tokens=lr_tokens,
+        exact_threshold=exact_thresh_val,
+        gpu_resident_max_tokens=gpu_hot_tok,
         sparse_query_tile_tokens=int(prefill_cfg.get('sparse_query_tile_tokens', 16)),
+        selection_reuse=bool(attn_cfg.get('selection_reuse', False)),
+        enable_native_gqa=bool(attn_cfg.get('enable_native_gqa', True)),
         residual_block_compensation=bool(attn_cfg.get('residual_compensation', False)),
         local_window=int(cache_cfg.get('local_window', cache_cfg.get('local_ring_tokens', 512))),
     )
     model.paged_cache_cfg = PagedCacheConfig(
         local_window=int(cache_cfg.get('local_window', cache_cfg.get('local_ring_tokens', 512))),
-        sinks=int(attn_cfg.get('sinks', 4)),
-        recent_tokens=int(attn_cfg.get('recent_tokens', 512)),
-        global_hot_tokens_per_visit=int(cache_cfg.get('global_hot_tokens_per_visit', 8192)),
+        sinks=sinks_val,
+        recent_tokens=recent_val,
+        global_hot_tokens_per_visit=gpu_hot_tok,
         kv_page_tokens=int(cache_cfg.get('kv_page_tokens', 64)),
         cold_codec=str(cache_cfg.get('cold_codec', 'bf16')),
         index_gpu_budget_bytes=int(cache_cfg.get('index_gpu_budget_bytes', 2 * (1024**3))),
         persistent_token_latents=bool(cache_cfg.get('persistent_token_latents', False)),
-        context_limit_tokens=int(cache_cfg.get('context_limit_tokens', model_cfg.get('context_limit_tokens', 131072))),
+        context_limit_tokens=int(cache_cfg.get('context_limit_tokens', model_cfg.get('context_limit_tokens', 1048576))),
         model_revision=str(model_cfg.get('base', model_cfg.get('backbone_id', 'XHToken/Spark-X2.6-4B'))),
         behavior_fingerprint=runtime_identity,
     )
@@ -391,6 +412,7 @@ def configure_model_for_loop72_lsa(
 def load_sparkx_loop72_lsa(
     repo_or_dir: str = 'TassP0lar/Spark-X2.6-4B-En4B-A1B',
     base_repo: str = 'XHToken/Spark-X2.6-4B',
+    model_id: Optional[str] = None,
     config_path: Optional[str] = None,
     dlsa_checkpoint: Optional[str] = None,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
@@ -401,6 +423,12 @@ def load_sparkx_loop72_lsa(
 ):
     """Load the Spark-X2.6-4B-Loop72-LSA architecture (72 visits = 18 global + 54 local, native GELU, 0 Engram params)."""
     _patch_transformers_v5_tied_weights()
+    if model_id is not None:
+        base_repo = str(model_id)
+        if str(model_id) == 'XHToken/Spark-X2.6-4B':
+            use_pristine_base = True
+        else:
+            repo_or_dir = str(model_id)
     cfg = load_loop72_lsa_yaml_config(config_path)
     if token is None:
         token = os.environ.get('HF_TOKEN') or None

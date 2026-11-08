@@ -36,6 +36,8 @@ class VisitDistillConfig:
     weight_decay: float = 0.01
     steps: int = 200
     sampled_queries: int = 32
+    keys_per_step: int = 1024
+    init_with_pca: bool = True
     tau_teacher: float = 1.0
     tau_student: float = 0.08
     focal_gamma: float = 1.5
@@ -184,6 +186,8 @@ def distill_single_visit_indexer(
 
     loss_first: Optional[float] = None
     loss_last: float = 0.0
+    recall_first: Optional[float] = None
+    recall_last: float = 0.0
     for step_i in range(max(1, int(cfg.steps))):
         q_s, k_s = qkv_samples[step_i % len(qkv_samples)]
         h_q, t_seq, d_h = q_s.shape
@@ -204,6 +208,7 @@ def distill_single_visit_indexer(
         k_f = k_s.float()
 
         step_loss = torch.tensor(0.0, device=q_s.device, dtype=torch.float32)
+        step_recall = 0.0
         for s_i in range(n_samp):
             p_tok = int(q_pos[s_i].item())
             upto = p_tok + 1
@@ -219,6 +224,10 @@ def distill_single_visit_indexer(
             if cfg.log_distance_prior_alpha > 0.0:
                 dist = (p_tok - torch.arange(upto, device=q_s.device, dtype=torch.float32)).clamp(min=0.0)
                 s_logits = s_logits - float(cfg.log_distance_prior_alpha) * torch.log1p(dist)
+            with torch.no_grad():
+                k_top = min(upto, max(8, upto // 4))
+                s_top_idx = torch.topk(s_logits, k=k_top, dim=-1).indices
+                step_recall += float(t_probs[s_top_idx].sum().item()) / float(n_samp)
             log_s = F.log_softmax(s_logits, dim=-1)
             kl = F.kl_div(log_s, t_probs, reduction="sum")
             if cfg.focal_weight > 0.0:
@@ -234,7 +243,9 @@ def distill_single_visit_indexer(
         val = float(step_loss.detach().item())
         if loss_first is None:
             loss_first = val
+            recall_first = step_recall
         loss_last = val
+        recall_last = step_recall
 
     for p in indexer.parameters():
         p.requires_grad_(False)
@@ -242,6 +253,10 @@ def distill_single_visit_indexer(
         "steps": int(cfg.steps),
         "loss_first": float(loss_first or 0.0),
         "loss_last": float(loss_last),
+        "initial_loss": float(loss_first or 0.0),
+        "final_loss": float(loss_last),
+        "initial_recall": float(recall_first or 0.0),
+        "final_recall": float(recall_last),
     }
 
 

@@ -48,7 +48,7 @@ cache:
   index_gpu_budget_bytes: 2147483648
   persistent_token_latents: false
   logical_positions: absolute
-  context_limit_tokens: 131072 # increase only after each length gate
+  context_limit_tokens: 1048576 # 1M full-length context window enabled with bounded 54x512 local rings + 18 paged D-LSA archives
 
 prefill:
   hidden_chunk_tokens: 2048

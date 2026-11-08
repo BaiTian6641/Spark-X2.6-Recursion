@@ -2568,10 +2568,19 @@ class TwoStreamMHC(nn.Module):
             return r1, 1.0 - w1, w1, p_swap
 
         with torch.autocast(device_type=s0.device.type, enabled=False):
-            flat = torch.cat((s0, s1), dim=-1)
-            rms = torch.rsqrt(flat.pow(2).mean(dim=-1, keepdim=True) + self.norm_eps)
-            normed = (flat * rms * nw) if nw is not None else (flat * rms)
-            dyn = proj(normed) + p_bias.view(1, 1, -1)
+            dim = s0.shape[-1]
+            # Compute joint RMS and split projection without allocating `torch.cat((s0, s1), dim=-1)` (`[B, T, 5120]`)
+            rms = torch.rsqrt(
+                0.5 * (s0.pow(2).mean(dim=-1, keepdim=True) + s1.pow(2).mean(dim=-1, keepdim=True)) + self.norm_eps
+            )
+            w_proj = proj.weight
+            if nw is not None:
+                dyn0 = F.linear(s0 * nw[:dim], w_proj[:, :dim])
+                dyn1 = F.linear(s1 * nw[dim:], w_proj[:, dim:])
+            else:
+                dyn0 = F.linear(s0, w_proj[:, :dim])
+                dyn1 = F.linear(s1, w_proj[:, dim:])
+            dyn = (dyn0 + dyn1) * rms + p_bias.view(1, 1, -1)
             r_log = base_r.float() + dyn[..., 0:2]
             w_log = base_w.float() + dyn[..., 2:4]
             m_log = (base_m.float().reshape(1, 1, 4) + dyn[..., 4:8]).clamp(min=-30.0, max=30.0)
@@ -2869,6 +2878,17 @@ class SparkXLoopV03(nn.Module):
                 global_visits_by_layer[idx] = global_visits_by_layer.get(idx, 0) + 1
             else:
                 local_visits += 1
+        from sparkx_dlsa import build_loop72_visit_schedule
+        sched_rows = build_loop72_visit_schedule(
+            start=self.loop_start,
+            end=self.loop_end,
+            passes=self.loop_passes,
+            enable_p3=self.enable_p3,
+            p3_start=self.p3_start,
+            p3_end=self.p3_end,
+            n_layers=self.n_layers,
+            global_layers=self.esm_layers,
+        )
         return {
             'total_visits': len(plan),
             'global_visits': global_visits,
@@ -2877,6 +2897,7 @@ class SparkXLoopV03(nn.Module):
             'loop_passes': int(self.loop_passes),
             'global_visits_by_layer': global_visits_by_layer,
             'per_layer_visits': per_layer_visits,
+            'schedule': sched_rows,
         }
 
     def execution_manifest(self) -> dict[str, Any]:
@@ -2885,8 +2906,12 @@ class SparkXLoopV03(nn.Module):
         mlp_cls = type(self.base.model.layers[0].mlp) if hasattr(self.base, 'model') and self.base.model.layers else None
         swiglu_patched = bool(getattr(mlp_cls, '_sparkx_triton_swiglu_patched', False)) if mlp_cls is not None else False
         dlsa_bank = getattr(self, 'dlsa_index_bank', None)
+        dlsa_params = int(dlsa_bank.total_map_parameters()) if (dlsa_bank is not None and hasattr(dlsa_bank, 'total_map_parameters')) else 0
         return {
             'runtime_identity': str(getattr(self.settings, 'runtime_identity', 'legacy_silu_v03')),
+            'total_virtual_layers': int(sched['total_visits']),
+            'global_visits': int(sched['global_visits']),
+            'local_visits': int(sched['local_visits']),
             'preserve_native_activation': bool(getattr(self.settings, 'preserve_native_activation', False)),
             'mlp_swiglu_patched': swiglu_patched,
             'engram_constructed': bool(self.engram is not None),
@@ -2894,6 +2919,7 @@ class SparkXLoopV03(nn.Module):
             'esm_enabled': bool(self.esm_enabled),
             'dlsa_attached': bool(dlsa_bank is not None),
             'dlsa_num_global_visits': int(len(dlsa_bank.visit_indexers)) if dlsa_bank is not None else 0,
+            'dlsa_selector_parameters': dlsa_params,
             'visit_schedule': sched,
         }
 
@@ -3595,7 +3621,7 @@ class SparkXLoopV03(nn.Module):
                     rope_theta=cfg.get_rope_theta(layer_type),
                     partial_rotary_factor=cfg.get_partial_rotary_factor(layer_type),
                     scale_factor=yarn_scale,
-                    original_max_position=int(getattr(sparse_cfg, 'yarn_original_max_position', 32768)),
+                    orig_max_position=int(getattr(sparse_cfg, 'yarn_orig_max_position', 1048576)),
                     beta_fast=float(getattr(sparse_cfg, 'yarn_beta_fast', 32.0)),
                     beta_slow=float(getattr(sparse_cfg, 'yarn_beta_slow', 1.0)),
                     device=device,
@@ -4016,7 +4042,19 @@ class SparkXLoopV03(nn.Module):
                 pass
         think_closed = False
         gen_list: list[int] = []
-        t0 = time.time()
+        prompt_len = int(out.shape[1])
+        bsz = int(out.shape[0])
+        out_buf = torch.empty(
+            (bsz, prompt_len + max(1, int(max_new_tokens)) + 16),
+            dtype=out.dtype,
+            device=out.device,
+        )
+        out_buf[:, :prompt_len].copy_(out)
+        cur_len = prompt_len
+        t_start = time.perf_counter()
+        t_decode_start = t_start
+        ttft_sec: float = 0.0
+        itl_ms_list: list[float] = []
 
         def _sample_step(step_logits: torch.Tensor, cur_gen: list[int], is_closed: bool) -> torch.Tensor:
             logits_1d = step_logits[0, -1, :].float().clone()
@@ -4038,16 +4076,34 @@ class SparkXLoopV03(nn.Module):
             if not do_sample or temperature <= 1e-5:
                 return logits_1d.argmax(dim=-1, keepdim=True).unsqueeze(0)
             scaled = logits_1d / float(temperature)
+            # Candidate-only Top-K / Top-P sampling: sort only the top candidates instead of sorting all 131,072 vocabulary tokens
             if top_k > 0:
                 k_val = min(int(top_k), scaled.shape[-1])
-                v_k, _ = torch.topk(scaled, k_val)
-                scaled = torch.where(scaled < v_k[-1], torch.full_like(scaled, -1e9), scaled)
+                top_vals, top_idx = torch.topk(scaled, k_val, largest=True, sorted=True)
+                s_probs = F.softmax(top_vals, dim=-1)
+                if 0.0 < top_p < 1.0:
+                    cum = torch.cumsum(s_probs, dim=-1)
+                    mask = (cum - s_probs) > float(top_p)
+                    s_probs = s_probs.masked_fill(mask, 0.0)
+                    s_probs = s_probs / s_probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+                choice = torch.multinomial(s_probs, num_samples=1)
+                return top_idx.gather(-1, choice).unsqueeze(0)
+
             probs = F.softmax(scaled, dim=-1)
             if 0.0 < top_p < 1.0:
+                k_cand = min(1024, probs.shape[-1])
+                top_probs, top_idx = torch.topk(probs, k_cand, largest=True, sorted=True)
+                if float(top_probs.sum().item()) >= float(top_p):
+                    cum = torch.cumsum(top_probs, dim=-1)
+                    mask = (cum - top_probs) > float(top_p)
+                    top_probs = top_probs.masked_fill(mask, 0.0)
+                    top_probs = top_probs / top_probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+                    choice = torch.multinomial(top_probs, num_samples=1)
+                    return top_idx.gather(-1, choice).unsqueeze(0)
                 s_probs, s_idx = torch.sort(probs, descending=True)
                 cum = torch.cumsum(s_probs, dim=-1)
-                mask = (cum - s_probs) > top_p
-                s_probs = torch.where(mask, torch.zeros_like(s_probs), s_probs)
+                mask = (cum - s_probs) > float(top_p)
+                s_probs = s_probs.masked_fill(mask, 0.0)
                 s_probs = s_probs / s_probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
                 choice = torch.multinomial(s_probs, num_samples=1)
                 return s_idx.gather(-1, choice).unsqueeze(0)
@@ -4055,78 +4111,130 @@ class SparkXLoopV03(nn.Module):
 
         try:
             logits = self.forward_logits(
-                out,
+                out_buf[:, :cur_len],
                 past_key_values=cache,
                 logits_to_keep=1,
                 chunk_size=(prefill_chunk if prefill_chunk > 0 else None),
             )
             next_id = _sample_step(logits, gen_list, think_closed)
             tok_int = int(next_id.item())
+            t_decode_start = time.perf_counter()
+            ttft_sec = max(1e-6, t_decode_start - t_start)
             gen_list.append(tok_int)
             if tok_int in think_close_ids:
                 in_think = False
                 think_closed = True
-            prev_tok = out[:, -2:]
-            out = torch.cat((out, next_id), dim=-1)
+            prev_tok = out_buf[:, max(0, cur_len - 2) : cur_len]
+            out_buf[:, cur_len : cur_len + 1].copy_(next_id)
+            cur_len += 1
             if tok_int in stop_ids:
-                return out
+                return out_buf[:, :cur_len]
             step_i = 1
             while step_i < max_new_tokens:
+                t_step_0 = time.perf_counter()
                 # Enforce think_budget_tokens so the model NEVER truncates mid-thought without emitting </think>
                 if not think_closed and eff_think_budget is not None and len(gen_list) >= eff_think_budget:
                     for cid in close_seq_ids:
                         if step_i >= max_new_tokens:
                             break
                         _ = self.forward_logits(next_id, past_key_values=cache, prev_ids=prev_tok, logits_to_keep=1)
-                        prev_tok = out[:, -2:]
-                        next_id = torch.tensor([[cid]], dtype=out.dtype, device=out.device)
+                        prev_tok = out_buf[:, max(0, cur_len - 2) : cur_len]
+                        next_id = torch.tensor([[cid]], dtype=out_buf.dtype, device=out_buf.device)
                         gen_list.append(cid)
-                        out = torch.cat((out, next_id), dim=-1)
+                        out_buf[:, cur_len : cur_len + 1].copy_(next_id)
+                        cur_len += 1
                         step_i += 1
                     in_think = False
                     think_closed = True
                     if stream_print:
-                        dt = max(1e-3, time.time() - t0)
-                        print(f"  [72L Budget </think>] Closed </think> at budget={eff_think_budget} tokens ({len(gen_list)/dt:.1f} tok/s).", flush=True)
+                        dec_dt = max(1e-3, time.perf_counter() - t_decode_start)
+                        e2e_dt = max(1e-3, time.perf_counter() - t_start)
+                        dec_tps = max(0, len(gen_list) - 1) / dec_dt
+                        print(
+                            f"  [72L Budget </think>] Closed </think> at budget={eff_think_budget} tokens "
+                            f"(decode={dec_tps:.1f} tok/s | e2e={len(gen_list)/e2e_dt:.1f} tok/s | TTFT={ttft_sec*1000:.0f}ms).",
+                            flush=True,
+                        )
                     if step_i >= max_new_tokens:
                         break
+                    t_step_0 = time.perf_counter()
 
                 logits = self.forward_logits(next_id, past_key_values=cache, prev_ids=prev_tok, logits_to_keep=1)
-                prev_tok = out[:, -2:]
+                prev_tok = out_buf[:, max(0, cur_len - 2) : cur_len]
                 if not think_closed and tokenizer is not None and (len(gen_list) <= 16 or len(gen_list) % 8 == 0):
                     tail_txt = tokenizer.decode(gen_list[-48:], skip_special_tokens=False)
                     if '<think>' in tail_txt and '</think>' not in tail_txt:
                         in_think = True
                     if '</think>' in tail_txt:
                         if in_think and stream_print:
-                            dt = max(1e-3, time.time() - t0)
-                            print(f"  [72L Natural </think>] Model closed </think> naturally at {len(gen_list)} tokens ({len(gen_list)/dt:.1f} tok/s).", flush=True)
+                            dec_dt = max(1e-3, time.perf_counter() - t_decode_start)
+                            e2e_dt = max(1e-3, time.perf_counter() - t_start)
+                            dec_tps = max(0, len(gen_list) - 1) / dec_dt
+                            print(
+                                f"  [72L Natural </think>] Model closed </think> naturally at {len(gen_list)} tokens "
+                                f"(decode={dec_tps:.1f} tok/s | e2e={len(gen_list)/e2e_dt:.1f} tok/s | TTFT={ttft_sec*1000:.0f}ms).",
+                                flush=True,
+                            )
                         in_think = False
                         think_closed = True
 
                 next_id = _sample_step(logits, gen_list, think_closed)
                 tok_int = int(next_id.item())
+                itl_ms_list.append((time.perf_counter() - t_step_0) * 1000.0)
                 gen_list.append(tok_int)
                 if tok_int in think_close_ids:
                     in_think = False
                     think_closed = True
-                out = torch.cat((out, next_id), dim=-1)
+                out_buf[:, cur_len : cur_len + 1].copy_(next_id)
+                cur_len += 1
                 step_i += 1
 
                 if stream_print and tokenizer is not None and len(gen_list) % 128 == 0:
-                    dt = max(1e-3, time.time() - t0)
+                    dec_dt = max(1e-3, time.perf_counter() - t_decode_start)
+                    e2e_dt = max(1e-3, time.perf_counter() - t_start)
+                    dec_tps = max(0, len(gen_list) - 1) / dec_dt
                     snippet = tokenizer.decode(gen_list[-24:], skip_special_tokens=False).replace('\n', ' ')
                     phase = 'think' if in_think else 'answer'
-                    print(f"  [Gen | {len(gen_list):5d} tok | {len(gen_list)/dt:5.1f} tok/s | phase={phase}] ...{snippet[-72:]}", flush=True)
+                    print(
+                        f"  [Gen | {len(gen_list):5d} tok | decode={dec_tps:5.1f} tok/s | e2e={len(gen_list)/e2e_dt:5.1f} tok/s | phase={phase}] ...{snippet[-72:]}",
+                        flush=True,
+                    )
 
                 if tok_int in stop_ids:
                     if stream_print:
-                        dt = max(1e-3, time.time() - t0)
-                        print(f"  [Gen Complete] Hit stop token at {len(gen_list)} tokens ({len(gen_list)/dt:.1f} tok/s).", flush=True)
+                        dec_dt = max(1e-3, time.perf_counter() - t_decode_start)
+                        e2e_dt = max(1e-3, time.perf_counter() - t_start)
+                        dec_tps = max(0, len(gen_list) - 1) / dec_dt
+                        print(
+                            f"  [Gen Complete] Hit stop token at {len(gen_list)} tokens "
+                            f"(decode={dec_tps:.1f} tok/s | e2e={len(gen_list)/e2e_dt:.1f} tok/s | TTFT={ttft_sec*1000:.0f}ms).",
+                            flush=True,
+                        )
                     break
         finally:
+            t_end = time.perf_counter()
+            e2e_sec = max(1e-6, t_end - t_start)
+            decode_sec = max(1e-6, t_end - t_decode_start)
+            decode_steps = max(0, len(gen_list) - 1)
+            sorted_itl = sorted(itl_ms_list) if itl_ms_list else [0.0]
+            n_itl = len(sorted_itl)
+            self.last_generation_timing = {
+                "prompt_tokens": prompt_len,
+                "generated_tokens": len(gen_list),
+                "decode_steps": decode_steps,
+                "ttft_sec": round(ttft_sec, 4),
+                "ttft_ms": round(ttft_sec * 1000.0, 2),
+                "prefill_tok_per_s": round(prompt_len / max(1e-6, ttft_sec), 2),
+                "decode_sec": round(decode_sec, 4),
+                "decode_tok_per_s": round(decode_steps / decode_sec, 2) if decode_steps > 0 else 0.0,
+                "e2e_sec": round(e2e_sec, 4),
+                "e2e_tok_per_s": round(len(gen_list) / e2e_sec, 2),
+                "itl_p50_ms": round(sorted_itl[min(n_itl - 1, int(0.50 * n_itl))], 2),
+                "itl_p95_ms": round(sorted_itl[min(n_itl - 1, int(0.95 * n_itl))], 2),
+                "itl_p99_ms": round(sorted_itl[min(n_itl - 1, int(0.99 * n_itl))], 2),
+            }
             self.train(prev_train)
-        return out
+        return out_buf[:, :cur_len]
 
 
 def set_trainables_v03(

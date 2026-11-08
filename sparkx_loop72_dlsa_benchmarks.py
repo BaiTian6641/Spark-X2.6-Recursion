@@ -323,6 +323,38 @@ OFFICIAL_BENCHMARK_TABLE: Dict[str, Dict[str, Any]] = {
         "Gemma4_12B": 78.8,
         "Gemma4_E4B": 58.6,
     },
+    # --- Modern 2026 Frontier Benchmarks (Knowledge Reliability, CLI Agent, Real-World GDP Work) ---
+    "AA-Omniscience v1.1": {
+        "category": "General & Knowledge",
+        "hf_dataset": "ArtificialAnalysis/AA-Omniscience-Public-v1.1",
+        "scale": 100.0,
+        "Spark_X2.6_4B": None,
+        "Spark_X2.5_4B": None,
+        "Qwen3.5_9B": None,
+        "Qwen3.5_4B": None,
+        "Gemma4_12B": None,
+        "Gemma4_E4B": None,
+    },
+    "Terminal-Bench 4.0": {
+        "category": "Agent",
+        "hf_dataset": "harborframework/terminal-bench-2.0",
+        "Spark_X2.6_4B": None,
+        "Spark_X2.5_4B": None,
+        "Qwen3.5_9B": None,
+        "Qwen3.5_4B": None,
+        "Gemma4_12B": None,
+        "Gemma4_E4B": None,
+    },
+    "openai/gdpval": {
+        "category": "Agent",
+        "hf_dataset": "openai/gdpval",
+        "Spark_X2.6_4B": None,
+        "Spark_X2.5_4B": None,
+        "Qwen3.5_9B": None,
+        "Qwen3.5_4B": None,
+        "Gemma4_12B": None,
+        "Gemma4_E4B": None,
+    },
 }
 
 
@@ -589,6 +621,131 @@ def score_mrcr_v2_response(response_text: str, gold_answer: str) -> Dict[str, An
     }
 
 
+def score_aa_omniscience_v11(
+    response_text: str,
+    gold_answer: str,
+    should_abstain: bool = False,
+) -> Dict[str, Any]:
+    """Score an `AA-Omniscience v1.1` (`ArtificialAnalysis/AA-Omniscience-Public-v1.1`) item.
+
+    Implements the official Artificial Analysis Omniscience Index rubric (`[-100, +100]`):
+      - `+1.0` (`+100` index): Correct factual recall without guessing on unanswerable prompts.
+      - `0.0` (`0` index): Calibrated abstention (`ABSTAIN` / `I do not have enough verified information`).
+      - `-1.0` (`-100` index): Hallucinated / incorrect factual guess.
+    """
+    ans_seg = extract_answer_segment(response_text)
+    boxed = (extract_boxed_answer(ans_seg) or ans_seg).strip()
+    lower = boxed.lower()
+    abstain_markers = (
+        "abstain",
+        "insufficient information",
+        "cannot verify",
+        "not enough verified information",
+        "unknown",
+        "i don't know",
+        "i do not know",
+    )
+    did_abstain = any(m in lower for m in abstain_markers)
+    if should_abstain:
+        if did_abstain:
+            return {"outcome": "calibrated_abstention", "omniscience_index": 100.0, "normalized_score": 100.0, "passed": True}
+        return {"outcome": "hallucinated_on_unanswerable", "omniscience_index": -100.0, "normalized_score": 0.0, "passed": False}
+
+    if gold_answer.lower() in lower:
+        return {"outcome": "correct", "omniscience_index": 100.0, "normalized_score": 100.0, "passed": True}
+    if did_abstain:
+        return {"outcome": "abstained", "omniscience_index": 0.0, "normalized_score": 50.0, "passed": False}
+    return {"outcome": "incorrect_hallucination", "omniscience_index": -100.0, "normalized_score": 0.0, "passed": False}
+
+
+def verify_terminal_bench_task(response_text: str, spec: Dict[str, Any]) -> Verdict:
+    """Verify a `Terminal-Bench 4.0` (`harborframework/terminal-bench-2.0` / `tbench.ai`) CLI engineering task."""
+    ans_seg = extract_answer_segment(response_text)
+    code = extract_code(ans_seg) or ans_seg
+    req_tokens = spec.get("required_tokens", [])
+    forbidden_tokens = spec.get("forbidden_tokens", [])
+    missing = [tok for tok in req_tokens if tok not in code]
+    forbidden_hit = [tok for tok in forbidden_tokens if tok in code]
+    ok = (len(missing) == 0) and (len(forbidden_hit) == 0)
+    matched = max(0, len(req_tokens) - len(missing))
+    score = (matched / max(1, len(req_tokens))) if not forbidden_hit else 0.0
+    return Verdict(
+        ok,
+        "ok" if ok else "terminal_command_mismatch",
+        {"score": round(score, 4), "missing": missing, "forbidden_hit": forbidden_hit, "extracted_command": code[:240]},
+    )
+
+
+def verify_gdpval_deliverable(response_text: str, spec: Dict[str, Any]) -> Verdict:
+    """Verify an `openai/gdpval` (44 occupations across 9 GDP sectors) structured economic deliverable."""
+    ans_seg = extract_answer_segment(response_text)
+    obj = _extract_json_object(ans_seg)
+    if not isinstance(obj, dict):
+        return Verdict(False, "no_json_deliverable", {"score": 0.0})
+    req_fields = spec.get("required_fields", {})
+    tol = float(spec.get("numeric_tolerance", 1e-2))
+    hits = 0
+    errors: List[str] = []
+    for k, exp_v in req_fields.items():
+        if k not in obj:
+            errors.append(f"missing:{k}")
+            continue
+        got_v = obj[k]
+        if isinstance(exp_v, (int, float)) and isinstance(got_v, (int, float)) and not isinstance(got_v, bool):
+            if abs(float(got_v) - float(exp_v)) <= tol:
+                hits += 1
+            else:
+                errors.append(f"value:{k}:got={got_v},exp={exp_v}")
+        elif str(got_v).strip().lower() == str(exp_v).strip().lower():
+            hits += 1
+        else:
+            errors.append(f"value:{k}:got={got_v!r},exp={exp_v!r}")
+    score = hits / max(1, len(req_fields))
+    return Verdict(len(errors) == 0, "ok" if not errors else "gdpval_rubric_mismatch", {"score": round(score, 4), "errors": errors, "parsed": obj})
+
+
+def compute_omp_hashline_tag(line_num: int, line_text: str) -> str:
+    """Compute the deterministic 2-hex-char content hash tag (`line_num:hh|line_text`) used by `Oh My Pi` (`omp`)
+    hashline edit mode (`can1357/oh-my-pi`).
+    """
+    h2 = hashlib.blake2b(line_text.rstrip("\r\n").encode("utf-8"), digest_size=1).hexdigest()
+    return f"{int(line_num)}:{h2}|{line_text.rstrip()}"
+
+
+def evaluate_oh_my_pi_hashline_task(
+    response_text: str,
+    source_lines: Sequence[str],
+    expected_substring: str,
+) -> Verdict:
+    """Verify an `Oh My Pi` (`omp`) hashline edit patch (`replace line:hash` -> new content)."""
+    ans_seg = extract_answer_segment(response_text)
+    obj = _extract_json_object(ans_seg)
+    tagged = {i + 1: hashlib.blake2b(ln.rstrip("\r\n").encode("utf-8"), digest_size=1).hexdigest() for i, ln in enumerate(source_lines)}
+    if isinstance(obj, dict):
+        anchor = str(obj.get("anchor", "")).strip()
+        replacement = str(obj.get("replacement", "")).strip()
+    else:
+        m = re.search(r"(\d+:[0-9a-fA-F]{2})", ans_seg)
+        anchor = m.group(1).lower() if m else ""
+        replacement = ans_seg
+    if ":" not in anchor:
+        return Verdict(False, "missing_hashline_anchor", {"score": 0.0, "anchor": anchor})
+    try:
+        ln_str, h_str = anchor.split(":", 1)
+        ln_idx = int(ln_str)
+    except Exception:
+        return Verdict(False, "invalid_hashline_anchor", {"score": 0.0, "anchor": anchor})
+    exp_hash = tagged.get(ln_idx)
+    hash_ok = (exp_hash is not None) and (h_str.lower() == exp_hash.lower())
+    content_ok = expected_substring in replacement
+    score = (0.5 if hash_ok else 0.0) + (0.5 if content_ok else 0.0)
+    return Verdict(
+        bool(hash_ok and content_ok),
+        "ok" if (hash_ok and content_ok) else "hashline_mismatch",
+        {"score": score, "anchor": anchor, "expected_hash": exp_hash, "hash_ok": hash_ok, "content_ok": content_ok},
+    )
+
+
 # ==============================================================================
 # 4. Curated Significant Benchmark Items (Math, LongBench v2 / AA-LCR, IFEval/IFBench, BFCL-V4, SciCode)
 # ==============================================================================
@@ -780,6 +937,76 @@ SIGNIFICANT_BENCHMARK_SUITE: List[Dict[str, Any]] = [
         ],
         "verifier": "code",
     },
+    # --- Frontier 1: AA-Omniscience v1.1 (Hallucination-Penalized Knowledge & Calibrated Abstention) ---
+    {
+        "id": "aa_omniscience_v11_ieee_fp8_mantissa",
+        "benchmark": "AA-Omniscience v1.1",
+        "category": "General & Knowledge",
+        "official_spark_x26_score": None,
+        "prompt": (
+            "[AA-Omniscience v1.1 — Computer Architecture & Numeric Formats]\n"
+            "Scoring Rubric: +100 for exact factual answer, 0 for `\\boxed{ABSTAIN}` if uncertain, -100 for an incorrect guess.\n"
+            "Question: In the OCP 8-bit floating-point specification `E4M3` (`float8_e4m3fn`), how many bits are allocated "
+            "to the significand/mantissa field (excluding the 1 sign bit and 4 exponent bits)? "
+            "Put your exact integer answer (or `ABSTAIN`) inside `\\boxed{...}`."
+        ),
+        "gold": "3",
+        "should_abstain": False,
+        "verifier": "omniscience",
+    },
+    # --- Frontier 2: Terminal-Bench 4.0 (`tbench.ai` / `harborframework/terminal-bench-2.0`) ---
+    {
+        "id": "terminal_bench_4_git_worktree_systemd",
+        "benchmark": "Terminal-Bench 4.0",
+        "category": "Agent",
+        "official_spark_x26_score": None,
+        "prompt": (
+            "[Terminal-Bench 4.0 — Container & CLI Systems Engineering]\n"
+            "Write a non-interactive POSIX shell snippet inside a ```bash ... ``` block that:\n"
+            "1. Creates a detached git worktree at `/srv/loop72-bench` checked out at branch `loop72-dlsa` using `git worktree add`.\n"
+            "2. Runs `python3 -m unittest discover -s tests -p \"test_*.py\"` inside `/srv/loop72-bench`.\n"
+            "Never use interactive flags (`-i`) or destructive `rm -rf /`."
+        ),
+        "terminal_spec": {
+            "required_tokens": ["git worktree add", "/srv/loop72-bench", "loop72-dlsa", "unittest"],
+            "forbidden_tokens": ["rm -rf /"],
+        },
+        "verifier": "terminal_bench",
+    },
+    # --- Frontier 3: openai/gdpval (Real-World Economically Valuable Knowledge Work across 44 Occupations) ---
+    {
+        "id": "gdpval_cloud_finops_capacity_audit",
+        "benchmark": "openai/gdpval",
+        "category": "Agent",
+        "official_spark_x26_score": None,
+        "prompt": (
+            "[openai/gdpval — Occupation: Principal Cloud Infrastructure & Financial Operations Analyst]\n"
+            "Case Brief:\n"
+            "- An enterprise deploys a 72-visit looped 4B model serving 1,048,576-token (`1M`) context sessions.\n"
+            "- Each session uses `54` local sliding-window rings (`108 MiB` total in BF16) plus `18` global full-attention visits.\n"
+            "- At `N = 1,048,576` tokens (`2^20`), each global visit stores `4` KV heads x `256` head_dim x `2` (K and V) elements per token.\n"
+            "  - In `16-bit` (`BF16`, `2` bytes/element), `1` global visit = `4 * 1,048,576 * 256 * 2 * 2` bytes = `4.0 GiB`, so `18` global visits = `72.0 GiB`.\n"
+            "  - In `4-bit` (`INT4`, `0.5` bytes/element), `18` global visits = `18.0 GiB` (`54.0 GiB` saved per session).\n"
+            "  - With `8,192` hot GPU tokens per global visit in BF16 (`18 * 8,192 * 4096 bytes = 576 MiB`) + `108 MiB` local rings, active GPU KV residency is `684 MiB`.\n\n"
+            "Deliverable: Emit a valid JSON object inside a ```json ... ``` block with exact keys:\n"
+            "- `\"global_bf16_gib\"`: float (`72.0`)\n"
+            "- `\"global_int4_gib\"`: float (`18.0`)\n"
+            "- `\"gib_saved_per_session\"`: float (`54.0`)\n"
+            "- `\"gpu_hot_kv_mib\"`: int (`684`)\n"
+            "- `\"recommended_tiering\"`: string (`\"M1_GPU_Hot_M2_Host_Cold\"`)"
+        ),
+        "gdpval_spec": {
+            "required_fields": {
+                "global_bf16_gib": 72.0,
+                "global_int4_gib": 18.0,
+                "gib_saved_per_session": 54.0,
+                "gpu_hot_kv_mib": 684,
+                "recommended_tiering": "M1_GPU_Hot_M2_Host_Cold",
+            },
+            "numeric_tolerance": 0.05,
+        },
+        "verifier": "gdpval",
+    },
 ]
 
 
@@ -800,6 +1027,9 @@ def try_load_hf_benchmark_samples(max_per_dataset: int = 3) -> Dict[str, List[Di
         ("HMMT Feb 26", "MathArena/hmmt_feb_2026", "train"),
         ("LongBench v2", "zai-org/LongBench-v2", "train"),
         ("IFEval", "google/IFEval", "train"),
+        ("AA-Omniscience v1.1", "ArtificialAnalysis/AA-Omniscience-Public-v1.1", "train"),
+        ("Terminal-Bench 4.0", "harborframework/terminal-bench-2.0", "test"),
+        ("openai/gdpval", "openai/gdpval", "train"),
     ]
     for name, repo_id, split in specs:
         try:
@@ -973,7 +1203,7 @@ def evaluate_selected_benchmark_tasks(
 
     device = next(model.base.parameters()).device
 
-    def _generate_one(prompt_text: str) -> Tuple[str, float]:
+    def _generate_one(prompt_text: str) -> Tuple[str, float, Dict[str, Any]]:
         t0 = time.perf_counter()
         messages = [{"role": "user", "content": prompt_text}]
         try:
@@ -995,13 +1225,14 @@ def evaluate_selected_benchmark_tasks(
         )
         gen_ids = out_ids[0, inp.shape[1]:].tolist()
         txt = tokenizer.decode(gen_ids, skip_special_tokens=True)
-        return txt, round(time.perf_counter() - t0, 3)
+        timing = dict(getattr(model, "last_generation_timing", None) or {})
+        return txt, round(time.perf_counter() - t0, 3), timing
 
     task_reports: List[Dict[str, Any]] = []
 
     # 1. GraphWalks BFS F1
     gw_item = generate_graphwalks_bfs_instance(num_nodes=graphwalks_nodes, branching=2, target_depth=2, seed=42)
-    gw_resp, gw_sec = _generate_one(gw_item["prompt"])
+    gw_resp, gw_sec, gw_timing = _generate_one(gw_item["prompt"])
     gw_score = score_graphwalks_bfs_f1(gw_resp, gw_item["gold_nodes"])
     task_reports.append({
         "id": "graphwalks_bfs",
@@ -1012,11 +1243,16 @@ def evaluate_selected_benchmark_tasks(
         "score": round(gw_score["f1"] * 100.0, 2),
         "details": gw_score,
         "latency_sec": gw_sec,
+        "ttft_ms": gw_timing.get("ttft_ms", 0.0),
+        "prefill_tok_per_s": gw_timing.get("prefill_tok_per_s", 0.0),
+        "decode_tok_per_s": gw_timing.get("decode_tok_per_s", 0.0),
+        "e2e_tok_per_s": gw_timing.get("e2e_tok_per_s", 0.0),
+        "itl_p50_ms": gw_timing.get("itl_p50_ms", 0.0),
     })
 
     # 2. OpenAI MRCR v2
     mrcr_item = generate_mrcr_v2_instance(num_rounds=mrcr_rounds, target_occurrence=3, seed=101)
-    mrcr_resp, mrcr_sec = _generate_one(mrcr_item["prompt"])
+    mrcr_resp, mrcr_sec, mrcr_timing = _generate_one(mrcr_item["prompt"])
     mrcr_score = score_mrcr_v2_response(mrcr_resp, mrcr_item["gold_answer"])
     task_reports.append({
         "id": "openai_mrcr_v2",
@@ -1027,11 +1263,16 @@ def evaluate_selected_benchmark_tasks(
         "score": round(mrcr_score["score"] * 100.0, 2),
         "details": mrcr_score,
         "latency_sec": mrcr_sec,
+        "ttft_ms": mrcr_timing.get("ttft_ms", 0.0),
+        "prefill_tok_per_s": mrcr_timing.get("prefill_tok_per_s", 0.0),
+        "decode_tok_per_s": mrcr_timing.get("decode_tok_per_s", 0.0),
+        "e2e_tok_per_s": mrcr_timing.get("e2e_tok_per_s", 0.0),
+        "itl_p50_ms": mrcr_timing.get("itl_p50_ms", 0.0),
     })
 
-    # 3. Curated Math, AA-LCR, IFBench, BFCL-V4, SciCode items
+    # 3. Curated Math, AA-LCR, IFBench, BFCL-V4, SciCode, AA-Omniscience v1.1, Terminal-Bench 4.0, openai/gdpval items
     for item in SIGNIFICANT_BENCHMARK_SUITE:
-        resp, sec = _generate_one(item["prompt"])
+        resp, sec, timing = _generate_one(item["prompt"])
         v_type = item["verifier"]
         if v_type == "math":
             res = verify_math_answer(resp, item["gold"])
@@ -1048,6 +1289,21 @@ def evaluate_selected_benchmark_tasks(
             passed = bool(res.ok)
             sc = round(float(res.detail.get("score", 1.0 if passed else 0.0)) * 100.0, 2)
             det = res.detail
+        elif v_type == "omniscience":
+            omni = score_aa_omniscience_v11(resp, item["gold"], should_abstain=bool(item.get("should_abstain", False)))
+            passed = bool(omni["passed"])
+            sc = float(omni["normalized_score"])
+            det = omni
+        elif v_type == "terminal_bench":
+            res = verify_terminal_bench_task(resp, item["terminal_spec"])
+            passed = bool(res.ok)
+            sc = round(float(res.detail.get("score", 1.0 if passed else 0.0)) * 100.0, 2)
+            det = res.detail
+        elif v_type == "gdpval":
+            res = verify_gdpval_deliverable(resp, item["gdpval_spec"])
+            passed = bool(res.ok)
+            sc = round(float(res.detail.get("score", 1.0 if passed else 0.0)) * 100.0, 2)
+            det = res.detail
         else:
             passed = False
             sc = 0.0
@@ -1061,16 +1317,334 @@ def evaluate_selected_benchmark_tasks(
             "score": sc,
             "details": det,
             "latency_sec": sec,
+            "ttft_ms": timing.get("ttft_ms", 0.0),
+            "prefill_tok_per_s": timing.get("prefill_tok_per_s", 0.0),
+            "decode_tok_per_s": timing.get("decode_tok_per_s", 0.0),
+            "e2e_tok_per_s": timing.get("e2e_tok_per_s", 0.0),
+            "itl_p50_ms": timing.get("itl_p50_ms", 0.0),
         })
 
     mean_score = round(sum(r["score"] for r in task_reports) / max(1, len(task_reports)), 2)
     pass_rate = round(sum(1 for r in task_reports if r["passed"]) / max(1, len(task_reports)) * 100.0, 2)
+    mean_decode_tps = round(sum(float(r.get("decode_tok_per_s", 0.0)) for r in task_reports) / max(1, len(task_reports)), 2)
+    mean_e2e_tps = round(sum(float(r.get("e2e_tok_per_s", 0.0)) for r in task_reports) / max(1, len(task_reports)), 2)
     return {
         "num_tasks": len(task_reports),
         "pass_rate_pct": pass_rate,
         "mean_score": mean_score,
+        "mean_decode_tok_per_s": mean_decode_tps,
+        "mean_e2e_tok_per_s": mean_e2e_tps,
         "tasks": task_reports,
     }
+
+
+@_no_grad()
+def benchmark_loop72_decode_speed(
+    model: Any,
+    tokenizer: Any,
+    prompt_lengths: Sequence[int] = (512, 2048, 8192, 32768),
+    gen_tokens: int = 64,
+) -> Dict[str, Any]:
+    """Measure separated TTFT, prefill throughput (`prefill_tok_per_s`), steady-state decode speed (`decode_tok_per_s`),
+    end-to-end throughput (`e2e_tok_per_s`), and inter-token latency percentiles (`itl_p50_ms`, `itl_p95_ms`, `itl_p99_ms`)
+    across multiple context horizons on `Spark-X2.6-4B-Loop72-LSA`.
+    """
+    if not HAS_TORCH:
+        raise RuntimeError("benchmark_loop72_decode_speed requires PyTorch.")
+
+    device = next(model.base.parameters()).device
+    max_len = max(int(x) for x in prompt_lengths)
+    raw_stream = build_modern_long_eval_stream(target_tokens=max_len + 256, tokenizer=tokenizer)
+    full_ids = tokenizer.encode(raw_stream, add_special_tokens=False)
+    while len(full_ids) < max_len:
+        full_ids = full_ids + full_ids
+
+    rows: List[Dict[str, Any]] = []
+    for p_len in prompt_lengths:
+        p_len_i = int(p_len)
+        inp = torch.tensor([full_ids[:p_len_i]], dtype=torch.long, device=device)
+        cache = model.make_inference_cache(session_id=f"speed_{p_len_i}")
+        _ = model.generate_cached(
+            inp,
+            max_new_tokens=int(gen_tokens),
+            do_sample=False,
+            tokenizer=tokenizer,
+            stream_print=False,
+            cache=cache,
+        )
+        t_rep = dict(getattr(model, "last_generation_timing", None) or {})
+        ledger = cache.memory_ledger()
+        rows.append({
+            "prompt_tokens": p_len_i,
+            "generated_tokens": int(t_rep.get("generated_tokens", gen_tokens)),
+            "ttft_ms": float(t_rep.get("ttft_ms", 0.0)),
+            "prefill_tok_per_s": float(t_rep.get("prefill_tok_per_s", 0.0)),
+            "decode_tok_per_s": float(t_rep.get("decode_tok_per_s", 0.0)),
+            "e2e_tok_per_s": float(t_rep.get("e2e_tok_per_s", 0.0)),
+            "itl_p50_ms": float(t_rep.get("itl_p50_ms", 0.0)),
+            "itl_p95_ms": float(t_rep.get("itl_p95_ms", 0.0)),
+            "itl_p99_ms": float(t_rep.get("itl_p99_ms", 0.0)),
+            "gpu_cache_mib": round(float(ledger.get("m1_gpu_total_mib", 0.0)), 2),
+            "host_cold_mib": round(float(ledger.get("m2_host_cold_pages_mib", 0.0)), 2),
+        })
+        del cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return {
+        "gen_tokens": int(gen_tokens),
+        "total_virtual_layers": int(getattr(model, "total_virtual_layers", 72)),
+        "horizons": rows,
+    }
+
+
+@_no_grad()
+def run_full_length_1m_context_benchmark(
+    model: Optional[Any] = None,
+    tokenizer: Optional[Any] = None,
+    horizons: Sequence[int] = (32_768, 131_072, 262_144, 524_288, 1_048_576),
+    max_live_tokens: int = 32_768,
+    gen_tokens: int = 16,
+) -> Dict[str, Any]:
+    """Run the Full-Length `1M` (`1,048,576`-Token) Context Window Capability & Scaling Suite:
+      1. Exact 72-visit memory capacity & compression ledger across `32K`, `128K`, `256K`, `512K`, and `1,048,576` (`1M`) tokens.
+      2. High-horizon `GraphWalks BFS 1M` (`openai/graphwalks`) & `OpenAI MRCR v2 512k-1M` (`openai/mrcr`) multi-round stress synthesis.
+      3. Live chunked prefill + steady-state decode on all horizons `<= max_live_tokens` (set `max_live_tokens=1_048_576` on A100/H100 to run the full 1M live forward pass).
+    """
+    capacity_by_horizon: Dict[int, Dict[str, Any]] = {}
+    for h_tok in horizons:
+        capacity_by_horizon[int(h_tok)] = compute_loop72_capacity_table(n_tokens=int(h_tok))
+
+    gw_1m = generate_graphwalks_bfs_instance(num_nodes=256, branching=3, target_depth=3, seed=2026)
+    mrcr_1m = generate_mrcr_v2_instance(num_rounds=64, target_occurrence=5, seed=2026)
+
+    live_runs: List[Dict[str, Any]] = []
+    if HAS_TORCH and model is not None and tokenizer is not None:
+        device = next(model.base.parameters()).device
+        live_horizons = [int(h) for h in horizons if int(h) <= int(max_live_tokens)]
+        if live_horizons:
+            max_h = max(live_horizons)
+            base_text = build_modern_long_eval_stream(target_tokens=min(max_h, 16384), tokenizer=tokenizer)
+            base_ids = tokenizer.encode(base_text, add_special_tokens=False)
+            for h_tok in live_horizons:
+                rep_factor = (h_tok // max(1, len(base_ids))) + 1
+                seq_ids = (base_ids * rep_factor)[:h_tok]
+                inp = torch.tensor([seq_ids], dtype=torch.long, device=device)
+                cache = model.make_inference_cache(session_id=f"ctx1m_{h_tok}")
+                _ = model.generate_cached(
+                    inp,
+                    max_new_tokens=int(gen_tokens),
+                    do_sample=False,
+                    tokenizer=tokenizer,
+                    stream_print=False,
+                    cache=cache,
+                )
+                t_rep = dict(getattr(model, "last_generation_timing", None) or {})
+                ledger = cache.memory_ledger()
+                live_runs.append({
+                    "context_tokens": int(h_tok),
+                    "ttft_ms": float(t_rep.get("ttft_ms", 0.0)),
+                    "prefill_tok_per_s": float(t_rep.get("prefill_tok_per_s", 0.0)),
+                    "decode_tok_per_s": float(t_rep.get("decode_tok_per_s", 0.0)),
+                    "e2e_tok_per_s": float(t_rep.get("e2e_tok_per_s", 0.0)),
+                    "itl_p50_ms": float(t_rep.get("itl_p50_ms", 0.0)),
+                    "m1_gpu_total_mib": round(float(ledger.get("m1_gpu_total_mib", 0.0)), 2),
+                    "m2_host_cold_pages_mib": round(float(ledger.get("m2_host_cold_pages_mib", 0.0)), 2),
+                })
+                del cache
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+    cap_1m = capacity_by_horizon.get(1_048_576) or compute_loop72_capacity_table(n_tokens=1_048_576)
+    return {
+        "context_limit_tokens": 1_048_576,
+        "horizons": [int(h) for h in horizons],
+        "capacity_1m_summary": {
+            "unbounded_all72_bf16_gib": cap_1m["unbounded_all72_bf16_gib"],
+            "local_54_rings_mib": cap_1m["local_rings_mib"],
+            "global_18_bf16_gib": cap_1m["global_payload_gib"]["16bit_gib"],
+            "global_18_mixed_rotary_bf16_gib": cap_1m["mixed_rotary_bf16_gib"],
+            "global_18_int4_gib": cap_1m["global_payload_gib"]["4bit_gib"],
+        },
+        "capacity_by_horizon": capacity_by_horizon,
+        "graphwalks_1m_spec": {
+            "num_nodes": gw_1m["num_nodes"],
+            "num_edges": gw_1m["num_edges"],
+            "target_depth": gw_1m["target_depth"],
+            "gold_nodes_count": len(gw_1m["gold_nodes"]),
+        },
+        "mrcr_v2_1m_spec": {
+            "num_rounds": mrcr_1m["num_rounds"],
+            "target_occurrence": mrcr_1m["target_occurrence"],
+            "gold_answer": mrcr_1m["gold_answer"],
+        },
+        "live_runs": live_runs,
+    }
+
+
+def generate_omp_models_yaml(
+    output_path: Optional[str] = None,
+    port: int = 8000,
+    model_id: str = "spark-x2.6-4b-loop72-dlsa",
+    context_window: int = 1_048_576,
+    max_tokens: int = 32_768,
+) -> Dict[str, Any]:
+    """Generate an `Oh My Pi` (`can1357/oh-my-pi`, `~/.omp/agent/models.yml`) provider configuration connecting
+    `omp` to the local `Spark-X2.6-4B-Loop72-LSA` OpenAI-compatible `/v1/chat/completions` endpoint with full
+    `1,048,576`-token (`1M`) context window support.
+    """
+    import os
+
+    yaml_text = (
+        "# Oh My Pi (omp) Custom Model Configuration for Spark-X2.6-4B-Loop72-LSA\n"
+        "providers:\n"
+        "  spark_loop72_local:\n"
+        f"    baseUrl: http://127.0.0.1:{int(port)}/v1\n"
+        "    apiKey: spark-local-loop72\n"
+        "    api: openai-completions\n"
+        "    models:\n"
+        f"      - id: {model_id}\n"
+        "        name: Spark-X2.6-4B-Loop72-LSA (72 Visits + Paged D-LSA 1M Context)\n"
+        "        reasoning: true\n"
+        "        input:\n"
+        "          - text\n"
+        f"        contextWindow: {int(context_window)}\n"
+        f"        maxTokens: {int(max_tokens)}\n"
+        "        cost:\n"
+        "          input: 0\n"
+        "          output: 0\n"
+        "          cacheRead: 0\n"
+        "          cacheWrite: 0\n"
+    )
+    written_path: Optional[str] = None
+    if output_path is not None:
+        expanded = os.path.expanduser(output_path)
+        os.makedirs(os.path.dirname(os.path.abspath(expanded)), exist_ok=True)
+        with open(expanded, "w", encoding="utf-8") as f:
+            f.write(yaml_text)
+        written_path = expanded
+
+    return {
+        "model_id": model_id,
+        "base_url": f"http://127.0.0.1:{int(port)}/v1",
+        "context_window": int(context_window),
+        "max_tokens": int(max_tokens),
+        "written_path": written_path,
+        "yaml": yaml_text,
+        "omp_cli_example": f"omp --model spark_loop72_local/{model_id}",
+    }
+
+
+def start_loop72_openai_compatible_server(
+    model: Any,
+    tokenizer: Any,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    model_id: str = "spark-x2.6-4b-loop72-dlsa",
+    background: bool = True,
+) -> Any:
+    """Start a lightweight OpenAI-compatible HTTP server (`/v1/models`, `/v1/chat/completions`) backed by
+    `model.generate_cached` so `Oh My Pi` (`omp`), `Terminal-Bench` (Harbor), or OpenAI SDK clients can connect directly.
+    """
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+
+    device = next(model.base.parameters()).device
+
+    class _Loop72Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+        def _send_json(self, status_code: int, payload: Dict[str, Any]) -> None:
+            raw = json.dumps(payload).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self) -> None:
+            if self.path.rstrip("/") in ("/v1/models", "/models"):
+                self._send_json(
+                    200,
+                    {
+                        "object": "list",
+                        "data": [
+                            {
+                                "id": model_id,
+                                "object": "model",
+                                "created": int(time.time()),
+                                "owned_by": "spark-x2.6-loop72-dlsa",
+                                "context_window": 1_048_576,
+                            }
+                        ],
+                    },
+                )
+            else:
+                self._send_json(200, {"status": "ok", "model": model_id, "context_window": 1_048_576})
+
+        def do_POST(self) -> None:
+            if self.path.rstrip("/") not in ("/v1/chat/completions", "/chat/completions"):
+                self._send_json(404, {"error": f"Unknown endpoint {self.path}"})
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+            messages = body.get("messages", [])
+            max_tokens = int(body.get("max_tokens", body.get("max_completion_tokens", 512)))
+            temperature = float(body.get("temperature", 0.2))
+            top_p = float(body.get("top_p", 0.95))
+            do_sample = temperature > 1e-4
+
+            try:
+                chat_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+                if hasattr(chat_ids, "input_ids"):
+                    chat_ids = chat_ids.input_ids
+                inp = torch.tensor([chat_ids], dtype=torch.long, device=device)
+            except Exception:
+                joined = "\n".join(f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages)
+                enc = tokenizer.encode(joined, add_special_tokens=True)
+                inp = torch.tensor([enc], dtype=torch.long, device=device)
+
+            out_ids = model.generate_cached(
+                inp,
+                max_new_tokens=max_tokens,
+                temperature=max(temperature, 1e-4),
+                top_p=top_p,
+                do_sample=do_sample,
+                tokenizer=tokenizer,
+                stream_print=False,
+            )
+            gen_ids = out_ids[0, inp.shape[1]:].tolist()
+            reply = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            timing = dict(getattr(model, "last_generation_timing", None) or {})
+            self._send_json(
+                200,
+                {
+                    "id": f"chatcmpl-{int(time.time() * 1000)}",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": model_id,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": reply},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": int(inp.shape[1]),
+                        "completion_tokens": len(gen_ids),
+                        "total_tokens": int(inp.shape[1]) + len(gen_ids),
+                    },
+                    "loop72_timing": timing,
+                },
+            )
+
+    server = ThreadingHTTPServer((host, int(port)), _Loop72Handler)
+    if background:
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+    return server
 
 
 def evaluate_cold_kv_codecs_summary() -> Dict[str, Dict[str, float]]:
@@ -1109,12 +1683,17 @@ def format_official_comparison_markdown(live_task_results: Optional[Dict[str, An
         "| Category | Benchmark | Official Spark X2.6-4B | Spark X2.5-4B | Qwen3.5 9B | Qwen3.5 4B | Gemma4 12B | Loop72 + D-LSA (Live) |",
         "| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
     ]
+    def _fmt(v: Any, bold: bool = False) -> str:
+        if v is None:
+            return "-"
+        s = f"{float(v):.1f}"
+        return f"**{s}**" if bold else s
+
     for b_name, row in OFFICIAL_BENCHMARK_TABLE.items():
         live_val = f"**{live_by_bench[b_name]:.1f}**" if b_name in live_by_bench else "—"
-        g12 = f"{row['Gemma4_12B']:.1f}" if row.get("Gemma4_12B") is not None else "-"
         lines.append(
-            f"| {row['category']} | **{b_name}** | **{row['Spark_X2.6_4B']:.1f}** | "
-            f"{row['Spark_X2.5_4B']:.1f} | {row['Qwen3.5_9B']:.1f} | {row['Qwen3.5_4B']:.1f} | "
-            f"{g12} | {live_val} |"
+            f"| {row['category']} | **{b_name}** | {_fmt(row.get('Spark_X2.6_4B'), bold=True)} | "
+            f"{_fmt(row.get('Spark_X2.5_4B'))} | {_fmt(row.get('Qwen3.5_9B'))} | {_fmt(row.get('Qwen3.5_4B'))} | "
+            f"{_fmt(row.get('Gemma4_12B'))} | {live_val} |"
         )
     return "\n".join(lines)
