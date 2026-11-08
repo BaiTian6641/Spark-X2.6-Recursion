@@ -306,5 +306,94 @@ class TestLoop72TorchComponents(unittest.TestCase):
         self.assertLess(max_prefix_diff, 1e-6)
 
 
+class TestLoop72BenchmarkSuiteAndNotebook(unittest.TestCase):
+
+    def test_official_benchmark_table_and_modern_stream(self):
+        from sparkx_loop72_dlsa_benchmarks import (
+            OFFICIAL_BENCHMARK_TABLE,
+            OFFICIAL_SPARK_X26_SAMPLING,
+            SIGNIFICANT_BENCHMARK_SUITE,
+            build_modern_long_eval_stream,
+            evaluate_cold_kv_codecs_summary,
+            format_official_comparison_markdown,
+            generate_graphwalks_bfs_instance,
+            generate_mrcr_v2_instance,
+            score_graphwalks_bfs_f1,
+            score_mrcr_v2_response,
+            verify_code_stdio,
+            verify_json_schema,
+            verify_math_answer,
+        )
+
+        self.assertTrue(OFFICIAL_SPARK_X26_SAMPLING["thinking_mode"])
+        self.assertEqual(OFFICIAL_SPARK_X26_SAMPLING["thinking_level"], "high")
+        self.assertEqual(OFFICIAL_BENCHMARK_TABLE["Average"]["Spark_X2.6_4B"], 63.3)
+        self.assertEqual(OFFICIAL_BENCHMARK_TABLE["Gaokao 2026"]["Spark_X2.6_4B"], 134.9)
+        self.assertEqual(OFFICIAL_BENCHMARK_TABLE["AIME 2026"]["Spark_X2.6_4B"], 91.2)
+        self.assertEqual(OFFICIAL_BENCHMARK_TABLE["HMMT Feb 26"]["Spark_X2.6_4B"], 81.3)
+        self.assertEqual(OFFICIAL_BENCHMARK_TABLE["Graphwalks bfs 256k f1"]["Spark_X2.6_4B"], 92.2)
+        self.assertEqual(OFFICIAL_BENCHMARK_TABLE["Openai_MRCR v2 256k-512k"]["Spark_X2.6_4B"], 65.6)
+        self.assertEqual(OFFICIAL_BENCHMARK_TABLE["AA-LCRv1.1"]["Spark_X2.6_4B"], 67.3)
+        self.assertEqual(OFFICIAL_BENCHMARK_TABLE["LongBench v2"]["Spark_X2.6_4B"], 53.3)
+        self.assertEqual(OFFICIAL_BENCHMARK_TABLE["IFEval"]["Spark_X2.6_4B"], 93.6)
+        self.assertEqual(OFFICIAL_BENCHMARK_TABLE["IFBench"]["Spark_X2.6_4B"], 75.8)
+        self.assertEqual(OFFICIAL_BENCHMARK_TABLE["GPQA Diamond"]["Spark_X2.6_4B"], 77.1)
+        self.assertEqual(OFFICIAL_BENCHMARK_TABLE["BFCL-V4"]["Spark_X2.6_4B"], 71.8)
+        self.assertEqual(OFFICIAL_BENCHMARK_TABLE["SciCode"]["Spark_X2.6_4B"], 36.8)
+
+        stream = build_modern_long_eval_stream(target_tokens=1024)
+        self.assertGreater(len(stream.split()), 700)
+
+        gw = generate_graphwalks_bfs_instance(num_nodes=48, branching=2, target_depth=2, seed=42)
+        self.assertEqual(len(gw["gold_nodes"]), 4)
+        gw_perfect = score_graphwalks_bfs_f1("\\boxed{" + ", ".join(gw["gold_nodes"]) + "}", gw["gold_nodes"])
+        self.assertEqual(gw_perfect["f1"], 1.0)
+
+        mrcr = generate_mrcr_v2_instance(num_rounds=16, target_occurrence=3, seed=101)
+        mrcr_ok = score_mrcr_v2_response(f"Answer: \\boxed{{{mrcr['gold_answer']}}}", mrcr["gold_answer"])
+        self.assertTrue(mrcr_ok["exact_match"])
+
+        for item in SIGNIFICANT_BENCHMARK_SUITE:
+            if item["verifier"] == "math":
+                res = verify_math_answer(f"\\boxed{{{item['gold']}}}", item["gold"])
+                self.assertTrue(res.ok, f"Failed gold verification for {item['id']}")
+
+        json_ok = verify_json_schema(
+            '```json\n{"model": "Spark", "total_visits": 72, "thinking_mode": true}\n```',
+            {"required_keys": ["model", "total_visits", "thinking_mode"], "key_types": {"model": "str", "total_visits": "int", "thinking_mode": "bool"}},
+        )
+        self.assertTrue(json_ok.ok)
+
+        code_ok = verify_code_stdio(
+            "```python\nimport sys\nsa, sb = map(int, sys.stdin.readline().split())\nx1, x2, y1, y2 = map(float, sys.stdin.readline().split())\nprint(f'{(sa*sb)/(sa+sb)*((x1-y1)**2+(x2-y2)**2):.4f}')\n```",
+            [{"stdin": "4 4\n1.0 0.0 0.0 1.0\n", "expected_stdout": "4.0000"}],
+        )
+        self.assertTrue(code_ok.ok)
+
+        codecs = evaluate_cold_kv_codecs_summary()
+        self.assertEqual(codecs["mixed_rotary_bf16"]["key_rotary_rel_err"], 0.0)
+        md = format_official_comparison_markdown()
+        self.assertIn("Graphwalks bfs 256k f1", md)
+        self.assertIn("Gaokao 2026", md)
+
+    def test_colab_benchmark_notebook_valid_json_and_syntax(self):
+        import ast
+        import json
+
+        nb_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "SparkX_Loop72_DLSA_Benchmark_Colab.ipynb",
+        )
+        self.assertTrue(os.path.exists(nb_path))
+        with open(nb_path, "r", encoding="utf-8") as f:
+            nb = json.load(f)
+        self.assertEqual(nb.get("nbformat"), 4)
+        code_cells = [c for c in nb.get("cells", []) if c.get("cell_type") == "code"]
+        self.assertGreaterEqual(len(code_cells), 5)
+        for idx, cell in enumerate(code_cells):
+            src = "".join(cell.get("source", []))
+            ast.parse(src, filename=f"SparkX_Loop72_DLSA_Benchmark_Colab.ipynb#cell_{idx}")
+
+
 if __name__ == "__main__":
     unittest.main()
