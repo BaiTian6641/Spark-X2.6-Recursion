@@ -221,14 +221,24 @@ def apply_hardware_profile_to_config(cfg: MHCTrainingConfig, vram_gb: Optional[f
         "l4_24gb": 24.0,
         "cpu_test": 0.0,
     }
-    target_vram = vram_gb if vram_gb is not None else prof_map.get(str(cfg.hardware_profile).lower())
+    prof_key = str(cfg.hardware_profile).lower()
+    target_vram = vram_gb if vram_gb is not None else prof_map.get(prof_key)
     info = detect_gpu_training_profile(target_vram)
-    if str(cfg.hardware_profile).lower() in prof_map:
+    if prof_key in prof_map and prof_key != "cpu_test":
         cfg.seq_len = int(info["seq_len"])
         cfg.micro_batch_size = int(info["micro_batch_size"])
         cfg.grad_accum_steps = int(info["grad_accum_steps"])
         cfg.sampled_kl_positions = int(info["sampled_kl_positions"])
         cfg.ce_chunk_tokens = int(info["ce_chunk_tokens"])
+    elif prof_key == "cpu_test":
+        if cfg.seq_len == 4096:
+            cfg.seq_len = int(info["seq_len"])
+        if cfg.grad_accum_steps == 8:
+            cfg.grad_accum_steps = int(info["grad_accum_steps"])
+        if cfg.sampled_kl_positions == 64:
+            cfg.sampled_kl_positions = int(info["sampled_kl_positions"])
+        if cfg.ce_chunk_tokens == 1024:
+            cfg.ce_chunk_tokens = int(info["ce_chunk_tokens"])
     return info
 
 
@@ -755,7 +765,7 @@ def run_stage_a_verification(
         "expected_full_model_controller_parameters": EXPECTED_DEFAULT_CONTROLLER_PARAMS,
         "loss_metrics": metrics_ckpt,
         "p2_gain_grad_l1": round(p2_grad_norm, 8),
-        "p3_gain_grad_l1": round(p3_gain_norm, 8),
+        "p3_gain_grad_l1": round(p3_grad_norm, 8),
         "adapter_up_grad_norm": round(adapter_up_grad_norm, 8),
         "max_checkpoint_replay_grad_diff": float(max_ckpt_grad_diff),
         "max_checkpoint_replay_rel_grad_diff": round(float(max_ckpt_rel_grad_diff), 8),
