@@ -1,0 +1,310 @@
+import os
+import unittest
+
+from sparkx_kv_codec import (
+    KVCodecConfig,
+    compute_loop72_capacity_table,
+    decode_kv_page,
+    encode_kv_page,
+    measure_codec_error,
+)
+from sparkx_memory_utils import EpisodicSideMemory
+
+try:
+    import torch
+    import torch.nn.functional as F
+    from sparkx_dlsa import (
+        DLSAIndexConfig,
+        LOOP72_GLOBAL_VISIT_SCHEDULE,
+        LOOP72_VISIT_SCHEDULE,
+        PagedLatentIndex,
+        VisitAwareDLSAIndexBank,
+        VisitStateKey,
+    )
+    from sparkx_paged_cache import Loop72HybridPagedCache, PagedCacheConfig
+    from sparkx_sparse_attention import (
+        SparseAttentionConfig,
+        compute_yarn_partial_rope_cos_sin,
+        local_sliding_attention_forward,
+        paged_dlsa_global_attention_forward,
+    )
+    from train_spark_dlsa import VisitDistillConfig, distill_single_visit_indexer
+    HAVE_TORCH = True
+except Exception:  # pragma: no cover
+    HAVE_TORCH = False
+
+
+class TestLoop72CapacityAndCodecs(unittest.TestCase):
+
+    def test_loop72_capacity_arithmetic_matches_plan_appendix(self):
+        cap_5m = compute_loop72_capacity_table(n_tokens=5_000_000)
+        self.assertEqual(cap_5m["total_visits"], 72)
+        self.assertEqual(cap_5m["global_visits"], 18)
+        self.assertEqual(cap_5m["local_visits"], 54)
+        self.assertEqual(cap_5m["selector_map_parameters"], 1_769_472)
+        self.assertEqual(cap_5m["global_visit_counts_by_layer"], {3: 1, 7: 2, 11: 2, 15: 3, 19: 3, 23: 3, 27: 2, 31: 1, 35: 1})
+        self.assertAlmostEqual(cap_5m["local_rings_mib"], 108.0, places=2)
+        self.assertAlmostEqual(cap_5m["unbounded_all72_bf16_gib"], 1373.29, places=1)
+        self.assertAlmostEqual(cap_5m["global_payload_gib"]["16bit_gib"], 343.32, places=1)
+        self.assertAlmostEqual(cap_5m["global_payload_gib"]["8bit_gib"], 171.66, places=1)
+        self.assertAlmostEqual(cap_5m["global_payload_gib"]["4bit_gib"], 85.83, places=1)
+        self.assertAlmostEqual(cap_5m["mixed_rotary_bf16_gib"], 118.02, places=1)
+
+        cap_32k = compute_loop72_capacity_table(n_tokens=32768)
+        self.assertAlmostEqual(cap_32k["unbounded_all72_bf16_gib"], 9.0, places=2)
+        self.assertAlmostEqual(cap_32k["global_payload_gib"]["16bit_gib"], 2.25, places=2)
+
+        cap_128k = compute_loop72_capacity_table(n_tokens=131072)
+        self.assertAlmostEqual(cap_128k["unbounded_all72_bf16_gib"], 36.0, places=2)
+        self.assertAlmostEqual(cap_128k["global_payload_gib"]["16bit_gib"], 9.0, places=2)
+        self.assertAlmostEqual(cap_128k["global_payload_gib"]["8bit_gib"], 4.5, places=2)
+        self.assertAlmostEqual(cap_128k["global_payload_gib"]["4bit_gib"], 2.25, places=2)
+
+    def test_kv_page_codecs_roundtrip_and_byte_accounting(self):
+        # 2 KV heads, 8 tokens, 16 head_dim (4 rotated + 12 free)
+        k_page = [
+            [
+                [(h + 1) * 0.1 + t * 0.03 + ((d % 5) - 2) * 0.25 for d in range(16)]
+                for t in range(8)
+            ]
+            for h in range(2)
+        ]
+        v_page = [
+            [
+                [(h + 1) * -0.08 + t * 0.02 + ((d % 7) - 3) * 0.15 for d in range(16)]
+                for t in range(8)
+            ]
+            for h in range(2)
+        ]
+
+        bf16_cfg = KVCodecConfig(codec="bf16", group_size=8, rope_dim=4, rope_first=True)
+        int8_cfg = KVCodecConfig(codec="int8", group_size=8, rope_dim=4, rope_first=True)
+        int4_cfg = KVCodecConfig(codec="int4", group_size=8, rope_dim=4, rope_first=True)
+        mixed_cfg = KVCodecConfig(codec="mixed_rotary_bf16", group_size=8, rope_dim=4, rope_first=True)
+
+        p_bf16 = encode_kv_page(k_page, v_page, cfg=bf16_cfg, positions=range(8))
+        p_int8 = encode_kv_page(k_page, v_page, cfg=int8_cfg, positions=range(8))
+        p_int4 = encode_kv_page(k_page, v_page, cfg=int4_cfg, positions=range(8))
+        p_mix = encode_kv_page(k_page, v_page, cfg=mixed_cfg, positions=range(8))
+
+        self.assertLess(p_int8.storage_bytes(), p_bf16.storage_bytes())
+        self.assertLess(p_int4.storage_bytes(), p_int8.storage_bytes())
+        self.assertLess(p_mix.storage_bytes(), p_int8.storage_bytes())
+        self.assertGreater(p_mix.storage_bytes(), p_int4.storage_bytes())
+
+        err_int8 = measure_codec_error(k_page, v_page, int8_cfg)
+        err_mix = measure_codec_error(k_page, v_page, mixed_cfg)
+        self.assertLess(err_int8["key_rel_err"], 0.03)
+        self.assertLess(err_mix["key_rel_err"], 0.15)
+        self.assertEqual(err_mix["key_rotary_rel_err"], 0.0)
+
+        # In mixed_rotary_bf16, the first 4 rotated dims of K must be exact
+        k_dec_mix, _ = decode_kv_page(p_mix)
+        if HAVE_TORCH and isinstance(k_dec_mix, torch.Tensor):
+            k_dec_mix = k_dec_mix.tolist()
+        for h in range(2):
+            for t in range(8):
+                for d in range(4):
+                    self.assertAlmostEqual(k_dec_mix[h][t][d], k_page[h][t][d], places=5)
+
+    def test_yaml_config_schema(self):
+        cfg_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "configs",
+            "spark4b_loop72_lsa.yaml",
+        )
+        self.assertTrue(os.path.exists(cfg_path))
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+        self.assertIn("preserve_native_activation: true", raw)
+        self.assertIn("enable_p3: true", raw)
+        self.assertIn("expected_visits: 72", raw)
+        self.assertIn("global_visits: 18", raw)
+        self.assertIn("local_visits: 54", raw)
+        self.assertIn("maps_per_global_visit: true", raw)
+        self.assertIn("construct: false", raw)
+        self.assertIn("generation_logits: last_position", raw)
+
+    def test_esm_serialization_and_checksum_verification(self):
+        esm1 = EpisodicSideMemory(width=16, r=12, route_dim=8, use_torch=False)
+        a_in = [[0.2 * ((i + j) % 5 - 2) for j in range(12)] for i in range(2)]
+        delta_in = [[0.1 * ((i + 2 * j) % 7 - 3) for j in range(16)] for i in range(2)]
+        h_query = [[0.15 * ((j % 5) - 2) for j in range(16)]]
+        c_in = esm1.route_embed(h_query)
+        rep = esm1.write(shard=0, A=a_in, Delta=delta_in, centroids=c_in)
+        self.assertEqual(esm1.memory_epoch, 1)
+        self.assertGreater(esm1.shard_storage_bytes(), 0)
+        out_before = esm1.forward(h_query, use_gate=True)
+
+        saved = esm1.esm_state_dict()
+        esm2 = EpisodicSideMemory(width=16, r=12, route_dim=8, use_torch=False)
+        load_info = esm2.load_esm_state_dict(saved, verify_checksum=True)
+        self.assertEqual(load_info["shards_restored"], 1)
+        self.assertEqual(esm2.memory_epoch, 1)
+        out_after = esm2.forward(h_query, use_gate=True)
+        for j in range(16):
+            self.assertAlmostEqual(out_before[0][j], out_after[0][j], places=6)
+
+        # Corrupting the checksum must raise ValueError when verify_checksum=True
+        corrupted = dict(saved)
+        corrupted["shards"] = {0: dict(saved["shards"][0], sha256="0" * 64)}
+        with self.assertRaises(ValueError):
+            esm2.load_esm_state_dict(corrupted, verify_checksum=True)
+
+
+@unittest.skipUnless(HAVE_TORCH, "torch not installed")
+class TestLoop72TorchComponents(unittest.TestCase):
+
+    def test_visit_schedule_and_visit_aware_dlsa_bank(self):
+        self.assertEqual(len(LOOP72_VISIT_SCHEDULE), 72)
+        self.assertEqual(len(LOOP72_GLOBAL_VISIT_SCHEDULE), 18)
+        counts = {}
+        for v in LOOP72_GLOBAL_VISIT_SCHEDULE:
+            counts[v.physical_layer] = counts.get(v.physical_layer, 0) + 1
+        self.assertEqual(counts, {3: 1, 7: 2, 11: 2, 15: 3, 19: 3, 23: 3, 27: 2, 31: 1, 35: 1})
+
+        bank = VisitAwareDLSAIndexBank(
+            base_cfg=DLSAIndexConfig(d_idx=64),
+            maps_per_global_visit=True,
+            per_visit_max_selected_keys={3: 3072, 31: 1536, 35: 1536},
+        )
+        self.assertEqual(bank.total_map_parameters(), 1_769_472)
+        self.assertEqual(bank.get_visit_indexer(0).cfg.max_selected_keys, 3072)   # L3
+        self.assertEqual(bank.get_visit_indexer(16).cfg.max_selected_keys, 1536)  # L31
+        self.assertEqual(bank.get_visit_indexer(17).cfg.max_selected_keys, 1536)  # L35
+
+    def test_paged_latent_index_append_and_tree_search(self):
+        g = torch.Generator().manual_seed(7)
+        k1 = F.normalize(torch.randn(180, 32, generator=g), dim=-1)
+        k2 = F.normalize(torch.randn(140, 32, generator=g), dim=-1)
+        idx = PagedLatentIndex(
+            k1,
+            n_sink=4,
+            n_pool=4,
+            n_cluster=64,
+            avg_bucket_size=16,
+            max_bucket_size=16,
+            window=32,
+            persistent_token_latents=False,
+            search_mode="tree",
+            branching_factor=4,
+            beam_width=8,
+        )
+        self.assertIsNone(idx.k_idx_n)
+        b1 = idx.n_blocks
+        idx.append_new_keys(k2)
+        self.assertGreater(idx.n_blocks, b1)
+        q = F.normalize(torch.randn(32, generator=g), dim=-1)
+        sel_tree, _ = idx.select_with_buckets(q, budget=32, search_mode="tree")
+        sel_flat, _ = idx.select_with_buckets(q, budget=32, search_mode="flat")
+        self.assertGreater(sel_tree.numel(), 0)
+        self.assertEqual(sel_tree.numel(), sel_flat.numel())
+
+    def test_loop72_hybrid_paged_cache_local_ring_and_global_gather(self):
+        cfg = PagedCacheConfig(
+            local_window=16,
+            sinks=4,
+            recent_tokens=16,
+            global_hot_tokens_per_visit=32,
+            kv_page_tokens=8,
+            cold_codec="bf16",
+        )
+        cache = Loop72HybridPagedCache(config=cfg)
+        self.assertEqual(len(cache.slots), 72)
+
+        # Visit 0 is local (layer 0): feed 40 tokens in two chunks; resident ring must stay capped at 16
+        k_loc1 = torch.randn(1, 4, 24, 16)
+        v_loc1 = torch.randn(1, 4, 24, 16)
+        k_out1, _, pos1 = cache.update_local_visit(0, k_loc1, v_loc1)
+        self.assertEqual(k_out1.shape[2], 16)
+        self.assertEqual(pos1.tolist(), list(range(8, 24)))
+        k_loc2 = torch.randn(1, 4, 16, 16)
+        v_loc2 = torch.randn(1, 4, 16, 16)
+        k_out2, _, pos2 = cache.update_local_visit(0, k_loc2, v_loc2)
+        self.assertEqual(k_out2.shape[2], 16)
+        self.assertEqual(cache.get_logical_seq_length(0), 40)
+        self.assertEqual(pos2.tolist(), list(range(24, 40)))
+
+        # Visit 3 is global (layer 3): feed 48 tokens, verify gather_selected matches exact tokens
+        k_glob = torch.randn(1, 4, 48, 16)
+        v_glob = torch.randn(1, 4, 48, 16)
+        slot_g = cache.append_global_visit(3, k_glob[:, :, :24], v_glob[:, :, :24])
+        cache.append_global_visit(3, k_glob[:, :, 24:], v_glob[:, :, 24:])
+        self.assertEqual(slot_g.logical_seq_length, 48)
+        self.assertGreaterEqual(len(slot_g.cold_pages), 3)
+
+        sel_pos = torch.tensor([0, 1, 10, 11, 25, 47], dtype=torch.long)
+        k_sel, v_sel, g_pos = slot_g.gather_selected(sel_pos)
+        self.assertEqual(g_pos.tolist(), sel_pos.tolist())
+        self.assertTrue(torch.allclose(k_sel[0], k_glob[0, :, sel_pos, :], atol=1e-5))
+        self.assertTrue(torch.allclose(v_sel[0], v_glob[0, :, sel_pos, :], atol=1e-5))
+
+    def test_paged_dlsa_global_attention_strict_causality(self):
+        g = torch.Generator().manual_seed(99)
+        h_q, h_kv, t, d = 8, 2, 96, 32
+        q_a = torch.randn(1, h_q, t, d, generator=g)
+        k_a = torch.randn(1, h_kv, t, d, generator=g)
+        v_a = torch.randn(1, h_kv, t, d, generator=g)
+
+        # Mutate tokens >= 64 and verify prefix [0..64) outputs are 100% unchanged under paged sparse prefill
+        q_b = q_a.clone()
+        k_b = k_a.clone()
+        v_b = v_a.clone()
+        q_b[:, :, 64:, :] = torch.randn(1, h_q, t - 64, d, generator=g) * 5.0
+        k_b[:, :, 64:, :] = torch.randn(1, h_kv, t - 64, d, generator=g) * 5.0
+        v_b[:, :, 64:, :] = torch.randn(1, h_kv, t - 64, d, generator=g) * 5.0
+
+        idx_cfg = DLSAIndexConfig(
+            d_idx=16,
+            n_kv_heads=h_kv,
+            n_q_heads=h_q,
+            head_dim=d,
+            rope_dim=8,
+            n_pool=4,
+            n_cluster=16,
+            k_clusters=4,
+            sinks=4,
+            recent_tokens=16,
+            max_selected_keys=24,
+            exact_threshold=32,
+        )
+        from sparkx_dlsa import FaithfulDLSAIndexer
+        indexer = FaithfulDLSAIndexer(idx_cfg)
+        p_cfg = PagedCacheConfig(
+            local_window=16,
+            sinks=4,
+            recent_tokens=16,
+            global_hot_tokens_per_visit=32,
+            kv_page_tokens=8,
+        )
+        s_cfg = SparseAttentionConfig(exact_threshold=32, sparse_query_tile_tokens=8)
+
+        cache_a = Loop72HybridPagedCache(config=p_cfg)
+        slot_a = cache_a.append_global_visit(3, k_a, v_a)
+        out_a = paged_dlsa_global_attention_forward(
+            module=torch.nn.Module(),
+            query=q_a,
+            slot=slot_a,
+            indexer=indexer,
+            q_positions=torch.arange(t),
+            scaling=1.0 / (d ** 0.5),
+            sparse_cfg=s_cfg,
+        )
+
+        cache_b = Loop72HybridPagedCache(config=p_cfg)
+        slot_b = cache_b.append_global_visit(3, k_b, v_b)
+        out_b = paged_dlsa_global_attention_forward(
+            module=torch.nn.Module(),
+            query=q_b,
+            slot=slot_b,
+            indexer=indexer,
+            q_positions=torch.arange(t),
+            scaling=1.0 / (d ** 0.5),
+            sparse_cfg=s_cfg,
+        )
+        max_prefix_diff = float((out_a[:, :, :64, :] - out_b[:, :, :64, :]).abs().max().item())
+        self.assertLess(max_prefix_diff, 1e-6)
+
+
+if __name__ == "__main__":
+    unittest.main()

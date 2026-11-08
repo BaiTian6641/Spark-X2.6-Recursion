@@ -253,6 +253,11 @@ class LoopV03Settings:
     offload_checkpoint_to_cpu: bool = False
     use_mhc: bool = True
     use_engram: bool = True
+    construct_engram: bool = True
+    preserve_native_activation: bool = False
+    runtime_identity: str = 'legacy_silu_v03'
+    prefill_chunk_tokens: int = 2048
+    use_paged_hybrid_cache: bool = False
     dynamic_mhc: bool = True
     sublayer_mhc: bool = True
     pass_adapter_rank: int = 16
@@ -260,6 +265,28 @@ class LoopV03Settings:
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
+
+    @classmethod
+    def for_loop72_lsa(cls, **overrides) -> 'LoopV03Settings':
+        """Return canonical Loop72-LSA settings (72 executed visits = 18 global + 54 local, native GELU, 0 Engram allocation)."""
+        defaults = dict(
+            start=4,
+            end=28,
+            passes=2,
+            p3_start=12,
+            p3_end=24,
+            enable_p3=True,
+            use_mhc=True,
+            use_engram=False,
+            construct_engram=False,
+            preserve_native_activation=True,
+            runtime_identity='native_gelu_loop72',
+            prefill_chunk_tokens=2048,
+            use_paged_hybrid_cache=True,
+            ce_chunk_tokens=2048,
+        )
+        defaults.update(overrides)
+        return cls(**defaults)
 
 
 class _CacheLayersView:
@@ -322,15 +349,21 @@ class _VisitCache:
         return getattr(self.cache, name)
 
 
-def patch_spark_for_unsloth_triton(base_model: nn.Module) -> dict[str, bool]:
-    """Patch Spark2_5 backbone with Triton Fused SwiGLU, Triton/Liger RMSNorm, and BF16 RoPE
-    for 16K-context full-parameter finetuning and high-throughput decoding.
+def patch_spark_for_unsloth_triton(
+    base_model: nn.Module,
+    preserve_native_activation: bool = False,
+) -> dict[str, bool]:
+    """Patch Spark2_5 backbone with Triton/Liger RMSNorm, BF16 RoPE, and optional Triton Fused SwiGLU.
+
+    When `preserve_native_activation=True` (Loop72-LSA default), the native Spark2_5MLP `GELU` gated activation
+    (`down_proj(act_fn(gate_proj(x)) * up_proj(x))`) is strictly preserved (and restored if previously patched).
     """
     status = {
         'triton_available': HAS_TRITON,
         'liger_rmsnorm': HAS_LIGER_RMSNORM,
         'cut_cross_entropy': HAS_CCE,
         'patched_mlp_swiglu': False,
+        'preserve_native_activation': bool(preserve_native_activation),
         'patched_bf16_rope': False,
     }
     if not hasattr(base_model, 'model') or not hasattr(base_model.model, 'layers'):
@@ -339,14 +372,22 @@ def patch_spark_for_unsloth_triton(base_model: nn.Module) -> dict[str, bool]:
     if not layers:
         return status
 
-    # 1. Patch Spark2_5MLP with Fused Triton SwiGLU (cuts 16K MLP intermediate VRAM by 50%)
+    # 1. Spark2_5MLP activation handling: preserve native GELU or opt-in Triton SwiGLU
     mlp_cls = type(layers[0].mlp)
-    if not getattr(mlp_cls, '_sparkx_triton_swiglu_patched', False):
-        def _triton_mlp_forward(self, x: torch.Tensor) -> torch.Tensor:
-            return self.down_proj(triton_swiglu(self.gate_proj(x), self.up_proj(x)))
-        mlp_cls.forward = _triton_mlp_forward
-        mlp_cls._sparkx_triton_swiglu_patched = True
-    status['patched_mlp_swiglu'] = True
+    if not hasattr(mlp_cls, '_sparkx_orig_mlp_forward'):
+        mlp_cls._sparkx_orig_mlp_forward = mlp_cls.forward
+    if preserve_native_activation:
+        if getattr(mlp_cls, '_sparkx_triton_swiglu_patched', False):
+            mlp_cls.forward = mlp_cls._sparkx_orig_mlp_forward
+            mlp_cls._sparkx_triton_swiglu_patched = False
+        status['patched_mlp_swiglu'] = False
+    else:
+        if not getattr(mlp_cls, '_sparkx_triton_swiglu_patched', False):
+            def _triton_mlp_forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.down_proj(triton_swiglu(self.gate_proj(x), self.up_proj(x)))
+            mlp_cls.forward = _triton_mlp_forward
+            mlp_cls._sparkx_triton_swiglu_patched = True
+        status['patched_mlp_swiglu'] = True
 
     # 1b. Patch Spark2_5RMSNorm with Fused Triton/Liger RMSNorm (replaces 5 ops x 144 calls/tok with 1 fused kernel)
     if hasattr(layers[0], 'input_layernorm'):
@@ -545,14 +586,17 @@ def _dispatch_spark_sdpa(
     )
 
 
-def patch_spark_attention_for_long_context(base_model: nn.Module) -> int:
+def patch_spark_attention_for_long_context(
+    base_model: nn.Module,
+    preserve_native_activation: bool = False,
+) -> int:
     """Replace Spark2_5Attention's O(T^2) eager_attention_forward with fused BF16 PyTorch SDPA / GQA."""
     if not hasattr(base_model, 'model') or not hasattr(base_model.model, 'layers'):
         return 0
     layers = base_model.model.layers
     if not layers or not hasattr(layers[0], 'self_attn'):
         return 0
-    patch_spark_for_unsloth_triton(base_model)
+    patch_spark_for_unsloth_triton(base_model, preserve_native_activation=preserve_native_activation)
     default_sw = int(getattr(getattr(base_model, 'config', None), 'sliding_window', 512) or 512)
     for lyr in layers:
         is_sl = (
@@ -2717,7 +2761,10 @@ class SparkXLoopV03(nn.Module):
         self.base = base_model
         self.settings = settings or LoopV03Settings()
         if patch_sdpa:
-            patch_spark_attention_for_long_context(self.base)
+            patch_spark_attention_for_long_context(
+                self.base,
+                preserve_native_activation=bool(getattr(self.settings, 'preserve_native_activation', False)),
+            )
         self.n_layers = len(self.base.model.layers)
         if strict and self.n_layers != 36:
             raise ValueError(f'Expected 36 Spark layers, got {self.n_layers}')
@@ -2732,7 +2779,8 @@ class SparkXLoopV03(nn.Module):
         self.p3_end = self.settings.p3_end
         self.enable_p3 = self.settings.enable_p3
         self.mhc_enabled = self.settings.use_mhc
-        self.engram_enabled = self.settings.use_engram
+        self.construct_engram = bool(getattr(self.settings, 'construct_engram', True))
+        self.engram_enabled = bool(self.settings.use_engram and self.construct_engram)
         self.enable_checkpoint = self.settings.checkpoint_layers
         self.offload_checkpoint_to_cpu = self.settings.offload_checkpoint_to_cpu
 
@@ -2750,36 +2798,41 @@ class SparkXLoopV03(nn.Module):
         })
 
         # 8 Macro-Block Anchors: Layer 3 (Prelude) + Layers 7, 11, 15, 19, 23, 27 (Recurrent Core) + Layer 31 (Coda)
+        # In the Loop72-LSA variant (`construct_engram=False`), Engram allocation is genuinely zero (0 parameters).
         param_dtype = self.base.model.embedding.weight.dtype
         if param_dtype not in (torch.bfloat16, torch.float16):
             param_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
 
-        def _make_engram():
-            return ZipfianTieredMoEEngram(
-                hot_buckets=self.settings.eng_hot_buckets,
-                cold_buckets=self.settings.eng_cold_buckets,
-                eng_dim=self.settings.eng_dim,
-                width=width,
-                shared_rank=self.settings.eng_shared_rank,
-                num_experts=self.settings.eng_experts,
-                initial_active_experts=self.settings.eng_initial_active_experts,
-                top_k=self.settings.eng_top_k,
-                initial_top_k=self.settings.eng_initial_top_k,
-                expert_rank=self.settings.eng_expert_rank,
-                route_dim=self.settings.eng_route_dim,
-                max_passes=self.settings.max_passes,
-                offload_tier1b_cpu=self.settings.eng_offload_tier1b_cpu,
-                param_dtype=param_dtype,
-            )
+        if self.construct_engram:
+            def _make_engram():
+                return ZipfianTieredMoEEngram(
+                    hot_buckets=self.settings.eng_hot_buckets,
+                    cold_buckets=self.settings.eng_cold_buckets,
+                    eng_dim=self.settings.eng_dim,
+                    width=width,
+                    shared_rank=self.settings.eng_shared_rank,
+                    num_experts=self.settings.eng_experts,
+                    initial_active_experts=self.settings.eng_initial_active_experts,
+                    top_k=self.settings.eng_top_k,
+                    initial_top_k=self.settings.eng_initial_top_k,
+                    expert_rank=self.settings.eng_expert_rank,
+                    route_dim=self.settings.eng_route_dim,
+                    max_passes=self.settings.max_passes,
+                    offload_tier1b_cpu=self.settings.eng_offload_tier1b_cpu,
+                    param_dtype=param_dtype,
+                )
 
-        self.engram = _make_engram()  # Anchor 0: Layer 3 (end of Prelude [0..4))
-        stride = max(1, int(self.settings.backbone_engram_stride))
-        anchor_indices = [
-            idx for idx in range(self.loop_start + stride - 1, min(self.n_layers - 4, 32), stride)
-        ]
-        self.backbone_engrams = nn.ModuleDict({
-            str(idx): _make_engram() for idx in anchor_indices
-        })
+            self.engram = _make_engram()  # Anchor 0: Layer 3 (end of Prelude [0..4))
+            stride = max(1, int(self.settings.backbone_engram_stride))
+            anchor_indices = [
+                idx for idx in range(self.loop_start + stride - 1, min(self.n_layers - 4, 32), stride)
+            ]
+            self.backbone_engrams = nn.ModuleDict({
+                str(idx): _make_engram() for idx in anchor_indices
+            })
+        else:
+            self.engram = None
+            self.backbone_engrams = nn.ModuleDict()
 
         # Phase 3: Dedicated Episodic Side Memory (ESM) at the 9 global layers (`{3, 7, 11, 15, 19, 23, 27, 31, 35}`)
         self.esm_layers = [idx for idx in (3, 7, 11, 15, 19, 23, 27, 31, 35) if idx < self.n_layers]
@@ -2792,10 +2845,57 @@ class SparkXLoopV03(nn.Module):
         self.share_global_kv_across_passes = False
 
     def all_engram_modules(self) -> list[ZipfianTieredMoEEngram]:
+        if self.engram is None:
+            return [mod for mod in self.backbone_engrams.values()]
         return [self.engram] + [mod for mod in self.backbone_engrams.values()]
 
     def iter_engram_anchors(self) -> list[tuple[int, ZipfianTieredMoEEngram]]:
+        if self.engram is None:
+            return [(int(k), mod) for k, mod in self.backbone_engrams.items()]
         return [(3, self.engram)] + [(int(k), mod) for k, mod in self.backbone_engrams.items()]
+
+    def visit_schedule_summary(self) -> dict[str, Any]:
+        """Return executed visit counts and global/local breakdown for the active loop configuration."""
+        plan = self.execution_plan
+        global_set = set(self.esm_layers)
+        per_layer_visits: dict[int, int] = {}
+        global_visits_by_layer: dict[int, int] = {}
+        global_visits = 0
+        local_visits = 0
+        for idx in plan:
+            per_layer_visits[idx] = per_layer_visits.get(idx, 0) + 1
+            if idx in global_set:
+                global_visits += 1
+                global_visits_by_layer[idx] = global_visits_by_layer.get(idx, 0) + 1
+            else:
+                local_visits += 1
+        return {
+            'total_visits': len(plan),
+            'global_visits': global_visits,
+            'local_visits': local_visits,
+            'enable_p3': bool(self.enable_p3),
+            'loop_passes': int(self.loop_passes),
+            'global_visits_by_layer': global_visits_by_layer,
+            'per_layer_visits': per_layer_visits,
+        }
+
+    def execution_manifest(self) -> dict[str, Any]:
+        """Return runtime identity, visit topology, activation mode, and memory tier manifest."""
+        sched = self.visit_schedule_summary()
+        mlp_cls = type(self.base.model.layers[0].mlp) if hasattr(self.base, 'model') and self.base.model.layers else None
+        swiglu_patched = bool(getattr(mlp_cls, '_sparkx_triton_swiglu_patched', False)) if mlp_cls is not None else False
+        dlsa_bank = getattr(self, 'dlsa_index_bank', None)
+        return {
+            'runtime_identity': str(getattr(self.settings, 'runtime_identity', 'legacy_silu_v03')),
+            'preserve_native_activation': bool(getattr(self.settings, 'preserve_native_activation', False)),
+            'mlp_swiglu_patched': swiglu_patched,
+            'engram_constructed': bool(self.engram is not None),
+            'engram_enabled': bool(self.engram_enabled),
+            'esm_enabled': bool(self.esm_enabled),
+            'dlsa_attached': bool(dlsa_bank is not None),
+            'dlsa_num_global_visits': int(len(dlsa_bank.visit_indexers)) if dlsa_bank is not None else 0,
+            'visit_schedule': sched,
+        }
 
     @torch.no_grad()
     def set_recursion_kv_sharing(self, enabled: bool = True) -> dict[str, Any]:
@@ -2910,6 +3010,19 @@ class SparkXLoopV03(nn.Module):
     @torch.no_grad()
     def get_engram_routing_telemetry(self) -> dict[str, Any]:
         """Aggregate router balance CV, min/max load ratio, and per-pass telescoping scales across all 8 Engram anchors."""
+        if self.engram is None:
+            return {
+                'active_experts': 0,
+                'active_top_k': 0,
+                'flight_mode': 'disabled',
+                'effective_top_k': 0,
+                'multi_horizon_recall': False,
+                'mean_load_cv': 0.0,
+                'min_load_ratio': 1.0,
+                'max_load_ratio': 1.0,
+                'mean_gain_sigmoid': 0.0,
+                'per_anchor': {},
+            }
         per_anchor = {}
         cvs, mins, maxs, gains = [], [], [], []
         for l_idx, mod in self.iter_engram_anchors():
@@ -2950,6 +3063,21 @@ class SparkXLoopV03(nn.Module):
           - 'max_recall':     top_k=24, multi_horizon=True,  tail_blend=0.22, scale=0.25 (~2.64B active Engram params)
           - 'full_dense':     top_k=32, multi_horizon=True,  tail_blend=0.25, scale=0.25 (~3.34B active Engram params)
         """
+        if self.engram is None:
+            return {
+                'flight_mode': 'disabled',
+                'anchors': 0,
+                'active_experts_pool': 0,
+                'base_top_k': 0,
+                'flight_top_k': 0,
+                'total_experts_fired_per_token': 0,
+                'multi_horizon_5gram_recall': False,
+                'ngram_probes_per_token': 0,
+                'elastic_tail_blend_max': 0.0,
+                'decode_engram_scale': 0.0,
+                'active_compute_engram_params_B': 0.0,
+                'total_engram_capacity_B': 0.0,
+            }
         presets = {
             'fast':           {'k': 4,  'mh': False, 'tb': 0.00, 'sc': 0.20},
             'balanced':       {'k': int(self.engram.active_top_k), 'mh': False, 'tb': 0.00, 'sc': 0.25},
@@ -3410,10 +3538,14 @@ class SparkXLoopV03(nn.Module):
         device = embeds.device
         bsz, q_len = embeds.shape[:2]
         custom_cache_pos = cache_position is not None
+        is_paged_cache = bool(past_key_values is not None and getattr(past_key_values, 'is_sparkx_paged_cache', False))
         if cache_position is None:
             if past_key_values is not None:
                 try:
-                    past_seen = int(past_key_values.get_seq_length(0))
+                    if hasattr(past_key_values, 'get_logical_seq_length'):
+                        past_seen = int(past_key_values.get_logical_seq_length(0))
+                    else:
+                        past_seen = int(past_key_values.get_seq_length(0))
                 except Exception:
                     try:
                         past_seen = int(past_key_values.get_seq_length())
@@ -3422,10 +3554,12 @@ class SparkXLoopV03(nn.Module):
             else:
                 past_seen = 0
             cache_position = torch.arange(past_seen, past_seen + q_len, device=device)
-        if not custom_cache_pos and hasattr(model, 'make_loop_context'):
+        if not custom_cache_pos and hasattr(model, 'make_loop_context') and not is_paged_cache:
             return model.make_loop_context(embeds, attention_mask), cache_position
-        if (past_key_values is not None and q_len == 1 and attention_mask is None) or (
-            not custom_cache_pos and past_key_values is None and attention_mask is None and q_len > 1024
+        if (
+            is_paged_cache
+            or (past_key_values is not None and q_len == 1 and attention_mask is None)
+            or (not custom_cache_pos and past_key_values is None and attention_mask is None and q_len > 1024)
         ):
             masks = {'full_attention': None, 'sliding_attention': None}
         else:
@@ -3450,11 +3584,27 @@ class SparkXLoopV03(nn.Module):
                 masks['sliding_attention'] = torch.where(sw_ok, zero_val, min_val)
         implementation = importlib.import_module(type(model.layers[0].self_attn).__module__)
         rope = {}
+        sparse_cfg = getattr(self, 'sparse_attention_cfg', None)
+        yarn_scale = float(getattr(sparse_cfg, 'yarn_scale_factor', 1.0) or 1.0) if sparse_cfg is not None else 1.0
         for layer_type in set(cfg.layer_types):
-            rope[layer_type] = implementation.compute_rope_cos_sin(
-                cache_position, cfg.head_dim, cfg.get_rope_theta(layer_type),
-                partial_rotary_factor=cfg.get_partial_rotary_factor(layer_type), device=device,
-            )
+            if layer_type == 'full_attention' and yarn_scale > 1.0:
+                from sparkx_sparse_attention import compute_yarn_partial_rope_cos_sin
+                rope[layer_type] = compute_yarn_partial_rope_cos_sin(
+                    cache_position,
+                    head_dim=cfg.head_dim,
+                    rope_theta=cfg.get_rope_theta(layer_type),
+                    partial_rotary_factor=cfg.get_partial_rotary_factor(layer_type),
+                    scale_factor=yarn_scale,
+                    original_max_position=int(getattr(sparse_cfg, 'yarn_original_max_position', 32768)),
+                    beta_fast=float(getattr(sparse_cfg, 'yarn_beta_fast', 32.0)),
+                    beta_slow=float(getattr(sparse_cfg, 'yarn_beta_slow', 1.0)),
+                    device=device,
+                )
+            else:
+                rope[layer_type] = implementation.compute_rope_cos_sin(
+                    cache_position, cfg.head_dim, cfg.get_rope_theta(layer_type),
+                    partial_rotary_factor=cfg.get_partial_rotary_factor(layer_type), device=device,
+                )
         return (masks, rope), cache_position
 
     def _apply_layer(self, idx, h, masks, ropes, past_key_values=None, cache_position=None, virtual_idx: Optional[int] = None, read_only_kv: bool = False):
@@ -3683,15 +3833,58 @@ class SparkXLoopV03(nn.Module):
             return self.base.model.embedding.weight
         return self.base.lm_head.weight
 
-    def forward_logits(self, input_ids: torch.LongTensor, attention_mask=None,
-                       past_key_values=None, cache_position=None,
-                       prev_ids: Optional[torch.LongTensor] = None):
+    def forward_logits(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask=None,
+        past_key_values=None,
+        cache_position=None,
+        prev_ids: Optional[torch.LongTensor] = None,
+        logits_to_keep: Optional[int] = None,
+        chunk_size: Optional[int] = None,
+    ):
         input_ids = _unwrap_input_ids(input_ids)
-        h = self.forward_hidden(
-            input_ids, attention_mask=attention_mask,
-            past_key_values=past_key_values, cache_position=cache_position,
-            prev_ids=prev_ids,
-        )
+        seq_len = int(input_ids.shape[1]) if input_ids.ndim == 2 else 0
+        if (
+            past_key_values is not None
+            and chunk_size is not None
+            and int(chunk_size) > 0
+            and seq_len > int(chunk_size)
+        ):
+            step = int(chunk_size)
+            h_chunks: list[torch.Tensor] = []
+            keep_all_h = logits_to_keep is None or int(logits_to_keep) >= seq_len
+            cur_prev = prev_ids
+            for start in range(0, seq_len, step):
+                end = min(seq_len, start + step)
+                sub_ids = input_ids[:, start:end]
+                sub_mask = attention_mask[:, :end] if (isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2) else attention_mask
+                sub_pos = cache_position[start:end] if isinstance(cache_position, torch.Tensor) else None
+                h_sub = self.forward_hidden(
+                    sub_ids,
+                    attention_mask=sub_mask,
+                    past_key_values=past_key_values,
+                    cache_position=sub_pos,
+                    prev_ids=cur_prev,
+                )
+                if keep_all_h:
+                    h_chunks.append(h_sub)
+                elif end == seq_len:
+                    k_keep = max(1, int(logits_to_keep))
+                    if h_sub.shape[1] >= k_keep:
+                        h_chunks = [h_sub[:, -k_keep:, :]]
+                    else:
+                        h_chunks.append(h_sub)
+                cur_prev = input_ids[:, max(0, end - 2):end]
+            h = torch.cat(h_chunks, dim=1) if len(h_chunks) > 1 else h_chunks[0]
+        else:
+            h = self.forward_hidden(
+                input_ids, attention_mask=attention_mask,
+                past_key_values=past_key_values, cache_position=cache_position,
+                prev_ids=prev_ids,
+            )
+        if logits_to_keep is not None and int(logits_to_keep) > 0 and h.shape[1] > int(logits_to_keep):
+            h = h[:, -int(logits_to_keep):, :]
         if getattr(self.base.config, 'tie_word_embeddings', False):
             return F.linear(h, self.base.model.embedding.weight)
         return self.base.lm_head(h)
@@ -3713,6 +3906,29 @@ class SparkXLoopV03(nn.Module):
             logits = F.linear(h, self._head_weight()) if getattr(self.base.config, 'tie_word_embeddings', False) else self.base.lm_head(h)
             return {'logits': logits, 'loss': loss, 'ce_loss': ce_loss, 'z_loss': z_loss}
         return {'logits': None, 'loss': loss, 'ce_loss': ce_loss, 'z_loss': z_loss}
+
+    def make_inference_cache(self, session_id: str = 'default', **cache_overrides):
+        """Construct a 72-visit Loop72HybridPagedCache configured for this model."""
+        from sparkx_paged_cache import Loop72HybridPagedCache, PagedCacheConfig
+        base_cfg = getattr(self, 'paged_cache_cfg', None)
+        if isinstance(base_cfg, PagedCacheConfig):
+            cfg_dict = dataclasses.asdict(base_cfg)
+        else:
+            cfg_dict = {
+                'behavior_fingerprint': str(getattr(self.settings, 'runtime_identity', 'native_gelu_loop72')),
+            }
+        cfg_dict['session_id'] = str(session_id)
+        cfg_dict.update(cache_overrides)
+        return Loop72HybridPagedCache(
+            config=PagedCacheConfig(**cfg_dict),
+            enable_p3=bool(self.enable_p3),
+            loop_passes=int(self.loop_passes),
+            loop_start=int(self.loop_start),
+            loop_end=int(self.loop_end),
+            p3_start=int(self.p3_start),
+            p3_end=int(self.p3_end),
+            n_layers=int(self.n_layers),
+        )
 
     @torch.no_grad()
     def generate_cached(
@@ -3736,7 +3952,16 @@ class SparkXLoopV03(nn.Module):
         input_ids = _unwrap_input_ids(input_ids)
         prev_train = self.training
         self.eval()
-        cache = DynamicCache()
+        use_paged = bool(
+            kwargs.pop('use_paged_cache', None)
+            if 'use_paged_cache' in kwargs
+            else (
+                bool(getattr(self.settings, 'use_paged_hybrid_cache', False))
+                or getattr(self, 'dlsa_index_bank', None) is not None
+            )
+        )
+        cache = self.make_inference_cache() if use_paged else DynamicCache()
+        prefill_chunk = int(kwargs.pop('prefill_chunk_tokens', getattr(self.settings, 'prefill_chunk_tokens', 2048)) or 0)
         out = input_ids
 
         stop_ids = set()
@@ -3829,7 +4054,12 @@ class SparkXLoopV03(nn.Module):
             return torch.multinomial(probs, num_samples=1).unsqueeze(0)
 
         try:
-            logits = self.forward_logits(out, past_key_values=cache)
+            logits = self.forward_logits(
+                out,
+                past_key_values=cache,
+                logits_to_keep=1,
+                chunk_size=(prefill_chunk if prefill_chunk > 0 else None),
+            )
             next_id = _sample_step(logits, gen_list, think_closed)
             tok_int = int(next_id.item())
             gen_list.append(tok_int)
@@ -3847,7 +4077,7 @@ class SparkXLoopV03(nn.Module):
                     for cid in close_seq_ids:
                         if step_i >= max_new_tokens:
                             break
-                        _ = self.forward_logits(next_id, past_key_values=cache, prev_ids=prev_tok)
+                        _ = self.forward_logits(next_id, past_key_values=cache, prev_ids=prev_tok, logits_to_keep=1)
                         prev_tok = out[:, -2:]
                         next_id = torch.tensor([[cid]], dtype=out.dtype, device=out.device)
                         gen_list.append(cid)
@@ -3861,7 +4091,7 @@ class SparkXLoopV03(nn.Module):
                     if step_i >= max_new_tokens:
                         break
 
-                logits = self.forward_logits(next_id, past_key_values=cache, prev_ids=prev_tok)
+                logits = self.forward_logits(next_id, past_key_values=cache, prev_ids=prev_tok, logits_to_keep=1)
                 prev_tok = out[:, -2:]
                 if not think_closed and tokenizer is not None and (len(gen_list) <= 16 or len(gen_list) % 8 == 0):
                     tail_txt = tokenizer.decode(gen_list[-48:], skip_special_tokens=False)
@@ -3917,8 +4147,9 @@ def set_trainables_v03(
             p.requires_grad_(True)
     for p in model.controllers.parameters():
         p.requires_grad_(bool(model.mhc_enabled))
-    for p in model.engram.parameters():
-        p.requires_grad_(not bool(freeze_engram))
+    if model.engram is not None:
+        for p in model.engram.parameters():
+            p.requires_grad_(not bool(freeze_engram))
     for p in model.backbone_engrams.parameters():
         p.requires_grad_(not bool(freeze_engram))
     return {n: p for n, p in model.named_parameters() if p.requires_grad}
@@ -3968,9 +4199,11 @@ def build_optimizer_v03(
 
 
 def count_en4b_a1b_params(model: SparkXLoopV03) -> dict[str, int]:
-    """Compute exact parameter breakdown across Backbone, GPU Engrams, and Offloaded Tier-1B DRAM/SSD."""
+    """Compute exact parameter breakdown across Backbone, mHC, D-LSA Index Bank, GPU Engrams, and Offloaded Tier-1B DRAM/SSD."""
     backbone_total = sum(p.numel() for p in model.base.parameters())
     ctrl_total = sum(p.numel() for p in model.controllers.parameters())
+    dlsa_bank = getattr(model, 'dlsa_index_bank', None)
+    dlsa_total = int(dlsa_bank.total_map_parameters()) if dlsa_bank is not None else 0
     eng_gpu_total = sum(p.numel() for mod in model.all_engram_modules() for p in mod.parameters())
     eng_cpu_tier1b = sum(
         mod.tier1b_cold_weight.numel()
@@ -3985,11 +4218,12 @@ def count_en4b_a1b_params(model: SparkXLoopV03) -> dict[str, int]:
         t3_act = mod.active_top_k * per_exp
         proj_act = mod.lexical_up.weight.numel() + mod.query_proj.weight.numel() + mod.ctx_gate.weight.numel() + mod.project.weight.numel()
         active_eng += (t2 + t3_act + proj_act)
-    total_params = backbone_total + ctrl_total + eng_total
-    active_params = backbone_total + ctrl_total + active_eng
+    total_params = backbone_total + ctrl_total + dlsa_total + eng_total
+    active_params = backbone_total + ctrl_total + dlsa_total + active_eng
     return {
         'backbone_total': backbone_total,
         'controllers_total': ctrl_total,
+        'dlsa_index_bank_total': dlsa_total,
         'engram_gpu_total': eng_gpu_total,
         'engram_cpu_tier1b_total': eng_cpu_tier1b,
         'engram_total': eng_total,
@@ -4002,51 +4236,97 @@ def count_en4b_a1b_params(model: SparkXLoopV03) -> dict[str, int]:
 
 
 def loop_v03_state_dict(model: SparkXLoopV03, include_tier1b: bool = True) -> dict:
-    """Serialize all v0.3 loop modules (mHC controllers + 8 MoE-Engrams + optional offloaded Tier-1B banks)."""
+    """Serialize all v0.3 loop modules (mHC controllers + ESM shards + D-LSA index bank + optional MoE-Engrams)."""
     tier1b = {}
-    if include_tier1b:
+    if include_tier1b and model.engram is not None:
         if getattr(model.engram, 'tier1b_cold_weight', None) is not None:
             tier1b['engram'] = model.engram.tier1b_cold_weight.detach().cpu()
         for k, mod in model.backbone_engrams.items():
             if getattr(mod, 'tier1b_cold_weight', None) is not None:
                 tier1b[f'backbone_engrams.{k}'] = mod.tier1b_cold_weight.detach().cpu()
     active_meta = {
-        'engram_active_experts': model.engram.active_experts,
-        'engram_active_top_k': model.engram.active_top_k,
-        'use_pass_gain_schedule': bool(getattr(model.engram, 'use_pass_gain_schedule', False)),
+        'engram_constructed': bool(model.engram is not None),
+        'engram_active_experts': int(model.engram.active_experts) if model.engram is not None else 0,
+        'engram_active_top_k': int(model.engram.active_top_k) if model.engram is not None else 0,
+        'use_pass_gain_schedule': bool(getattr(model.engram, 'use_pass_gain_schedule', False)) if model.engram is not None else False,
+        'esm_enabled': bool(getattr(model, 'esm_enabled', False)),
+        'esm_visits': str(getattr(model, 'esm_visits', 'first')),
     }
+    esm_state = {}
+    if hasattr(model, 'esm'):
+        for k, mod in model.esm.items():
+            if hasattr(mod, 'esm_state_dict'):
+                esm_state[str(k)] = mod.esm_state_dict()
+            elif mod.has_active_writes():
+                esm_state[str(k)] = {sk: {tk: tv.detach().cpu() for tk, tv in sv.items()} for sk, sv in mod.shards.items()}
+    dlsa_state = None
+    if getattr(model, 'dlsa_index_bank', None) is not None:
+        dlsa_state = model.dlsa_index_bank.export_manifest()
     return {
         'version': 'v0.3-en4b-a1b',
         'settings': dataclasses.asdict(model.settings),
         'active_meta': active_meta,
         'controllers': {k: v.detach().cpu() for k, v in model.controllers.state_dict().items()},
-        'engram': {k: v.detach().cpu() for k, v in model.engram.state_dict().items()},
+        'engram': ({k: v.detach().cpu() for k, v in model.engram.state_dict().items()} if model.engram is not None else {}),
         'backbone_engrams': {k: v.detach().cpu() for k, v in model.backbone_engrams.state_dict().items()},
         'tier1b_cold': tier1b,
+        'esm': esm_state,
+        'dlsa_index_bank': dlsa_state,
     }
 
 
 def load_loop_v03_state_dict(model: SparkXLoopV03, state: dict, strict: bool = False) -> dict:
-    """Restore v0.3 loop state (including active expert count and pinned Host DRAM Tier-1B weights)."""
+    """Restore v0.3 loop state (including mHC controllers, ESM shards, D-LSA index bank, and optional MoE-Engrams)."""
     meta = state.get('active_meta', {})
-    act_e = int(meta.get('engram_active_experts', model.engram.active_experts))
-    act_k = int(meta.get('engram_active_top_k', model.engram.active_top_k))
-    use_pg = bool(meta.get('use_pass_gain_schedule', False))
-    for mod in model.all_engram_modules():
-        mod.active_experts = min(act_e, mod.num_experts)
-        mod.active_top_k = min(act_k, mod.active_experts)
-        mod.use_pass_gain_schedule = use_pg
+    if model.engram is not None:
+        act_e = int(meta.get('engram_active_experts', model.engram.active_experts))
+        act_k = int(meta.get('engram_active_top_k', model.engram.active_top_k))
+        use_pg = bool(meta.get('use_pass_gain_schedule', False))
+        for mod in model.all_engram_modules():
+            mod.active_experts = min(act_e, mod.num_experts)
+            mod.active_top_k = min(act_k, mod.active_experts)
+            mod.use_pass_gain_schedule = use_pg
     c_res = model.controllers.load_state_dict(state['controllers'], strict=strict)
-    e_res = model.engram.load_state_dict(state['engram'], strict=strict)
-    b_res = model.backbone_engrams.load_state_dict(state['backbone_engrams'], strict=strict)
+    e_res = (
+        model.engram.load_state_dict(state['engram'], strict=strict)
+        if (model.engram is not None and state.get('engram'))
+        else None
+    )
+    b_res = (
+        model.backbone_engrams.load_state_dict(state['backbone_engrams'], strict=strict)
+        if (len(model.backbone_engrams) > 0 and state.get('backbone_engrams'))
+        else None
+    )
     tier1b = state.get('tier1b_cold', {})
-    if 'engram' in tier1b and getattr(model.engram, 'tier1b_cold_weight', None) is not None:
+    if model.engram is not None and 'engram' in tier1b and getattr(model.engram, 'tier1b_cold_weight', None) is not None:
         model.engram.tier1b_cold_weight.copy_(tier1b['engram'])
     for k, mod in model.backbone_engrams.items():
         key = f'backbone_engrams.{k}'
         if key in tier1b and getattr(mod, 'tier1b_cold_weight', None) is not None:
             mod.tier1b_cold_weight.copy_(tier1b[key])
-    return {'controllers': c_res, 'engram': e_res, 'backbone_engrams': b_res}
+    esm_loaded = 0
+    esm_state = state.get('esm', {})
+    if isinstance(esm_state, dict) and hasattr(model, 'esm'):
+        for k, shard_payload in esm_state.items():
+            if str(k) in model.esm:
+                mod = model.esm[str(k)]
+                if hasattr(mod, 'load_esm_state_dict'):
+                    mod.load_esm_state_dict(shard_payload)
+                esm_loaded += 1
+        if 'esm_enabled' in meta:
+            model.esm_enabled = bool(meta['esm_enabled'])
+        if 'esm_visits' in meta:
+            model.esm_visits = str(meta['esm_visits'])
+    dlsa_res = None
+    if state.get('dlsa_index_bank') and getattr(model, 'dlsa_index_bank', None) is not None:
+        dlsa_res = model.dlsa_index_bank.load_from_checkpoint_dict(state['dlsa_index_bank'])
+    return {
+        'controllers': c_res,
+        'engram': e_res,
+        'backbone_engrams': b_res,
+        'esm_layers_loaded': esm_loaded,
+        'dlsa_index_bank': dlsa_res,
+    }
 
 
 @torch.no_grad()
@@ -4074,9 +4354,9 @@ def warm_start_from_v02_state(model: SparkXLoopV03, v02_state: dict) -> dict[str
                 cnt += 1
         return cnt
 
-    if 'engram' in v02_state:
+    if model.engram is not None and 'engram' in v02_state:
         copied_eng += _copy_compatible_engram(model.engram, v02_state['engram'])
-    if 'backbone_engrams' in v02_state:
+    if len(model.backbone_engrams) > 0 and 'backbone_engrams' in v02_state:
         v02_be = v02_state['backbone_engrams']
         for idx_key, mod in model.backbone_engrams.items():
             sub_dict = {

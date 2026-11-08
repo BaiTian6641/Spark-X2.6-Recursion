@@ -155,20 +155,37 @@ def ward_partition(
 # Paged latent index with exact-key selection
 # ======================================================================================
 class PagedLatentIndex:
-    """Hierarchical (pool -> Ward bucket) index over the *middle* region `[n_sink, T - tail)` of a key sequence.
+    """Hierarchical (pool -> Ward bucket -> optional geometric tree) index over the *middle* region `[n_sink, T - tail)` of a key sequence.
 
     Only complete blocks of `n_cluster` keys are clustered; the remainder (< n_cluster keys) is returned as part of the
     always-read tail. Selection returns **exact key positions** (sink + selected buckets + tail), never averaged values.
+
+    Loop72 LSA scaling upgrades (§3.3, §4.2, §5.3, P2, P6):
+      - Append-only block pages (`_cent_pages`, `_label_pages`, `_btok_pages`) eliminate quadratic full-prefix `torch.cat` traffic.
+      - Source-side candidate gather (`index_select` on `k_idx_n`'s device before `.to(dev)`) prevents full-history host->GPU copy.
+      - Optional `persistent_token_latents=False` avoids keeping full-history FP32 64D per-token arrays in RAM/VRAM; stage-2
+        reranking can evaluate an on-the-fly `candidate_key_fn(mid_indices)` callback.
+      - Supports both `search_mode="flat"` (exact bucket scan) and `search_mode="tree"` (bounded-beam geometric-series
+        hierarchical traversal in $O(r f w \\log_f P + K r)$ time, strictly respecting causal block horizon `limit`).
     """
 
     def __init__(self, k_idx: torch.Tensor, n_sink: int = 4, n_pool: int = 4, n_cluster: int = 512,
-                 avg_bucket_size: int = 8, max_bucket_size: int = 16, window: int = 512, rerank: int = 1):
+                 avg_bucket_size: int = 8, max_bucket_size: int = 16, window: int = 512, rerank: int = 1,
+                 search_mode: str = "flat", branching_factor: int = 16, beam_width: int = 32,
+                 persistent_token_latents: Optional[bool] = None):
         assert n_cluster % n_pool == 0
         self.rerank = max(1, int(rerank))  # two-stage: buckets up to rerank*budget tokens, then token-level top-`budget` on k_idx
+        self.search_mode = str(search_mode).lower().strip()
+        self.branching_factor = max(2, int(branching_factor))
+        self.beam_width = max(4, int(beam_width))
+        if persistent_token_latents is None:
+            persistent_token_latents = bool(self.rerank > 1)
+        self.persistent_token_latents = bool(persistent_token_latents)
         self.t = int(k_idx.shape[0])
         self.n_sink, self.n_pool, self.n_cluster = int(n_sink), int(n_pool), int(n_cluster)
         self.window = int(window)
-        d = k_idx.shape[-1]
+        self.d = int(k_idx.shape[-1])
+        d = self.d
         mid_end = max(self.n_sink, self.t - self.window)
         n_blocks = max(0, (mid_end - self.n_sink) // self.n_cluster)
         self.n_blocks = n_blocks
@@ -177,50 +194,159 @@ class PagedLatentIndex:
         self.pools_per_block = self.n_cluster // self.n_pool
         self.avg_bucket_size = int(avg_bucket_size)
         self.max_bucket_size = int(max_bucket_size)
+
+        self._cent_pages: List[torch.Tensor] = []
+        self._label_pages: List[torch.Tensor] = []
+        self._btok_pages: List[torch.Tensor] = []
+        self._k_idx_pages: List[torch.Tensor] = []
+        self._materialized_blocks: int = -1
+        self._mat_centroids: torch.Tensor = torch.zeros(0, 0, d)
+        self._mat_labels: torch.Tensor = torch.zeros(0, 0, dtype=torch.long)
+        self._mat_btoks: torch.Tensor = torch.zeros(0, 0)
+        self._mat_k_idx_n: Optional[torch.Tensor] = None
+        self._k_idx_mat_t: int = -1
+
+        if self.persistent_token_latents and self.t > 0:
+            kk = F.normalize(k_idx.float(), dim=-1, eps=1e-6)
+            self._k_idx_pages.append(kk)
+        else:
+            kk = F.normalize(k_idx[self.mid_start: self.clustered_end].float(), dim=-1, eps=1e-6) if n_blocks > 0 else None
+
         if n_blocks == 0:
-            self.centroids = torch.zeros(0, 0, d)
-            self.labels = torch.zeros(0, 0, dtype=torch.long)
-            self.bucket_tokens = torch.zeros(0, 0)
-            self.k_idx_n = F.normalize(k_idx.float(), dim=-1, eps=1e-6) if self.rerank > 1 else None
             return
-        kk = F.normalize(k_idx.float(), dim=-1, eps=1e-6)
-        self.k_idx_n = kk if self.rerank > 1 else None
-        blk = kk[self.mid_start: self.clustered_end].view(n_blocks, self.pools_per_block, self.n_pool, d)
+
+        blk_src = kk[self.mid_start: self.clustered_end] if self.persistent_token_latents else kk
+        blk = blk_src.view(n_blocks, self.pools_per_block, self.n_pool, d)
         pools = F.normalize(blk.mean(dim=2), dim=-1, eps=1e-6)  # [B, P, d]
         target = max(1, self.n_cluster // int(avg_bucket_size))
-        self.labels = ward_partition(pools, target, max_pools_per_bucket=max(1, int(max_bucket_size) // self.n_pool))
+        labels = ward_partition(pools, target, max_pools_per_bucket=max(1, int(max_bucket_size) // self.n_pool))
         p = self.pools_per_block
-        onehot = F.one_hot(self.labels, num_classes=p).float()  # [B, P, C]
+        onehot = F.one_hot(labels, num_classes=p).float()  # [B, P, C]
         sums = torch.einsum("bpc,bpd->bcd", onehot, pools)
-        self.centroids = F.normalize(sums, dim=-1, eps=1e-6)  # [B, C, d]
-        self.bucket_tokens = onehot.sum(dim=1) * self.n_pool  # [B, C] token count per bucket (0 = empty slot)
-        self.avg_bucket_size = int(avg_bucket_size)
-        self.max_bucket_size = int(max_bucket_size)
+        cents = F.normalize(sums, dim=-1, eps=1e-6)  # [B, C, d]
+        btoks = onehot.sum(dim=1) * self.n_pool  # [B, C] token count per bucket (0 = empty slot)
+        self._cent_pages.append(cents)
+        self._label_pages.append(labels)
+        self._btok_pages.append(btoks)
+
+    def _ensure_materialized(self) -> None:
+        if self._materialized_blocks == self.n_blocks:
+            return
+        if not self._cent_pages or self.n_blocks == 0:
+            self._mat_centroids = torch.zeros(0, 0, self.d)
+            self._mat_labels = torch.zeros(0, 0, dtype=torch.long)
+            self._mat_btoks = torch.zeros(0, 0)
+        elif len(self._cent_pages) == 1:
+            self._mat_centroids = self._cent_pages[0]
+            self._mat_labels = self._label_pages[0]
+            self._mat_btoks = self._btok_pages[0]
+        else:
+            dev = self._cent_pages[0].device
+            ldev = self._label_pages[0].device
+            self._mat_centroids = torch.cat([c.to(dev) for c in self._cent_pages], dim=0)
+            self._mat_labels = torch.cat([l.to(ldev) for l in self._label_pages], dim=0)
+            self._mat_btoks = torch.cat([b.to(dev) for b in self._btok_pages], dim=0)
+            self._cent_pages = [self._mat_centroids]
+            self._label_pages = [self._mat_labels]
+            self._btok_pages = [self._mat_btoks]
+        self._materialized_blocks = self.n_blocks
+
+    @property
+    def centroids(self) -> torch.Tensor:
+        self._ensure_materialized()
+        return self._mat_centroids
+
+    @centroids.setter
+    def centroids(self, val: torch.Tensor) -> None:
+        self._cent_pages = [val] if val.numel() > 0 else []
+        self._mat_centroids = val
+        self._materialized_blocks = self.n_blocks
+
+    @property
+    def labels(self) -> torch.Tensor:
+        self._ensure_materialized()
+        return self._mat_labels
+
+    @labels.setter
+    def labels(self, val: torch.Tensor) -> None:
+        self._label_pages = [val] if val.numel() > 0 else []
+        self._mat_labels = val
+        self._materialized_blocks = self.n_blocks
+
+    @property
+    def bucket_tokens(self) -> torch.Tensor:
+        self._ensure_materialized()
+        return self._mat_btoks
+
+    @bucket_tokens.setter
+    def bucket_tokens(self, val: torch.Tensor) -> None:
+        self._btok_pages = [val] if val.numel() > 0 else []
+        self._mat_btoks = val
+        self._materialized_blocks = self.n_blocks
+
+    @property
+    def k_idx_n(self) -> Optional[torch.Tensor]:
+        if not self.persistent_token_latents or not self._k_idx_pages:
+            return None
+        if self._k_idx_mat_t != self.t or self._mat_k_idx_n is None:
+            if len(self._k_idx_pages) == 1:
+                self._mat_k_idx_n = self._k_idx_pages[0]
+            else:
+                dev = self._k_idx_pages[0].device
+                self._mat_k_idx_n = torch.cat([p.to(dev) for p in self._k_idx_pages], dim=0)
+                self._k_idx_pages = [self._mat_k_idx_n]
+            self._k_idx_mat_t = self.t
+        return self._mat_k_idx_n
+
+    @k_idx_n.setter
+    def k_idx_n(self, val: Optional[torch.Tensor]) -> None:
+        if val is None:
+            self._k_idx_pages = []
+            self._mat_k_idx_n = None
+            self._k_idx_mat_t = -1
+        else:
+            self._k_idx_pages = [val]
+            self._mat_k_idx_n = val
+            self._k_idx_mat_t = int(val.shape[0])
 
     @torch.no_grad()
-    def extend_to(self, k_idx: torch.Tensor) -> int:
-        """Incrementally extend the index to a longer key sequence `k_idx` (`[T_new, d]`, `T_new >= self.t`) without
-        re-clustering already-completed blocks `[mid_start, clustered_end)`. Returns the number of newly clustered blocks."""
-        new_t = int(k_idx.shape[0])
-        if new_t < self.t:
-            raise ValueError(f"extend_to requires new_t ({new_t}) >= current t ({self.t})")
-        if new_t == self.t:
+    def append_new_keys(self, k_idx_new: torch.Tensor) -> int:
+        """Append only newly arrived key latents `k_idx_new` (`[Delta_T, d]`) without passing the full prefix."""
+        delta_t = int(k_idx_new.shape[0])
+        if delta_t <= 0:
             return 0
-        d = int(k_idx.shape[-1])
-        old_t = self.t
-        self.t = new_t
-        if self.rerank > 1:
-            kk_tail = F.normalize(k_idx[old_t:new_t].float(), dim=-1, eps=1e-6)
-            self.k_idx_n = kk_tail if self.k_idx_n is None else torch.cat([self.k_idx_n.to(kk_tail.device), kk_tail], dim=0)
-        mid_end = max(self.n_sink, new_t - self.window)
+        # Keep an unclustered tail buffer of at most `n_cluster + window` key latents so block closing never needs full-history k_idx
+        tail_buf = getattr(self, "_unclustered_k_buf", None)
+        kk_new = F.normalize(k_idx_new.float(), dim=-1, eps=1e-6)
+        if self.persistent_token_latents:
+            self._k_idx_pages.append(kk_new)
+        if tail_buf is None:
+            if self.persistent_token_latents and self.k_idx_n is not None:
+                # Extract from the already-stored pages starting at clustered_end
+                full_k = self.k_idx_n
+                old_t = self.t
+                self.t = old_t + delta_t
+                return self._cluster_new_blocks_from_slice(full_k[self.clustered_end: self.t])
+            tail_buf = kk_new
+        else:
+            tail_buf = torch.cat([tail_buf.to(kk_new.device), kk_new], dim=0)
+        self.t += delta_t
+        added = self._cluster_new_blocks_from_slice(tail_buf)
+        consumed = added * self.n_cluster
+        self._unclustered_k_buf = tail_buf[consumed:]
+        return added
+
+    def _cluster_new_blocks_from_slice(self, unclustered_slice: torch.Tensor) -> int:
+        mid_end = max(self.n_sink, self.t - self.window)
         new_blocks = max(0, (mid_end - self.n_sink) // self.n_cluster)
         delta_blocks = new_blocks - self.n_blocks
         if delta_blocks <= 0:
             return 0
-        start = self.clustered_end
-        end = self.n_sink + new_blocks * self.n_cluster
-        kk_new = F.normalize(k_idx[start:end].float(), dim=-1, eps=1e-6)
-        blk = kk_new.view(delta_blocks, self.pools_per_block, self.n_pool, d)
+        need_toks = delta_blocks * self.n_cluster
+        if int(unclustered_slice.shape[0]) < need_toks:
+            return 0
+        kk_new = unclustered_slice[:need_toks]
+        blk = kk_new.view(delta_blocks, self.pools_per_block, self.n_pool, self.d)
         pools = F.normalize(blk.mean(dim=2), dim=-1, eps=1e-6)
         avg_bs = getattr(self, "avg_bucket_size", 8)
         max_bs = getattr(self, "max_bucket_size", 16)
@@ -231,18 +357,36 @@ class PagedLatentIndex:
         sums = torch.einsum("bpc,bpd->bcd", onehot, pools)
         new_centroids = F.normalize(sums, dim=-1, eps=1e-6)
         new_btoks = onehot.sum(dim=1) * self.n_pool
-        if self.n_blocks == 0:
-            self.labels = new_labels
-            self.centroids = new_centroids
-            self.bucket_tokens = new_btoks
-        else:
-            dev = self.centroids.device
-            self.labels = torch.cat([self.labels, new_labels.to(self.labels.device)], dim=0)
-            self.centroids = torch.cat([self.centroids, new_centroids.to(dev)], dim=0)
-            self.bucket_tokens = torch.cat([self.bucket_tokens, new_btoks.to(dev)], dim=0)
+        self._cent_pages.append(new_centroids)
+        self._label_pages.append(new_labels)
+        self._btok_pages.append(new_btoks)
         self.n_blocks = new_blocks
-        self.clustered_end = end
+        self.clustered_end = self.n_sink + new_blocks * self.n_cluster
         return int(delta_blocks)
+
+    @torch.no_grad()
+    def extend_to(self, k_idx: torch.Tensor) -> int:
+        """Incrementally extend the index to a longer key sequence `k_idx` (`[T_new, d]`, `T_new >= self.t`) without
+        re-clustering already-completed blocks `[mid_start, clustered_end)`. Returns the number of newly clustered blocks."""
+        new_t = int(k_idx.shape[0])
+        if new_t < self.t:
+            raise ValueError(f"extend_to requires new_t ({new_t}) >= current t ({self.t})")
+        if new_t == self.t:
+            return 0
+        old_t = self.t
+        self.t = new_t
+        if self.persistent_token_latents:
+            kk_tail = F.normalize(k_idx[old_t:new_t].float(), dim=-1, eps=1e-6)
+            self._k_idx_pages.append(kk_tail)
+        mid_end = max(self.n_sink, new_t - self.window)
+        new_blocks = max(0, (mid_end - self.n_sink) // self.n_cluster)
+        delta_blocks = new_blocks - self.n_blocks
+        if delta_blocks <= 0:
+            return 0
+        start = self.clustered_end
+        end = self.n_sink + new_blocks * self.n_cluster
+        kk_new = F.normalize(k_idx[start:end].float(), dim=-1, eps=1e-6)
+        return self._cluster_new_blocks_from_slice(kk_new)
 
     def bucket_stats(self) -> Dict[str, float]:
         if self.n_blocks == 0:
@@ -251,9 +395,97 @@ class PagedLatentIndex:
         return {"blocks": self.n_blocks, "buckets": int(nz.numel()), "mean_tokens": float(nz.mean()),
                 "max_tokens": float(nz.max())}
 
+    def index_storage_bytes(self) -> int:
+        """Compute resident index storage bytes (centroids + labels + bucket token counts + optional token latents)."""
+        total = 0
+        for page_list in (self._cent_pages, self._label_pages, self._btok_pages, self._k_idx_pages):
+            for t_obj in page_list:
+                if isinstance(t_obj, torch.Tensor):
+                    total += int(t_obj.numel() * t_obj.element_size())
+        return total
+
+    @torch.no_grad()
+    def _select_tree_buckets(
+        self,
+        cents: torch.Tensor,
+        toks: torch.Tensor,
+        q: torch.Tensor,
+        stage1_token_budget: int,
+        upto: int,
+        dist_alpha_over_tau: float = 0.0,
+    ) -> torch.Tensor:
+        """Bounded-beam geometric-series hierarchical tree search over causal blocks `[0, limit)`.
+        Complexity: $O(r f w \\log_f P + K r)$ where $P$ is the number of non-empty leaf buckets, $f$ is `branching_factor`,
+        and $w$ is `beam_width`."""
+        limit, c_slots, d = cents.shape
+        dev = cents.device
+        flat_toks = toks.reshape(-1)
+        valid_mask = flat_toks > 0
+        valid_flat_ids = torch.nonzero(valid_mask).squeeze(1)
+        n_valid = int(valid_flat_ids.numel())
+        if n_valid == 0:
+            return valid_flat_ids
+
+        f = self.branching_factor
+        target_leaf_buckets = max(self.beam_width, int(math.ceil(stage1_token_budget / max(1, self.avg_bucket_size))) * 2)
+        if n_valid <= max(f * 2, target_leaf_buckets):
+            # Small enough to score valid leaf buckets directly
+            cand_flat = valid_flat_ids
+        else:
+            valid_cents = cents.reshape(-1, d)[valid_flat_ids]
+            # Build geometric hierarchy levels of branching factor `f` over valid causal buckets
+            levels_cents: List[torch.Tensor] = [valid_cents]
+            cur = valid_cents
+            while int(cur.shape[0]) > f * self.beam_width:
+                n_cur = int(cur.shape[0])
+                n_parent = (n_cur + f - 1) // f
+                pad = n_parent * f - n_cur
+                if pad > 0:
+                    cur_padded = torch.cat([cur, torch.zeros(pad, d, device=dev, dtype=cur.dtype)], dim=0)
+                else:
+                    cur_padded = cur
+                cur = F.normalize(cur_padded.view(n_parent, f, d).sum(dim=1), dim=-1, eps=1e-6)
+                levels_cents.append(cur)
+
+            # Top-down bounded-beam traversal from coarsest level to leaf valid indices
+            top_cents = levels_cents[-1]
+            top_scores = top_cents @ q
+            w_beam = min(int(top_cents.shape[0]), max(self.beam_width, target_leaf_buckets // f))
+            active_idx = top_scores.topk(w_beam, largest=True, sorted=False).indices
+
+            for lvl in range(len(levels_cents) - 2, -1, -1):
+                lvl_cents = levels_cents[lvl]
+                n_lvl = int(lvl_cents.shape[0])
+                children = (
+                    active_idx.unsqueeze(1) * f + torch.arange(f, device=dev, dtype=torch.long).unsqueeze(0)
+                ).reshape(-1)
+                children = children[children < n_lvl]
+                ch_scores = lvl_cents.index_select(0, children) @ q
+                keep_k = min(int(children.numel()), target_leaf_buckets if lvl == 0 else max(self.beam_width * 2, target_leaf_buckets // f))
+                active_idx = children[ch_scores.topk(keep_k, largest=True, sorted=False).indices]
+
+            cand_flat = valid_flat_ids.index_select(0, active_idx)
+
+        cand_cents = cents.reshape(-1, d).index_select(0, cand_flat)
+        cand_scores = cand_cents @ q
+        if dist_alpha_over_tau > 0.0:
+            q_pos = float(upto - 1)
+            blk_ids = cand_flat // c_slots
+            blk_centers = self.mid_start + (blk_ids.float() + 0.5) * float(self.n_cluster)
+            cand_scores = cand_scores - float(dist_alpha_over_tau) * torch.log1p(
+                (q_pos - blk_centers).clamp(min=0.0) / max(1.0, float(self.window))
+            )
+        order = cand_scores.argsort(descending=True)
+        sorted_flat = cand_flat.index_select(0, order)
+        sorted_toks = flat_toks.index_select(0, sorted_flat)
+        csum = torch.cumsum(sorted_toks, dim=0)
+        take = (csum - sorted_toks) < stage1_token_budget
+        return sorted_flat[take]
+
     @torch.no_grad()
     def select(self, q_idx: torch.Tensor, budget: int, upto: Optional[int] = None,
-               dist_alpha_over_tau: float = 0.0) -> torch.Tensor:
+               dist_alpha_over_tau: float = 0.0, search_mode: Optional[str] = None,
+               candidate_key_fn: Optional[Any] = None) -> torch.Tensor:
         """`q_idx`: [d] or [Tq, d] unit-norm (mean-pooled if 2-D). Returns sorted exact key positions (sink+selected+tail).
 
         `upto`: causal horizon for a query at position `upto - 1` (keys `>= upto` do not exist for it). Because Ward blocks are
@@ -273,19 +505,28 @@ class PagedLatentIndex:
         q = F.normalize(q_idx.float().reshape(-1, q_idx.shape[-1]).mean(dim=0), dim=-1, eps=1e-6)
         cents = self.centroids[:limit].to(dev)
         toks = self.bucket_tokens[:limit].to(dev)
-        scores = torch.einsum("bcd,d->bc", cents, q)
-        if dist_alpha_over_tau > 0.0:
-            q_pos = float(upto - 1)
-            blk_centers = self.mid_start + (torch.arange(limit, device=dev, dtype=torch.float32) + 0.5) * float(self.n_cluster)
-            blk_pen = float(dist_alpha_over_tau) * torch.log1p((q_pos - blk_centers).clamp(min=0.0) / max(1.0, float(self.window)))
-            scores = scores - blk_pen.unsqueeze(1)
-        scores = scores.masked_fill(toks == 0, float("-inf"))
-        flat_s, flat_i = scores.reshape(-1).sort(descending=True)
-        flat_t = toks.reshape(-1)[flat_i]
-        csum = torch.cumsum(flat_t, dim=0)
-        take = (csum - flat_t) < int(budget) * self.rerank  # include a bucket while the (stage-1) budget is not yet exhausted
-        take &= torch.isfinite(flat_s)
-        sel_flat = flat_i[take]
+        stage1_budget = int(budget) * self.rerank
+        eff_mode = str(search_mode or self.search_mode).lower().strip()
+
+        if eff_mode == "tree":
+            sel_flat = self._select_tree_buckets(
+                cents, toks, q, stage1_token_budget=stage1_budget, upto=upto, dist_alpha_over_tau=dist_alpha_over_tau
+            )
+        else:
+            scores = torch.einsum("bcd,d->bc", cents, q)
+            if dist_alpha_over_tau > 0.0:
+                q_pos = float(upto - 1)
+                blk_centers = self.mid_start + (torch.arange(limit, device=dev, dtype=torch.float32) + 0.5) * float(self.n_cluster)
+                blk_pen = float(dist_alpha_over_tau) * torch.log1p((q_pos - blk_centers).clamp(min=0.0) / max(1.0, float(self.window)))
+                scores = scores - blk_pen.unsqueeze(1)
+            scores = scores.masked_fill(toks == 0, float("-inf"))
+            flat_s, flat_i = scores.reshape(-1).sort(descending=True)
+            flat_t = toks.reshape(-1)[flat_i]
+            csum = torch.cumsum(flat_t, dim=0)
+            take = (csum - flat_t) < stage1_budget  # include a bucket while the (stage-1) budget is not yet exhausted
+            take &= torch.isfinite(flat_s)
+            sel_flat = flat_i[take]
+
         sel_mask = torch.zeros(limit * self.pools_per_block, dtype=torch.bool, device=dev)
         sel_mask[sel_flat] = True
         sel_mask = sel_mask.view(limit, self.pools_per_block)  # [B, C]
@@ -293,13 +534,21 @@ class PagedLatentIndex:
         pool_ids = torch.nonzero(pool_sel)  # [M, 2]
         base = self.mid_start + pool_ids[:, 0] * self.n_cluster + pool_ids[:, 1] * self.n_pool
         mid = (base.unsqueeze(1) + torch.arange(self.n_pool, device=dev).unsqueeze(0)).reshape(-1)
-        if self.rerank > 1 and mid.numel() > int(budget) and self.k_idx_n is not None:
-            tok_scores = self.k_idx_n.to(dev)[mid] @ q  # stage 2: token-level scores of the candidates only
-            if dist_alpha_over_tau > 0.0:
-                q_pos = float(upto - 1)
-                tok_pen = float(dist_alpha_over_tau) * torch.log1p((q_pos - mid.float()).clamp(min=0.0) / max(1.0, float(self.window)))
-                tok_scores = tok_scores - tok_pen
-            mid = mid[tok_scores.topk(int(budget)).indices]
+        if self.rerank > 1 and mid.numel() > int(budget):
+            cand_k_lat: Optional[torch.Tensor] = None
+            if candidate_key_fn is not None:
+                cand_k_lat = candidate_key_fn(mid).to(device=dev, dtype=q.dtype)
+            elif self.k_idx_n is not None:
+                # Fix §3.3: gather candidates on the source device first instead of copying full-history k_idx_n to `dev`
+                k_src = self.k_idx_n
+                cand_k_lat = k_src.index_select(0, mid.to(k_src.device)).to(device=dev, dtype=q.dtype)
+            if cand_k_lat is not None:
+                tok_scores = cand_k_lat @ q  # stage 2: token-level scores of the candidates only
+                if dist_alpha_over_tau > 0.0:
+                    q_pos = float(upto - 1)
+                    tok_pen = float(dist_alpha_over_tau) * torch.log1p((q_pos - mid.float()).clamp(min=0.0) / max(1.0, float(self.window)))
+                    tok_scores = tok_scores - tok_pen
+                mid = mid[tok_scores.topk(int(budget)).indices]
         return torch.cat([sink, mid, tail]).unique()  # `unique` sorts ascending
 
 
@@ -316,11 +565,17 @@ class FaithfulDLSAIndexer(nn.Module):
     def __init__(self, n_kv: int = 4, head_dim: int = 256, rope_dim: int = 64, d_idx: int = 64, rope_first: bool = True,
                  n_sink: int = 4, n_pool: int = 4, n_cluster: int = 512, avg_bucket_size: int = 8, max_bucket_size: int = 16,
                  window: int = 512, k_long_range: int = 2048, rerank: int = 1,
-                 selection_reuse_steps: int = 1, reuse_cos_threshold: float = 0.92):
+                 selection_reuse_steps: int = 1, reuse_cos_threshold: float = 0.92,
+                 search_mode: str = "flat", branching_factor: int = 16, beam_width: int = 32,
+                 persistent_token_latents: Optional[bool] = None):
         super().__init__()
         self.rerank = max(1, int(rerank))
         self.selection_reuse_steps = max(1, int(selection_reuse_steps))
         self.reuse_cos_threshold = float(reuse_cos_threshold)
+        self.search_mode = str(search_mode).lower().strip()
+        self.branching_factor = max(2, int(branching_factor))
+        self.beam_width = max(4, int(beam_width))
+        self.persistent_token_latents = persistent_token_latents
         self.n_kv, self.head_dim, self.rope_dim, self.d_idx, self.rope_first = n_kv, head_dim, rope_dim, d_idx, rope_first
         self.n_sink, self.n_pool, self.n_cluster = n_sink, n_pool, n_cluster
         self.avg_bucket_size, self.max_bucket_size, self.window, self.k_long_range = avg_bucket_size, max_bucket_size, window, k_long_range
@@ -332,6 +587,7 @@ class FaithfulDLSAIndexer(nn.Module):
         self.raw_dist_alpha = nn.Parameter(torch.tensor(-6.0))
         nn.init.orthogonal_(self.w_k.weight)
         self.w_q.weight.data.copy_(self.w_k.weight.data)
+        self._visit_state_slots: Dict[Any, Dict[str, Any]] = {}
 
     def dist_alpha(self) -> torch.Tensor:
         """Non-negative query-time log-distance decay weight `alpha >= 0` (exactly `0.0` at init `-6.0`)."""
@@ -373,11 +629,27 @@ class FaithfulDLSAIndexer(nn.Module):
     def build_index(self, k: torch.Tensor) -> PagedLatentIndex:
         """`k`: [H_kv, T, D] -> index over this layer's keys."""
         _, k_in = self.inputs(_dummy_q(k), k)
-        return PagedLatentIndex(self.project_k(k_in), self.n_sink, self.n_pool, self.n_cluster, self.avg_bucket_size,
-                                self.max_bucket_size, self.window, self.rerank)
+        return PagedLatentIndex(
+            self.project_k(k_in),
+            self.n_sink,
+            self.n_pool,
+            self.n_cluster,
+            self.avg_bucket_size,
+            self.max_bucket_size,
+            self.window,
+            self.rerank,
+            search_mode=self.search_mode,
+            branching_factor=self.branching_factor,
+            beam_width=self.beam_width,
+            persistent_token_latents=self.persistent_token_latents,
+        )
 
-    def reset_decode_cache(self) -> None:
-        """Clear cached decode `PagedLatentIndex` and step-to-step selection reuse state."""
+    def reset_decode_cache(self, visit_key: Any = None) -> None:
+        """Clear cached decode `PagedLatentIndex` and step-to-step selection reuse state (for `visit_key` or all visits)."""
+        if visit_key is not None and hasattr(self, "_visit_state_slots"):
+            self._visit_state_slots.pop(visit_key, None)
+            return
+        self._visit_state_slots = {}
         self._cached_index: Optional[PagedLatentIndex] = None
         self._cached_k_idx: Optional[torch.Tensor] = None
         self._cached_sig: Optional[Tuple[Any, ...]] = None
@@ -389,67 +661,124 @@ class FaithfulDLSAIndexer(nn.Module):
         self.decode_cache_misses: int = 0
         self.selection_reuse_hits: int = 0
 
+    def _get_slot(self, visit_key: Any = None, state_slot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        if state_slot is not None:
+            return state_slot
+        if not hasattr(self, "_visit_state_slots") or self._visit_state_slots is None:
+            self._visit_state_slots = {}
+        key = "__default__" if visit_key is None else visit_key
+        if key not in self._visit_state_slots:
+            self._visit_state_slots[key] = {}
+        return self._visit_state_slots[key]
+
     @staticmethod
     def _prefix_signature(k0: torch.Tensor, check_len: int) -> Tuple[Any, ...]:
-        p0 = float(k0[0, 0, 0].item()) if check_len > 0 else 0.0
-        pm = float(k0[0, check_len // 2, 0].item()) if check_len > 1 else 0.0
-        pe = float(k0[0, check_len - 1, -1].item()) if check_len > 0 else 0.0
-        return (int(k0.shape[0]), int(k0.shape[2]), round(p0, 5), round(pm, 5), round(pe, 5))
+        if check_len <= 0:
+            return (int(k0.shape[0]), int(k0.shape[2]), 0)
+        # Deterministic strided digest over 8 anchor positions along `check_len`
+        pts = sorted({0, check_len // 4, check_len // 2, (3 * check_len) // 4, check_len - 1})
+        vals = tuple(round(float(k0[0, p, p % int(k0.shape[2])].item()), 5) for p in pts)
+        return (int(k0.shape[0]), int(k0.shape[2]), int(check_len), vals)
 
     @torch.no_grad()
-    def get_or_update_index(self, k0: torch.Tensor) -> PagedLatentIndex:
+    def get_or_update_index(
+        self,
+        k0: torch.Tensor,
+        visit_key: Any = None,
+        state_slot: Optional[Dict[str, Any]] = None,
+    ) -> PagedLatentIndex:
         """Return a `PagedLatentIndex` for `k0` `[H_kv, T, D]`, incrementally projecting & Ward-clustering only new keys when
-        `k0` extends the previously indexed sequence."""
+        `k0` extends the previously indexed sequence for this specific `(visit_key, state_slot)`."""
         t = int(k0.shape[1])
-        idx = getattr(self, "_cached_index", None)
-        k_idx_prev = getattr(self, "_cached_k_idx", None)
-        sig_prev = getattr(self, "_cached_sig", None)
-        if idx is not None and k_idx_prev is not None and idx.t <= t and sig_prev is not None:
+        slot = self._get_slot(visit_key=visit_key, state_slot=state_slot)
+        idx: Optional[PagedLatentIndex] = slot.get("index")
+        if idx is None and visit_key is None and state_slot is None:
+            idx = getattr(self, "_cached_index", None)
+        sig_prev = slot.get("sig", getattr(self, "_cached_sig", None) if (visit_key is None and state_slot is None) else None)
+
+        if idx is not None and idx.t <= t and sig_prev is not None:
             if self._prefix_signature(k0, idx.t) == sig_prev:
                 if t > idx.t:
-                    _, k_in_new = self.inputs(_dummy_q(k0[:, idx.t:t]), k0[:, idx.t:t])
-                    k_idx_new = self.project_k(k_in_new)
-                    k_idx_full = torch.cat([k_idx_prev, k_idx_new.to(k_idx_prev.device)], dim=0)
-                    idx.extend_to(k_idx_full)
-                    self._cached_k_idx = k_idx_full
-                    self._cached_sig = self._prefix_signature(k0, t)
+                    # Only project the unclustered tail + new keys `[idx.clustered_end : t)` — no full-prefix k_idx copy!
+                    tail_start = idx.clustered_end
+                    _, k_in_tail = self.inputs(_dummy_q(k0[:, tail_start:t]), k0[:, tail_start:t])
+                    k_idx_tail = self.project_k(k_in_tail)
+                    if idx.persistent_token_latents and idx.k_idx_n is not None:
+                        _, k_in_new = self.inputs(_dummy_q(k0[:, idx.t:t]), k0[:, idx.t:t])
+                        k_idx_new = self.project_k(k_in_new)
+                        idx._k_idx_pages.append(F.normalize(k_idx_new.float(), dim=-1, eps=1e-6))
+                    idx.t = t
+                    idx._cluster_new_blocks_from_slice(F.normalize(k_idx_tail.float(), dim=-1, eps=1e-6))
+                    sig_prev = self._prefix_signature(k0, t)
+                    slot["sig"] = sig_prev
+                    if visit_key is None and state_slot is None:
+                        self._cached_sig = sig_prev
                 self.decode_cache_hits = int(getattr(self, "decode_cache_hits", 0)) + 1
+                slot["hits"] = int(slot.get("hits", 0)) + 1
                 return idx
+
         _, k_in = self.inputs(_dummy_q(k0), k0)
         k_idx_full = self.project_k(k_in)
-        idx = PagedLatentIndex(k_idx_full, self.n_sink, self.n_pool, self.n_cluster, self.avg_bucket_size,
-                               self.max_bucket_size, self.window, self.rerank)
-        self._cached_index = idx
-        self._cached_k_idx = k_idx_full
-        self._cached_sig = self._prefix_signature(k0, t)
+        idx = PagedLatentIndex(
+            k_idx_full,
+            self.n_sink,
+            self.n_pool,
+            self.n_cluster,
+            self.avg_bucket_size,
+            self.max_bucket_size,
+            self.window,
+            self.rerank,
+            search_mode=self.search_mode,
+            branching_factor=self.branching_factor,
+            beam_width=self.beam_width,
+            persistent_token_latents=self.persistent_token_latents,
+        )
+        sig_now = self._prefix_signature(k0, t)
+        slot["index"] = idx
+        slot["sig"] = sig_now
+        slot["misses"] = int(slot.get("misses", 0)) + 1
+        if visit_key is None and state_slot is None:
+            self._cached_index = idx
+            self._cached_k_idx = k_idx_full if idx.persistent_token_latents else None
+            self._cached_sig = sig_now
         self.decode_cache_misses = int(getattr(self, "decode_cache_misses", 0)) + 1
         return idx
 
     @torch.no_grad()
-    def select_key_indices(self, query: torch.Tensor, key: torch.Tensor, k_budget: Optional[int] = None,
-                           use_cache: bool = True) -> torch.Tensor:
+    def select_key_indices(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        k_budget: Optional[int] = None,
+        use_cache: bool = True,
+        visit_key: Any = None,
+        state_slot: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
         """API-compatible with `LatentSparseAttentionIndexer.select_key_indices`: `query` [1, H_q, T_q, D], `key`
-        [1, H_kv, T_k, D] -> exact key positions shared by all heads (decode / <=64 queries; mean of the query index vectors).
+        [1, H_kv, T_k, D] -> exact key positions shared by all heads.
 
-        When `use_cache=True` (default), reuses and incrementally extends the cached `PagedLatentIndex` across decode steps.
-        When `self.selection_reuse_steps > 1` (default 1 = off), consecutive single-token decode steps whose query latent has
-        cosine similarity >= `self.reuse_cos_threshold` (default 0.92) reuse the middle-region bucket selection.
+        State is isolated by `(visit_key, state_slot)` so recurrent visits to the same physical layer never collide.
         """
         assert query.shape[0] == 1 and key.shape[0] == 1
         budget = int(k_budget or self.k_long_range)
         t = key.shape[2]
         if t <= self.n_sink + self.window + budget:
             return torch.arange(t, device=key.device)
-        idx = self.get_or_update_index(key[0]) if use_cache else self.build_index(key[0])
+        slot = self._get_slot(visit_key=visit_key, state_slot=state_slot)
+        idx = (
+            self.get_or_update_index(key[0], visit_key=visit_key, state_slot=slot)
+            if use_cache
+            else self.build_index(key[0])
+        )
         q_in, _ = self.inputs(query[0], key[0][:, :1])
         q_proj = self.project_q(q_in)
         q_vec = F.normalize(q_proj.float().reshape(-1, q_proj.shape[-1]).mean(dim=0), dim=-1, eps=1e-6)
         reuse_steps = int(getattr(self, "selection_reuse_steps", 1) or 1)
         reuse_thr = float(getattr(self, "reuse_cos_threshold", 0.92) or 0.92)
-        last_q = getattr(self, "_last_q_vec", None)
-        last_mid = getattr(self, "_last_mid_sel", None)
-        last_ce = int(getattr(self, "_last_clustered_end", -1))
-        age = int(getattr(self, "_reuse_age", 0))
+        last_q = slot.get("last_q_vec", getattr(self, "_last_q_vec", None) if (visit_key is None and state_slot is None) else None)
+        last_mid = slot.get("last_mid_sel", getattr(self, "_last_mid_sel", None) if (visit_key is None and state_slot is None) else None)
+        last_ce = int(slot.get("last_clustered_end", getattr(self, "_last_clustered_end", -1) if (visit_key is None and state_slot is None) else -1))
+        age = int(slot.get("reuse_age", getattr(self, "_reuse_age", 0) if (visit_key is None and state_slot is None) else 0))
         if (
             use_cache
             and reuse_steps > 1
@@ -460,18 +789,38 @@ class FaithfulDLSAIndexer(nn.Module):
             and age + 1 < reuse_steps
             and float(torch.dot(q_vec, last_q.to(q_vec.device)).item()) >= reuse_thr
         ):
-            self._reuse_age = age + 1
+            slot["reuse_age"] = age + 1
+            if visit_key is None and state_slot is None:
+                self._reuse_age = age + 1
             self.selection_reuse_hits = int(getattr(self, "selection_reuse_hits", 0)) + 1
             sink = torch.arange(0, min(self.n_sink, t), device=key.device)
             tail = torch.arange(idx.clustered_end, t, device=key.device)
             return torch.cat([sink, last_mid.to(key.device), tail]).unique()
-        sel = idx.select(q_proj, budget, upto=t, dist_alpha_over_tau=self.dist_alpha_over_tau()).to(key.device)
+
+        def _cand_key_fn(mid_indices: torch.Tensor) -> torch.Tensor:
+            k_cand = key[0].index_select(1, mid_indices.to(key.device))
+            _, k_in_c = self.inputs(_dummy_q(k_cand), k_cand)
+            return self.project_k(k_in_c)
+
+        sel = idx.select(
+            q_proj,
+            budget,
+            upto=t,
+            dist_alpha_over_tau=self.dist_alpha_over_tau(),
+            search_mode=self.search_mode,
+            candidate_key_fn=_cand_key_fn if not idx.persistent_token_latents else None,
+        ).to(key.device)
         if use_cache and reuse_steps > 1 and query.shape[2] == 1:
             mid_mask = (sel >= self.n_sink) & (sel < idx.clustered_end)
-            self._last_q_vec = q_vec.detach()
-            self._last_mid_sel = sel[mid_mask].detach()
-            self._last_clustered_end = idx.clustered_end
-            self._reuse_age = 0
+            slot["last_q_vec"] = q_vec.detach()
+            slot["last_mid_sel"] = sel[mid_mask].detach()
+            slot["last_clustered_end"] = idx.clustered_end
+            slot["reuse_age"] = 0
+            if visit_key is None and state_slot is None:
+                self._last_q_vec = q_vec.detach()
+                self._last_mid_sel = sel[mid_mask].detach()
+                self._last_clustered_end = idx.clustered_end
+                self._reuse_age = 0
         return sel
 
     # ---- distillation
@@ -852,3 +1201,357 @@ def evaluate_selectors(
     out["mean_long_keys"] = (sum(n_long_list) / len(n_long_list)) if n_long_list else None
     out["budget"] = budget
     return out
+
+
+# ======================================================================================
+# Loop72 Visit Schedule, Explicit State Key & 18-Visit D-LSA Index Bank (§5.1–§5.2, P2)
+# ======================================================================================
+GLOBAL_PHYSICAL_LAYERS: Tuple[int, ...] = (3, 7, 11, 15, 19, 23, 27, 31, 35)
+
+
+def build_loop72_visit_schedule(
+    start: int = 4,
+    end: int = 28,
+    passes: int = 2,
+    enable_p3: bool = True,
+    p3_start: int = 12,
+    p3_end: int = 24,
+    n_layers: int = 36,
+    global_layers: Sequence[int] = GLOBAL_PHYSICAL_LAYERS,
+) -> List[Dict[str, Any]]:
+    """Build the 72-visit execution schedule table (`virtual_visit`, `physical_layer`, `pass_idx`, `is_global`,
+    `layer_visit_ordinal`, `global_visit_id`)."""
+    global_set = {int(x) for x in global_layers}
+    segments: List[Tuple[int, int, int, str]] = [(0, start, 0, "prelude")]
+    for p in range(passes):
+        segments.append((start, end, p, f"core_p{p + 1}"))
+    if enable_p3 and passes >= 2:
+        segments.append((p3_start, p3_end, 2, "inner_p3"))
+    segments.append((end, n_layers, 0, "coda"))
+
+    schedule: List[Dict[str, Any]] = []
+    visit_counts: Dict[int, int] = {}
+    v_idx = 0
+    g_id = 0
+    for s_lo, s_hi, pass_idx, seg_name in segments:
+        for l_idx in range(s_lo, s_hi):
+            ord_i = visit_counts.get(l_idx, 0)
+            visit_counts[l_idx] = ord_i + 1
+            is_g = l_idx in global_set
+            cur_g_id = g_id if is_g else None
+            if is_g:
+                g_id += 1
+            schedule.append(
+                {
+                    "virtual_visit": v_idx,
+                    "physical_layer": l_idx,
+                    "pass_idx": pass_idx,
+                    "segment": seg_name,
+                    "is_global": is_g,
+                    "layer_visit_ordinal": ord_i,
+                    "global_visit_id": cur_g_id,
+                }
+            )
+            v_idx += 1
+    return schedule
+
+
+LOOP72_VISIT_SCHEDULE: List[Dict[str, Any]] = build_loop72_visit_schedule()
+LOOP72_GLOBAL_VISIT_SCHEDULE: List[Dict[str, Any]] = [
+    dict(row) for row in LOOP72_VISIT_SCHEDULE if row["is_global"]
+]
+
+
+class VisitStateKey:
+    """Immutable 7-tuple state key for per-visit cache and index ownership (§5.2):
+    `(model_revision, behavior_fingerprint, projection_revision, session_id, memory_epoch, physical_layer, virtual_visit)`."""
+
+    __slots__ = (
+        "model_revision",
+        "behavior_fingerprint",
+        "projection_revision",
+        "session_id",
+        "memory_epoch",
+        "physical_layer",
+        "virtual_visit",
+    )
+
+    def __init__(
+        self,
+        model_revision: str = "XHToken/Spark-X2.6-4B",
+        behavior_fingerprint: str = "native_gelu_loop72",
+        projection_revision: str = "v1",
+        session_id: str = "default",
+        memory_epoch: int = 0,
+        physical_layer: int = 3,
+        virtual_visit: int = 3,
+    ) -> None:
+        self.model_revision = str(model_revision)
+        self.behavior_fingerprint = str(behavior_fingerprint)
+        self.projection_revision = str(projection_revision)
+        self.session_id = str(session_id)
+        self.memory_epoch = int(memory_epoch)
+        self.physical_layer = int(physical_layer)
+        self.virtual_visit = int(virtual_visit)
+
+    def as_tuple(self) -> Tuple[str, str, str, str, int, int, int]:
+        return (
+            self.model_revision,
+            self.behavior_fingerprint,
+            self.projection_revision,
+            self.session_id,
+            self.memory_epoch,
+            self.physical_layer,
+            self.virtual_visit,
+        )
+
+    def __hash__(self) -> int:
+        return hash(self.as_tuple())
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, VisitStateKey):
+            return self.as_tuple() == other.as_tuple()
+        if isinstance(other, tuple) and len(other) == 7:
+            return self.as_tuple() == other
+        return False
+
+    def __repr__(self) -> str:
+        return f"VisitStateKey{self.as_tuple()}"
+
+
+class VisitAwareDLSAIndexBank(nn.Module):
+    """Per-global-visit D-LSA selector bank for Spark X2.6 4B Loop72 (`18` global visits, `1,769,472` map parameters).
+
+    When `maps_per_global_visit=True` (default per §5.1):
+      - Allocates 18 independent `FaithfulDLSAIndexer` modules (`18 * 2 * 768 * 64 = 1,769,472` projection weights),
+        indexed by `global_visit_id in [0..17]` (and mapped from `virtual_visit` or `(physical_layer, layer_visit_ordinal)`).
+    When `maps_per_global_visit=False` (ablation):
+      - Allocates 9 per-physical-layer `FaithfulDLSAIndexer` modules while still keeping mutable index state strictly
+        isolated per `virtual_visit`.
+    """
+
+    def __init__(
+        self,
+        maps_per_global_visit: bool = True,
+        n_kv: int = 4,
+        head_dim: int = 256,
+        rope_dim: int = 64,
+        d_idx: int = 64,
+        rope_first: bool = True,
+        n_sink: int = 4,
+        n_pool: int = 4,
+        n_cluster: int = 512,
+        avg_bucket_size: int = 8,
+        max_bucket_size: int = 16,
+        window: int = 512,
+        k_long_range: int = 4096,
+        rerank: int = 1,
+        search_mode: str = "flat",
+        branching_factor: int = 16,
+        beam_width: int = 32,
+        persistent_token_latents: bool = False,
+        per_visit_budget_overrides: Optional[Dict[Any, int]] = None,
+        visit_schedule: Optional[Sequence[Dict[str, Any]]] = None,
+        projection_revision: str = "loop72_dlsa_v1",
+    ) -> None:
+        super().__init__()
+        self.maps_per_global_visit = bool(maps_per_global_visit)
+        self.n_kv = int(n_kv)
+        self.head_dim = int(head_dim)
+        self.rope_dim = int(rope_dim)
+        self.d_idx = int(d_idx)
+        self.k_long_range = int(k_long_range)
+        self.search_mode = str(search_mode).lower().strip()
+        self.persistent_token_latents = bool(persistent_token_latents)
+        self.projection_revision = str(projection_revision)
+        self.schedule = list(visit_schedule) if visit_schedule is not None else list(LOOP72_VISIT_SCHEDULE)
+        self.global_schedule = [row for row in self.schedule if row["is_global"]]
+
+        self._vvisit_to_gvisit: Dict[int, int] = {}
+        self._layer_ord_to_gvisit: Dict[Tuple[int, int], int] = {}
+        self._gvisit_meta: Dict[int, Dict[str, Any]] = {}
+        for row in self.global_schedule:
+            gid = int(row["global_visit_id"])
+            vv = int(row["virtual_visit"])
+            pl = int(row["physical_layer"])
+            lo = int(row["layer_visit_ordinal"])
+            self._vvisit_to_gvisit[vv] = gid
+            self._layer_ord_to_gvisit[(pl, lo)] = gid
+            self._gvisit_meta[gid] = dict(row)
+
+        def _make_ix() -> FaithfulDLSAIndexer:
+            return FaithfulDLSAIndexer(
+                n_kv=n_kv,
+                head_dim=head_dim,
+                rope_dim=rope_dim,
+                d_idx=d_idx,
+                rope_first=rope_first,
+                n_sink=n_sink,
+                n_pool=n_pool,
+                n_cluster=n_cluster,
+                avg_bucket_size=avg_bucket_size,
+                max_bucket_size=max_bucket_size,
+                window=window,
+                k_long_range=k_long_range,
+                rerank=rerank,
+                search_mode=search_mode,
+                branching_factor=branching_factor,
+                beam_width=beam_width,
+                persistent_token_latents=persistent_token_latents,
+            )
+
+        if self.maps_per_global_visit:
+            self.indexers = nn.ModuleDict({str(gid): _make_ix() for gid in range(len(self.global_schedule))})
+        else:
+            unique_layers = sorted({int(r["physical_layer"]) for r in self.global_schedule})
+            self.indexers = nn.ModuleDict({str(l_idx): _make_ix() for l_idx in unique_layers})
+
+        self.per_visit_budget_overrides: Dict[int, int] = {}
+        if per_visit_budget_overrides:
+            for k, v in per_visit_budget_overrides.items():
+                self.set_visit_budget_override(k, int(v))
+
+    def resolve_global_visit_id(
+        self,
+        physical_layer: int,
+        virtual_visit: Optional[int] = None,
+        layer_visit_ordinal: int = 0,
+        global_visit_id: Optional[int] = None,
+    ) -> int:
+        if global_visit_id is not None:
+            return int(global_visit_id)
+        if virtual_visit is not None and int(virtual_visit) in self._vvisit_to_gvisit:
+            return self._vvisit_to_gvisit[int(virtual_visit)]
+        key = (int(physical_layer), int(layer_visit_ordinal))
+        if key in self._layer_ord_to_gvisit:
+            return self._layer_ord_to_gvisit[key]
+        # Fallback to first visit of `physical_layer`
+        return self._layer_ord_to_gvisit.get((int(physical_layer), 0), 0)
+
+    def get_indexer(
+        self,
+        physical_layer: int,
+        virtual_visit: Optional[int] = None,
+        layer_visit_ordinal: int = 0,
+        global_visit_id: Optional[int] = None,
+    ) -> FaithfulDLSAIndexer:
+        if self.maps_per_global_visit:
+            gid = self.resolve_global_visit_id(
+                physical_layer,
+                virtual_visit=virtual_visit,
+                layer_visit_ordinal=layer_visit_ordinal,
+                global_visit_id=global_visit_id,
+            )
+            return self.indexers[str(gid)]
+        return self.indexers[str(int(physical_layer))]
+
+    def set_visit_budget_override(self, visit_or_layer: Any, budget: int) -> None:
+        b = max(64, int(budget))
+        if isinstance(visit_or_layer, str) and visit_or_layer.startswith("g"):
+            gid = int(visit_or_layer[1:])
+            self.per_visit_budget_overrides[gid] = b
+            if self.maps_per_global_visit and str(gid) in self.indexers:
+                self.indexers[str(gid)].k_long_range = b
+            return
+        idx_val = int(visit_or_layer)
+        if idx_val in self._vvisit_to_gvisit:
+            gid = self._vvisit_to_gvisit[idx_val]
+            self.per_visit_budget_overrides[gid] = b
+            if self.maps_per_global_visit and str(gid) in self.indexers:
+                self.indexers[str(gid)].k_long_range = b
+        elif idx_val in self._gvisit_meta:
+            self.per_visit_budget_overrides[idx_val] = b
+            if self.maps_per_global_visit and str(idx_val) in self.indexers:
+                self.indexers[str(idx_val)].k_long_range = b
+        else:
+            # Physical layer override -> apply to all visits of that physical layer
+            for gid, meta in self._gvisit_meta.items():
+                if int(meta["physical_layer"]) == idx_val:
+                    self.per_visit_budget_overrides[gid] = b
+                    if self.maps_per_global_visit and str(gid) in self.indexers:
+                        self.indexers[str(gid)].k_long_range = b
+            if not self.maps_per_global_visit and str(idx_val) in self.indexers:
+                self.indexers[str(idx_val)].k_long_range = b
+
+    def get_visit_budget(
+        self,
+        physical_layer: int,
+        virtual_visit: Optional[int] = None,
+        layer_visit_ordinal: int = 0,
+        global_visit_id: Optional[int] = None,
+    ) -> int:
+        gid = self.resolve_global_visit_id(
+            physical_layer,
+            virtual_visit=virtual_visit,
+            layer_visit_ordinal=layer_visit_ordinal,
+            global_visit_id=global_visit_id,
+        )
+        if gid in self.per_visit_budget_overrides:
+            return int(self.per_visit_budget_overrides[gid])
+        ix = self.get_indexer(
+            physical_layer,
+            virtual_visit=virtual_visit,
+            layer_visit_ordinal=layer_visit_ordinal,
+            global_visit_id=gid,
+        )
+        return int(ix.k_long_range)
+
+    def reset_all_decode_caches(self) -> None:
+        for ix in self.indexers.values():
+            ix.reset_decode_cache()
+
+    def parameter_manifest(self) -> Dict[str, Any]:
+        map_params = sum(
+            ix.w_q.weight.numel() + ix.w_k.weight.numel()
+            for ix in self.indexers.values()
+        )
+        total_params = sum(p.numel() for p in self.parameters())
+        return {
+            "maps_per_global_visit": self.maps_per_global_visit,
+            "num_indexer_modules": len(self.indexers),
+            "global_visits": len(self.global_schedule),
+            "map_parameters": int(map_params),
+            "total_parameters": int(total_params),
+            "projection_revision": self.projection_revision,
+            "search_mode": self.search_mode,
+            "default_k_long_range": self.k_long_range,
+            "per_visit_budget_overrides": dict(self.per_visit_budget_overrides),
+        }
+
+    def export_manifest_state(self) -> Dict[str, Any]:
+        return {
+            "manifest": self.parameter_manifest(),
+            "global_schedule": self.global_schedule,
+            "state_dict": {k: v.detach().cpu() for k, v in self.state_dict().items()},
+        }
+
+    def load_from_legacy_or_visit_checkpoint(self, ckpt_data: Dict[str, Any], strict: bool = False) -> Dict[str, Any]:
+        """Load either an 18-visit `VisitAwareDLSAIndexBank` checkpoint or broadcast a 9-layer `LSA-F2` checkpoint
+        across each physical layer's visits."""
+        if "state_dict" in ckpt_data and isinstance(ckpt_data["state_dict"], dict):
+            sd = ckpt_data["state_dict"]
+            if any(k.startswith("indexers.") for k in sd.keys()):
+                self.load_state_dict(sd, strict=strict)
+                return {"mode": "visit_bank_state_dict", "loaded_modules": len(self.indexers)}
+        raw_layers = ckpt_data.get("indexers", ckpt_data)
+        loaded = 0
+        if self.maps_per_global_visit:
+            for gid, meta in self._gvisit_meta.items():
+                pl = int(meta["physical_layer"])
+                src_sd = (
+                    raw_layers.get(f"g{gid}")
+                    or raw_layers.get(str(gid))
+                    or raw_layers.get(pl)
+                    or raw_layers.get(str(pl))
+                )
+                if isinstance(src_sd, dict):
+                    self.indexers[str(gid)].load_state_dict(src_sd, strict=strict)
+                    loaded += 1
+        else:
+            for l_key, ix in self.indexers.items():
+                src_sd = raw_layers.get(int(l_key)) or raw_layers.get(str(l_key))
+                if isinstance(src_sd, dict):
+                    ix.load_state_dict(src_sd, strict=strict)
+                    loaded += 1
+        return {"mode": "broadcast_layer_indexers", "loaded_modules": loaded}
+

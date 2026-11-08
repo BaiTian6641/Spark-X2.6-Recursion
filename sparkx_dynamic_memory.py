@@ -403,6 +403,7 @@ class DynamicLatentMemoryGraph:
         self.ppr_weight = float(ppr_weight)
         self.superseded_discount = float(superseded_discount)
         self.n_super_topics = max(2, int(n_super_topics))
+        self.max_ward_buckets_per_block: int = 256
 
         self.nodes: Dict[int, BucketNodeState] = {}
         # Adjacency: adj[u][v] = edge weight (u -> v)
@@ -499,21 +500,64 @@ class DynamicLatentMemoryGraph:
 
     @torch.no_grad()
     def _rebuild_super_topics(self) -> None:
-        """2nd-level Ward clustering over active bucket centroids to form topic super-buckets."""
+        """Bounded 2nd-level Ward clustering over active bucket centroids to form topic super-buckets.
+
+        When `n_act > self.max_ward_buckets_per_block`, first partitions centroids in bounded blocks of at most
+        `max_ward_buckets_per_block` buckets and then clusters the resulting mid-level centroids, avoiding any
+        global O(B^2) distance matrix allocation across long sequences.
+        """
         active_gids = [g for g, st in self.nodes.items() if st.is_active]
         n_act = len(active_gids)
         if n_act < 4:
             return
-        cents = torch.stack([self.get_centroid(g) for g in active_gids], dim=0).unsqueeze(0)  # [1, N, D]
+        all_cents = torch.stack([self.get_centroid(g) for g in active_gids], dim=0)  # [N, D]
         target_b = max(2, min(self.n_super_topics, n_act // 2))
-        max_sz = max(2, (n_act * 2) // target_b)
-        labels = ward_partition(cents, target_buckets=target_b, max_pools_per_bucket=max_sz)[0]  # [N]
+        blk_cap = max(32, int(getattr(self, "max_ward_buckets_per_block", 256)))
+
+        if n_act <= blk_cap:
+            cents = all_cents.unsqueeze(0)  # [1, N, D]
+            max_sz = max(2, (n_act * 2) // target_b)
+            labels = ward_partition(cents, target_buckets=target_b, max_pools_per_bucket=max_sz)[0]
+        else:
+            mid_cents_list: List[torch.Tensor] = []
+            chunk_labels_list: List[torch.Tensor] = []
+            mid_offset = 0
+            sub_target = max(4, min(32, target_b * 2))
+            for start in range(0, n_act, blk_cap):
+                end = min(n_act, start + blk_cap)
+                sub_c = all_cents[start:end]
+                sub_n = int(sub_c.shape[0])
+                if sub_n < 4:
+                    for i in range(sub_n):
+                        mid_cents_list.append(F.normalize(sub_c[i], dim=-1, eps=1e-6))
+                    chunk_labels_list.append(torch.arange(mid_offset, mid_offset + sub_n, device=sub_c.device))
+                    mid_offset += sub_n
+                else:
+                    tb_sub = max(2, min(sub_target, sub_n // 2))
+                    ms_sub = max(2, (sub_n * 2) // tb_sub)
+                    lbl_sub = ward_partition(sub_c.unsqueeze(0), target_buckets=tb_sub, max_pools_per_bucket=ms_sub)[0]
+                    uniq_sub = lbl_sub.unique(sorted=True).tolist()
+                    remap_sub = {old: mid_offset + idx_u for idx_u, old in enumerate(uniq_sub)}
+                    for old in uniq_sub:
+                        m_sub = lbl_sub == old
+                        mid_cents_list.append(F.normalize(sub_c[m_sub].mean(dim=0), dim=-1, eps=1e-6))
+                    mapped_lbl = torch.tensor([remap_sub[int(x)] for x in lbl_sub.tolist()], device=sub_c.device, dtype=torch.long)
+                    chunk_labels_list.append(mapped_lbl)
+                    mid_offset += len(uniq_sub)
+            mid_cents = torch.stack(mid_cents_list, dim=0)  # [M, D]
+            chunk_labels = torch.cat(chunk_labels_list, dim=0)  # [N]
+            m_mid = int(mid_cents.shape[0])
+            tb_top = max(2, min(target_b, m_mid // 2))
+            ms_top = max(2, (m_mid * 2) // tb_top)
+            top_labels = ward_partition(mid_cents.unsqueeze(0), target_buckets=tb_top, max_pools_per_bucket=ms_top)[0]
+            labels = top_labels[chunk_labels]
+
         unique_lbls = labels.unique(sorted=True).tolist()
         remap = {old: i for i, old in enumerate(unique_lbls)}
         super_cents = []
         for old in unique_lbls:
             mask = labels == old
-            c_mean = F.normalize(cents[0, mask].mean(dim=0), dim=-1, eps=1e-6)
+            c_mean = F.normalize(all_cents[mask].mean(dim=0), dim=-1, eps=1e-6)
             super_cents.append(c_mean)
         self.super_centroids = torch.stack(super_cents, dim=0)
         for gid, lbl in zip(active_gids, labels.tolist()):
@@ -974,7 +1018,7 @@ class SleepConsolidationEngine:
 
     @torch.no_grad()
     def unlearn_entry(self, entry_id: int) -> bool:
-        """Exact one-step surgical unlearning of a consolidated batch via the ledger."""
+        """Exact one-step surgical unlearning of a consolidated batch via the ledger (restoring DLMG bucket visibility)."""
         if entry_id < 0 or entry_id >= len(self.ledger):
             return False
         entry = self.ledger[entry_id]
@@ -989,6 +1033,9 @@ class SleepConsolidationEngine:
             sims = protos @ rem.t()
             keep_mask = sims.max(dim=-1).values < 0.999
             self.vertical_memory.scope_prototypes = protos[keep_mask]
+        for gid in entry.compiled_bucket_gids:
+            if gid in self.dlmg.nodes:
+                self.dlmg.nodes[gid].compiled_and_evicted = False
         entry.unlearned = True
         return True
 

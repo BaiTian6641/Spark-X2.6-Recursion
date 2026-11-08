@@ -911,6 +911,9 @@ class EpisodicSideMemory(torch.nn.Module if HAS_TORCH else object):
         # Shard storage (dynamically allocated on demand so empty ESM uses minimal memory)
         self._shards: Dict[int, Dict[str, Any]] = {}
         self._general_basis: Optional[Any] = None  # [r, k_gen] shared or per-shard general basis
+        self.memory_epoch: int = 0
+        self.gpu_resident_budget_bytes: int = 128 * 1024 * 1024
+        self.persistent_shard_budget_bytes: int = 2 * (1024**3)
 
         if HAS_TORCH:
             self.route_proj = torch.nn.Linear(self.width, self.route_dim, bias=False, dtype=torch.float32)
@@ -1192,10 +1195,12 @@ class EpisodicSideMemory(torch.nn.Module if HAS_TORCH else object):
             saved_dw = [list(row) for row in dw]
 
         sh["num_writes"] = int(sh.get("num_writes", 0)) + 1
+        self.memory_epoch += 1
         delta_ref = {
             "shard_id": int(target_shard),
             "delta_w": saved_dw,
             "num_keys": int(n_keys),
+            "memory_epoch": int(self.memory_epoch),
         }
         return WriteReport(
             shard_id=int(target_shard),
@@ -1225,6 +1230,144 @@ class EpisodicSideMemory(torch.nn.Module if HAS_TORCH else object):
             if max_v < 1e-7:
                 sh["num_writes"] = 0
                 sh["centroids"] = []
+        self.memory_epoch += 1
+
+    def shard_storage_bytes(self) -> int:
+        """Return total byte footprint of allocated ESM shards (`u_gate`, `u_up`, `w_down`, `centroids`, `u_gen`, `u_past`)."""
+        total = 0
+        for sh in self._shards.values():
+            for key in ("u_gate", "u_up", "w_down", "centroids", "u_gen", "u_past"):
+                val = sh.get(key)
+                if val is None:
+                    continue
+                if HAS_TORCH and isinstance(val, torch.Tensor):
+                    total += int(val.numel() * val.element_size())
+                elif isinstance(val, list):
+                    rows = len(val)
+                    cols = len(val[0]) if (rows > 0 and isinstance(val[0], list)) else 1
+                    total += rows * cols * 4
+        return total
+
+    def _compute_shard_checksum(self, sh: Dict[str, Any]) -> str:
+        h = hashlib.sha256()
+        h.update(f"num_writes={sh.get('num_writes', 0)};tau={sh.get('tau', self.default_tau):.8f};".encode("utf-8"))
+        w = sh.get("w_down")
+        if HAS_TORCH and isinstance(w, torch.Tensor):
+            flat = w.detach().cpu().float().reshape(-1)
+            n = int(flat.numel())
+            step = max(1, n // 256)
+            samp = flat[::step].tolist()
+            h.update(",".join(f"{v:.7e}" for v in samp).encode("utf-8"))
+        elif isinstance(w, list):
+            flat_py = [float(v) for row in w for v in row]
+            step = max(1, len(flat_py) // 256)
+            samp = flat_py[::step]
+            h.update(",".join(f"{v:.7e}" for v in samp).encode("utf-8"))
+        return h.hexdigest()
+
+    def esm_state_dict(self) -> Dict[str, Any]:
+        """Serialize all ESM shards, routing projections, epochs, and SHA-256 payload checksums (Work Package P7)."""
+        shards_out: Dict[int, Dict[str, Any]] = {}
+        checksums: Dict[int, str] = {}
+        for s_id, sh in self._shards.items():
+            s_entry: Dict[str, Any] = {
+                "tau": float(sh.get("tau", self.default_tau)),
+                "num_writes": int(sh.get("num_writes", 0)),
+            }
+            for k in ("u_gate", "u_up", "w_down", "centroids", "u_gen", "u_past"):
+                v = sh.get(k)
+                if v is None:
+                    s_entry[k] = None
+                elif HAS_TORCH and isinstance(v, torch.Tensor):
+                    s_entry[k] = v.detach().cpu().clone()
+                elif isinstance(v, list):
+                    s_entry[k] = [list(row) if isinstance(row, list) else row for row in v]
+                else:
+                    s_entry[k] = v
+            checksum = self._compute_shard_checksum(s_entry)
+            s_entry["sha256"] = checksum
+            shards_out[int(s_id)] = s_entry
+            checksums[int(s_id)] = checksum
+
+        route_w = (
+            self.route_proj.weight.detach().cpu().clone()
+            if (HAS_TORCH and hasattr(self, "route_proj"))
+            else None
+        )
+        gen_b = (
+            self._general_basis.detach().cpu().clone()
+            if (HAS_TORCH and isinstance(self._general_basis, torch.Tensor))
+            else ([list(row) for row in self._general_basis] if isinstance(self._general_basis, list) else None)
+        )
+        return {
+            "format_version": "esm_v1",
+            "width": int(self.width),
+            "r": int(self.r),
+            "route_dim": int(self.route_dim),
+            "max_shards": int(self.max_shards),
+            "gate_T": float(self.gate_T),
+            "default_tau": float(self.default_tau),
+            "memory_epoch": int(self.memory_epoch),
+            "gpu_resident_budget_bytes": int(self.gpu_resident_budget_bytes),
+            "persistent_shard_budget_bytes": int(self.persistent_shard_budget_bytes),
+            "use_torch": bool(self._use_torch),
+            "route_proj_weight": route_w,
+            "py_route_proj": [list(row) for row in self._py_route_proj],
+            "general_basis": gen_b,
+            "shards": shards_out,
+            "checksums": checksums,
+        }
+
+    def load_esm_state_dict(self, state: Dict[str, Any], verify_checksum: bool = True) -> Dict[str, Any]:
+        """Restore ESM shards, routing projections, and epoch from `esm_state_dict()`, verifying SHA-256 checksums."""
+        if not isinstance(state, dict):
+            raise ValueError("ESM state must be a dictionary.")
+        self.memory_epoch = int(state.get("memory_epoch", self.memory_epoch))
+        self.gpu_resident_budget_bytes = int(state.get("gpu_resident_budget_bytes", self.gpu_resident_budget_bytes))
+        self.persistent_shard_budget_bytes = int(state.get("persistent_shard_budget_bytes", self.persistent_shard_budget_bytes))
+        if "py_route_proj" in state and state["py_route_proj"] is not None:
+            self._py_route_proj = [list(row) for row in state["py_route_proj"]]
+        dev = self.route_proj.weight.device if (HAS_TORCH and hasattr(self, "route_proj")) else None
+        if HAS_TORCH and hasattr(self, "route_proj") and isinstance(state.get("route_proj_weight"), torch.Tensor):
+            self.route_proj.weight.data.copy_(state["route_proj_weight"].to(device=dev, dtype=self.route_proj.weight.dtype))
+        gb = state.get("general_basis")
+        if gb is not None:
+            if HAS_TORCH and isinstance(gb, torch.Tensor) and dev is not None:
+                self._general_basis = gb.to(device=dev, dtype=torch.float32).clone()
+            elif isinstance(gb, list):
+                self._general_basis = [list(row) for row in gb]
+
+        self._shards.clear()
+        shards_in = state.get("shards", {})
+        verified = 0
+        for raw_sid, sh_in in shards_in.items():
+            s_id = int(raw_sid)
+            expected_sha = sh_in.get("sha256") or state.get("checksums", {}).get(s_id)
+            actual_sha = self._compute_shard_checksum(sh_in)
+            if verify_checksum and expected_sha is not None and actual_sha != expected_sha:
+                raise ValueError(f"ESM shard {s_id} checksum mismatch: expected {expected_sha}, got {actual_sha}")
+            restored: Dict[str, Any] = {
+                "tau": float(sh_in.get("tau", self.default_tau)),
+                "num_writes": int(sh_in.get("num_writes", 0)),
+            }
+            for k in ("u_gate", "u_up", "w_down", "centroids", "u_gen", "u_past"):
+                v = sh_in.get(k)
+                if v is None:
+                    restored[k] = None
+                elif HAS_TORCH and isinstance(v, torch.Tensor):
+                    restored[k] = v.to(device=dev, dtype=torch.float32).clone() if dev is not None else v.clone()
+                elif isinstance(v, list):
+                    restored[k] = [list(row) if isinstance(row, list) else row for row in v]
+                    self._use_torch = False
+                else:
+                    restored[k] = v
+            self._shards[s_id] = restored
+            verified += 1
+        return {
+            "shards_restored": verified,
+            "memory_epoch": int(self.memory_epoch),
+            "storage_bytes": self.shard_storage_bytes(),
+        }
 
     def forward(self, h: Any, use_gate: bool = True) -> Any:
         """Return `Delta h_ESM(h)`; returns exact `0.0` tensor/list when no writes have been committed."""

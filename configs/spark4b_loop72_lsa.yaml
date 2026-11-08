@@ -1,0 +1,73 @@
+model:
+  base: XHToken/Spark-X2.6-4B
+  revision: PIN_AT_BASELINE_CREATION
+  runtime_identity: native_gelu_loop72
+  preserve_native_activation: true
+
+loop:
+  start: 4
+  end_exclusive: 28
+  passes: 2
+  enable_p3: true
+  p3_start: 12
+  p3_end_exclusive: 24
+  expected_visits: 72
+  global_visits: 18
+  local_visits: 54
+  share_kv_across_visits: false
+
+engram:
+  construct: false
+  train: false
+  load: false
+
+attention:
+  implementation: spark_dlsa_paged
+  index_dim: 64
+  maps_per_global_visit: true
+  search: flat                 # tree only after matched-budget validation
+  pool_size: 4
+  cluster_block_tokens: 512
+  average_bucket_tokens: 8
+  max_bucket_tokens: 16
+  sinks: 4
+  recent_tokens: 512
+  long_range_tokens: 4096
+  per_visit_budget_overrides: {}
+  selection_reuse: false
+  residual_compensation: false
+  graph_expansion: false
+  unbounded_dense_fallback: false
+
+cache:
+  local_window: 512
+  global_hot_tokens_per_visit: 8192
+  kv_page_tokens: 64           # benchmark physical page amplification
+  archive: cpu_then_nvme
+  cold_codec: bf16             # 8/4-bit enabled after separate quality gates
+  index_gpu_budget_bytes: 2147483648
+  persistent_token_latents: false
+  logical_positions: absolute
+  context_limit_tokens: 131072 # increase only after each length gate
+
+prefill:
+  hidden_chunk_tokens: 2048
+  sparse_query_tile_tokens: 16
+  bounded_workspace: true
+  generation_logits: last_position
+  full_prefix_masks: false
+
+memory:
+  m3_enabled: true             # release requires P7; off in attention controls
+  read_policy: first_visit
+  write_policy: committed_episode
+  persistent_shard_budget_bytes: 1073741824
+  gpu_resident_budget_bytes: 268435456
+  freeze_epoch_during_request: true
+  delete_raw_after_consolidation: false
+
+release:
+  target_total_context_tokens: 5000000
+  generation_positions_reserved: true
+  batch_size: 1
+  require_measured_memory_ledger: true
