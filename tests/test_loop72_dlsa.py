@@ -558,6 +558,142 @@ class TestLoop72BenchmarkSuiteAndNotebook(unittest.TestCase):
             src = "".join(cell.get("source", []))
             ast.parse(src, filename=f"SparkX_Loop72_DLSA_Benchmark_Colab.ipynb#cell_{idx}")
 
+    def test_hf_row_conversion_and_real_verifiers(self):
+        from sparkx_loop72_dlsa_benchmarks import (
+            SIGNIFICANT_BENCHMARK_SUITE,
+            convert_hf_row_to_eval_task,
+            score_aa_omniscience_v11,
+            verify_bfcl_tool_call,
+            verify_ifeval_constraints,
+            verify_math_answer,
+            verify_mcq_choice,
+            verify_swe_patch_in_sandbox,
+        )
+
+        # 1. AIME 2026 (`MathArena/aime_2026` schema)
+        aime_task = convert_hf_row_to_eval_task(
+            "AIME 2026",
+            {"problem_idx": 1, "problem": "Find the remainder when 2^10 is divided by 1000.", "answer": "24"},
+            row_idx=0,
+        )
+        self.assertIsNotNone(aime_task)
+        self.assertEqual(aime_task["source"], "hf_real")
+        self.assertEqual(aime_task["verifier"], "math")
+        self.assertTrue(verify_math_answer("\\boxed{24}", aime_task["gold"]).ok)
+
+        # 2. IMO-AnswerBench (`Hwilner/imo-answerbench` schema)
+        imo_task = convert_hf_row_to_eval_task(
+            "IMO-AnswerBench",
+            {"Problem ID": "alg-01", "Problem": "Solve for x: 3x = 27.", "Short Answer": "$9$"},
+            row_idx=0,
+        )
+        self.assertIsNotNone(imo_task)
+        self.assertEqual(imo_task["gold"], "9")
+        self.assertTrue(verify_math_answer("\\boxed{9}", imo_task["gold"]).ok)
+
+        # 3. LongBench v2 (`zai-org/LongBench-v2` schema)
+        lb_task = convert_hf_row_to_eval_task(
+            "LongBench v2",
+            {
+                "context": "Spark-X2.6-4B uses 18 global attention visits across 72 virtual layers.",
+                "question": "How many global attention visits does Spark-X2.6-4B use in Loop72?",
+                "choice_A": "9",
+                "choice_B": "18",
+                "choice_C": "36",
+                "choice_D": "72",
+                "answer": "B",
+            },
+            row_idx=0,
+        )
+        self.assertIsNotNone(lb_task)
+        self.assertEqual(lb_task["verifier"], "mcq")
+        self.assertTrue(verify_mcq_choice("<think>It uses 18 visits.</think>\\boxed{B}", lb_task["mcq_spec"]).ok)
+
+        # 4. GPQA Diamond (`Idavidrein/gpqa` schema)
+        gpqa_task = convert_hf_row_to_eval_task(
+            "GPQA Diamond",
+            {
+                "Question": "What is the proton threshold energy factor?",
+                "Correct Answer": "7 m_p c^2",
+                "Incorrect Answer 1": "3 m_p c^2",
+                "Incorrect Answer 2": "5 m_p c^2",
+                "Incorrect Answer 3": "9 m_p c^2",
+            },
+            row_idx=1,
+        )
+        self.assertIsNotNone(gpqa_task)
+        gold_ltr = gpqa_task["mcq_spec"]["gold_letter"]
+        self.assertTrue(verify_mcq_choice(f"Final Answer: \\boxed{{{gold_ltr}}}", gpqa_task["mcq_spec"]).ok)
+
+        # 5. IFEval (`google/IFEval` schema)
+        ifeval_task = convert_hf_row_to_eval_task(
+            "IFEval",
+            {
+                "key": 1001,
+                "prompt": "Write a short sentence about sparse attention without using any commas and include the word hypersphere.",
+                "instruction_id_list": ["punctuation:no_comma", "keywords:existence", "length_constraints:number_words"],
+                "kwargs": [{}, {"keywords": ["hypersphere"]}, {"relation": "at least", "num_words": 5}],
+            },
+            row_idx=0,
+        )
+        self.assertIsNotNone(ifeval_task)
+        if_res = verify_ifeval_constraints(
+            "Latent sparse attention projects queries onto a unit hypersphere cleanly.",
+            ifeval_task["ifeval_spec"],
+        )
+        self.assertTrue(if_res.ok, f"IFEval failed: {if_res.detail}")
+
+        # 6. BFCL-V4 (`gorilla-llm/Berkeley-Function-Calling-Leaderboard` schema + positional AST call)
+        bfcl_task = convert_hf_row_to_eval_task(
+            "BFCL-V4",
+            {
+                "id": "simple_0",
+                "question": [[{"role": "user", "content": "Calculate triangle area with base 10 and height 5."}]],
+                "function": [
+                    {
+                        "name": "calculate_triangle_area",
+                        "parameters": {
+                            "type": "dict",
+                            "properties": {"base": {"type": "integer"}, "height": {"type": "integer"}},
+                            "required": ["base", "height"],
+                        },
+                    }
+                ],
+                "ground_truth": [{"calculate_triangle_area": {"base": [10], "height": [5]}}],
+            },
+            row_idx=0,
+        )
+        self.assertIsNotNone(bfcl_task)
+        # Test positional Python AST call matching
+        pos_res = verify_bfcl_tool_call("```python\ncalculate_triangle_area(10, 5)\n```", bfcl_task["tool_spec"])
+        self.assertTrue(pos_res.ok, f"Positional AST tool call failed: {pos_res.detail}")
+
+        # 7. SWE Pro method-only patch (when model emits only `def access(self, page_id: int)` without `class HotPageLRU:`)
+        swe_pro_item = next(it for it in SIGNIFICANT_BENCHMARK_SUITE if it["id"] == "swe_pro_lru_page_eviction_bug")
+        method_only_patch = (
+            "```python\n"
+            "def access(self, page_id: int) -> list:\n"
+            "    if page_id in self.order:\n"
+            "        self.order.move_to_end(page_id)\n"
+            "    else:\n"
+            "        if len(self.order) >= self.capacity:\n"
+            "            self.order.popitem(last=False)\n"
+            "        self.order[page_id] = True\n"
+            "    return list(self.order.keys())\n"
+            "```"
+        )
+        swe_method_res = verify_swe_patch_in_sandbox(method_only_patch, swe_pro_item["swe_spec"])
+        self.assertTrue(swe_method_res.ok, f"Method-only SWE Pro patch failed: {swe_method_res.detail}")
+
+        # 8. AA-Omniscience v1.1 when prose mentions 'do not ABSTAIN' alongside the right boxed answer
+        omni_res = score_aa_omniscience_v11(
+            "Since the hidden size is known (do not ABSTAIN here), Final Answer: \\boxed{2560}",
+            "2560",
+            should_abstain=False,
+        )
+        self.assertTrue(omni_res["passed"])
+        self.assertEqual(omni_res["normalized_score"], 100.0)
+
 
 if __name__ == "__main__":
     unittest.main()
