@@ -171,6 +171,7 @@ def run_dataset(
     rows: Iterable[dict[str, Any]] | None = None,
     evaluator: Callable[..., dict[str, Any]] | None = None,
     converter: Callable[..., dict[str, Any] | None] | None = None,
+    verbose: bool | None = None,
 ) -> dict[str, Any]:
     """Evaluate every eligible row; ``limit`` always makes the run a subset.
 
@@ -182,10 +183,17 @@ def run_dataset(
     if max_new_tokens <= 0:
         raise ValueError("max_new_tokens must be positive")
     test_inputs = rows is not None or evaluator is not None or converter is not None
+    if verbose is None:
+        verbose = not test_inputs and hasattr(model, "generate_cached")
     if evaluator is None or converter is None:
         from sparkx_loop72_dlsa_benchmarks import evaluate_benchmark_task, convert_hf_row_to_eval_task
         evaluator = evaluator or evaluate_benchmark_task
         converter = converter or convert_hf_row_to_eval_task
+    import inspect as _inspect
+    try:
+        _eval_accepts_verbose = "verbose" in _inspect.signature(evaluator).parameters
+    except Exception:
+        _eval_accepts_verbose = False
     dest = Path(output_dir)
     dest.mkdir(parents=True, exist_ok=True)
     output = dest / f"{spec.name}.jsonl"
@@ -226,6 +234,14 @@ def run_dataset(
                 counts["attempted"] += 1
                 record: dict[str, Any] = {"row_index": index, "row_sha256": stable_digest(row),
                                           "source_id": row.get("_id", row.get("id"))}
+                row_t0 = time.perf_counter()
+                if verbose:
+                    print(
+                        f"  [{spec.name} | row #{counts['attempted']} (seen={counts['rows_seen']}, "
+                        f"excl={counts['excluded_by_declared_filter']}, id={record['source_id']})] "
+                        f"starting evaluation (max_new_tokens={max_new_tokens})...",
+                        flush=True,
+                    )
                 try:
                     task = converter(spec.benchmark_name, row, row_idx=index, task_mode="official")
                     if task is None:
@@ -238,8 +254,13 @@ def run_dataset(
                         task["benchmark_id"] = spec.name
                         task["official_spark_x26_score"] = None
                         task["official_comparable"] = False
-                        result = evaluator(model, tokenizer, task, max_new_tokens=max_new_tokens,
-                                           generation_options=options)
+                        eval_kwargs: dict[str, Any] = {
+                            "max_new_tokens": max_new_tokens,
+                            "generation_options": options,
+                        }
+                        if _eval_accepts_verbose and verbose:
+                            eval_kwargs["verbose"] = True
+                        result = evaluator(model, tokenizer, task, **eval_kwargs)
                     if result.get("score") is not None:
                         if result.get("status") != "completed":
                             raise ValueError("A numeric score requires status='completed'")
@@ -256,6 +277,25 @@ def run_dataset(
                 except Exception as exc:
                     counts["errors"] += 1
                     record.update(status="error", score=None, reason=f"{type(exc).__name__}: {exc}")
+                if verbose:
+                    row_dt = time.perf_counter() - row_t0
+                    timing = record.get("timing") or {}
+                    run_mean = (sum(scores) / len(scores)) if scores else None
+                    mean_str = f"{run_mean:.2f}" if run_mean is not None else "N/A"
+                    sc_val = record.get("score")
+                    sc_str = f"{float(sc_val):.2f}" if sc_val is not None else str(sc_val)
+                    p_tok = record.get("prompt_tokens", timing.get("prompt_tokens", "?"))
+                    g_tok = record.get("generated_tokens", timing.get("generated_tokens", "?"))
+                    dec_tps = float(timing.get("decode_tok_per_s", 0.0) or 0.0)
+                    ttft_ms = float(timing.get("ttft_ms", 0.0) or 0.0)
+                    reason_sfx = f" | reason={record.get('reason')}" if record.get("reason") else ""
+                    print(
+                        f"  [{spec.name} | row #{counts['attempted']} done] status={record.get('status')} | "
+                        f"score={sc_str} | running_mean={mean_str} (scored={counts['scored']}/{counts['attempted']}) | "
+                        f"prompt={p_tok} tok | gen={g_tok} tok | decode={dec_tps:.1f} tok/s | "
+                        f"TTFT={ttft_ms:.0f}ms | wall={row_dt:.2f}s{reason_sfx}",
+                        flush=True,
+                    )
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
                 handle.flush()
         except Exception as exc:
@@ -276,7 +316,7 @@ def run_dataset(
 
 def run_full_benchmarks(model: Any, tokenizer: Any, output_dir: str | Path,
                         suites: Iterable[str] | None = None, max_new_tokens: int = 32768,
-                        limit: int | None = None) -> dict[str, Any]:
+                        limit: int | None = None, verbose: bool = True) -> dict[str, Any]:
     """Run supported datasets and enumerate every remaining blocked suite."""
     names = list(suites or [*NATIVE_PROTOCOLS, *EXTERNAL_PROTOCOLS])
     unknown = set(names) - set(NATIVE_PROTOCOLS) - set(EXTERNAL_PROTOCOLS)
@@ -286,14 +326,34 @@ def run_full_benchmarks(model: Any, tokenizer: Any, output_dir: str | Path,
     dest.mkdir(parents=True, exist_ok=True)
     result: dict[str, Any] = {"mode": "full" if limit is None else "subset", "complete": False,
                               "macro_score": None, "suites": []}
+    native_names = [n for n in names if n in NATIVE_PROTOCOLS]
+    native_idx = 0
     for name in names:
         if name in NATIVE_PROTOCOLS:
+            native_idx += 1
+            spec = NATIVE_PROTOCOLS[name]
+            if verbose:
+                print(
+                    f"\n=== [FullBench {native_idx}/{len(native_names)}] Starting Native Suite '{name}' "
+                    f"(dataset={spec.dataset}@{spec.revision[:8]}, max_new_tokens={max_new_tokens}, limit={limit}) ===",
+                    flush=True,
+                )
             try:
-                entry = run_dataset(model, tokenizer, NATIVE_PROTOCOLS[name], dest,
-                                    max_new_tokens=max_new_tokens, limit=limit)
+                entry = run_dataset(model, tokenizer, spec, dest,
+                                    max_new_tokens=max_new_tokens, limit=limit, verbose=verbose)
             except Exception as exc:
                 entry = {"suite": name, "status": "blocked", "score": None,
                          "reason": f"{type(exc).__name__}: {exc}", "complete": False}
+            if verbose:
+                sc_mean = entry.get("score_on_scored_rows")
+                sc_str = f"{float(sc_mean):.2f}" if sc_mean is not None else "N/A"
+                print(
+                    f"=== [FullBench {native_idx}/{len(native_names)}] Suite '{name}' Finished: "
+                    f"status={entry.get('status')} | attempted={entry.get('attempted', 0)} | "
+                    f"scored={entry.get('scored', 0)} | mean_score={sc_str} | "
+                    f"elapsed={float(entry.get('elapsed_seconds', 0.0) or 0.0):.1f}s ===",
+                    flush=True,
+                )
         else:
             url, why = EXTERNAL_PROTOCOLS[name]
             entry = {"suite": name, "status": "external_harness_required", "score": None,

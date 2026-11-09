@@ -2566,6 +2566,7 @@ def evaluate_benchmark_task(
     item: Dict[str, Any],
     max_new_tokens: int = 8192,
     generation_options: Optional[Dict[str, Any]] = None,
+    verbose: bool = False,
 ) -> Dict[str, Any]:
     """Generate and score one row, preserving raw conversations and token budgets.
 
@@ -2639,7 +2640,7 @@ def evaluate_benchmark_task(
         cache = model.make_inference_cache(session_id=f"bench_{item.get('id', 'task')}")
         model.last_generation_timing = None
         output = model.generate_cached(inp, max_new_tokens=int(max_new_tokens), tokenizer=tokenizer,
-                                       stream_print=False, cache=cache, **options)
+                                       stream_print=bool(verbose), cache=cache, **options)
         token_ids = output[0, len(chat_ids):].tolist()
         if len(token_ids) > int(max_new_tokens):
             raise RuntimeError("runtime exceeded max_new_tokens")
@@ -2677,6 +2678,7 @@ def evaluate_selected_benchmark_tasks(
     include_smoke: bool = False,
     task_mode: str = "official",
     generation_options: Optional[Dict[str, Any]] = None,
+    verbose: bool = False,
 ) -> Dict[str, Any]:
     """Evaluate supplied rows with explicit scope and no implicit synthetic tasks.
 
@@ -2709,14 +2711,26 @@ def evaluate_selected_benchmark_tasks(
                     break
                 consumed += 1
                 task = convert_hf_row_to_eval_task(name, row, index, task_mode=task_mode)
-                reports.append(evaluate_benchmark_task(model, tokenizer, task, max_new_tokens, generation_options))
+                if verbose:
+                    print(f"[EvalTask | {name} #{consumed}] starting...", flush=True)
+                    res = evaluate_benchmark_task(model, tokenizer, task, max_new_tokens, generation_options, verbose=True)
+                else:
+                    res = evaluate_benchmark_task(model, tokenizer, task, max_new_tokens, generation_options)
+                if verbose:
+                    t_info = res.get("timing") or {}
+                    print(
+                        f"[EvalTask | {name} #{consumed}] status={res.get('status')} | score={res.get('score')} | "
+                        f"prompt={res.get('prompt_tokens')} tok | gen={res.get('generated_tokens')} tok | "
+                        f"decode={float(t_info.get('decode_tok_per_s', 0.0) or 0.0):.1f} tok/s | "
+                        f"wall={float(res.get('wall_time_sec', 0.0) or 0.0):.2f}s",
+                        flush=True,
+                    )
+                reports.append(res)
             dataset_reports[name] = {"supplied_rows": known_size, "attempted_rows": consumed,
                                      "rows_exhausted": exhausted, "row_cap": max_hf_per_benchmark,
                                      "full_official_split_verified": False}
     if include_smoke:
-        for original in SIGNIFICANT_BENCHMARK_SUITE:
-            item = dict(original)
-            reports.append(evaluate_benchmark_task(model, tokenizer, item, max_new_tokens, generation_options))
+        smoke_items = [dict(original) for original in SIGNIFICANT_BENCHMARK_SUITE]
         graph = generate_graphwalks_bfs_instance(num_nodes=graphwalks_nodes, seed=2026)
         memory = generate_mrcr_v2_instance(num_rounds=mrcr_rounds, seed=2026)
         for item in (
@@ -2726,7 +2740,29 @@ def evaluate_selected_benchmark_tasks(
              "gold_answer": memory["gold_answer"], "verifier": "mrcr"},
         ):
             item.update(evaluation_kind="smoke", source="synthetic", status="ready", official_comparable=False)
-            reports.append(evaluate_benchmark_task(model, tokenizer, item, max_new_tokens, generation_options))
+            smoke_items.append(item)
+        total_smoke = len(smoke_items)
+        for s_idx, item in enumerate(smoke_items, start=1):
+            if verbose:
+                print(
+                    f"[Smoke {s_idx}/{total_smoke}] {item.get('benchmark', item.get('id'))} ({item.get('id')}) starting...",
+                    flush=True,
+                )
+                res = evaluate_benchmark_task(model, tokenizer, item, max_new_tokens, generation_options, verbose=True)
+            else:
+                res = evaluate_benchmark_task(model, tokenizer, item, max_new_tokens, generation_options)
+            if verbose:
+                t_info = res.get("timing") or {}
+                print(
+                    f"[Smoke {s_idx}/{total_smoke}] {item.get('benchmark', item.get('id'))} -> "
+                    f"status={res.get('status')} | score={res.get('score')} | "
+                    f"prompt={res.get('prompt_tokens')} tok | gen={res.get('generated_tokens')} tok | "
+                    f"decode={float(t_info.get('decode_tok_per_s', 0.0) or 0.0):.1f} tok/s | "
+                    f"TTFT={float(t_info.get('ttft_ms', 0.0) or 0.0):.1f}ms | "
+                    f"wall={float(res.get('wall_time_sec', 0.0) or 0.0):.2f}s",
+                    flush=True,
+                )
+            reports.append(res)
     counts: Dict[str, int] = {}
     buckets: Dict[Tuple[str, str, str], List[float]] = {}
     for result in reports:
@@ -2761,6 +2797,7 @@ def benchmark_loop72_decode_speed(
     warmups: int = 1,
     repeats: int = 3,
     seed: int = 2026,
+    verbose: bool = False,
 ) -> Dict[str, Any]:
     """Repeat synchronized prefill/decode trials with fresh request caches.
 
@@ -2838,8 +2875,26 @@ def benchmark_loop72_decode_speed(
                          "timing": timing, "memory_ledger": ledger}
                 if trial_idx < int(warmups):
                     row["warmups_completed"] += 1
+                    if verbose:
+                        print(
+                            f"  [SpeedBench | prompt={length} tok | warmup {trial_idx + 1}/{warmups}] "
+                            f"TTFT={float(timing.get('ttft_ms', 0.0)):.1f}ms ({float(timing.get('prefill_tok_per_s', 0.0)):.1f} tok/s) | "
+                            f"decode={float(timing.get('decode_tok_per_s', 0.0)):.2f} tok/s | wall={wall:.2f}s",
+                            flush=True,
+                        )
                 else:
                     row["trials"].append(trial)
+                    if verbose:
+                        t_num = trial_idx - int(warmups) + 1
+                        print(
+                            f"  [SpeedBench | prompt={length} tok | trial {t_num}/{repeats}] "
+                            f"TTFT={float(timing.get('ttft_ms', 0.0)):.1f}ms ({float(timing.get('prefill_tok_per_s', 0.0)):.1f} tok/s) | "
+                            f"decode={float(timing.get('decode_tok_per_s', 0.0)):.2f} tok/s | "
+                            f"ITL p50={float(timing.get('itl_p50_ms', 0.0)):.1f}ms | "
+                            f"GPU={float(ledger.get('m1_gpu_total_mib', 0.0)):.1f} MiB | "
+                            f"Cold={float(ledger.get('m2_host_cold_pages_mib', 0.0)):.1f} MiB | wall={wall:.2f}s",
+                            flush=True,
+                        )
             except Exception as exc:
                 row.update(status="error", reason=f"performance_trial_error:{type(exc).__name__}:{exc}")
                 if trial_idx >= int(warmups):
@@ -2874,6 +2929,7 @@ def run_full_length_1m_context_benchmark(
     horizons: Sequence[int] = (32_768, 131_072, 262_144, 524_288, 1_048_576),
     max_live_tokens: int = 32_768,
     gen_tokens: int = 16,
+    verbose: bool = False,
 ) -> Dict[str, Any]:
     """Report capacity arithmetic and optional synthetic live load probes.
 
@@ -2890,12 +2946,16 @@ def run_full_length_1m_context_benchmark(
     live_runs = []
     for horizon in horizons:
         if horizon > int(max_live_tokens):
+            if verbose:
+                print(f"  [ContextProbe | {horizon:,} tok] skipped (above max_live_tokens={max_live_tokens:,})", flush=True)
             horizon_status.append({"context_tokens": horizon, "status": "not_run", "reason": "above_explicit_live_probe_cap"})
             continue
         if not HAS_TORCH or model is None or tokenizer is None:
             horizon_status.append({"context_tokens": horizon, "status": "blocked", "reason": "model_tokenizer_and_pytorch_required"})
             continue
-        measured = benchmark_loop72_decode_speed(model, tokenizer, (horizon,), gen_tokens=gen_tokens, warmups=0, repeats=1)
+        if verbose:
+            print(f"  [ContextProbe | {horizon:,} tok] running live prefill + {gen_tokens}-token decode probe...", flush=True)
+        measured = benchmark_loop72_decode_speed(model, tokenizer, (horizon,), gen_tokens=gen_tokens, warmups=0, repeats=1, verbose=verbose)
         row = dict(measured.get("horizons", [{}])[0]) if measured.get("horizons") else {"status": measured["status"], "reason": measured.get("reason")}
         row.update(context_tokens=horizon, evaluation_kind="synthetic_load_probe", quality_validated=False)
         horizon_status.append(row)
