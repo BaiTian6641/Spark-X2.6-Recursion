@@ -445,6 +445,7 @@ def configure_model_for_loop72_lsa(
 
     model.dlsa_checkpoint_status = {
         'initialization': 'random_orthogonal',
+        'verified': False,
         'quality_evidence': 'not_evaluated_in_loader',
         'checkpoint_name': None,
         'checkpoint_sha256': None,
@@ -516,6 +517,7 @@ def configure_model_for_loop72_lsa(
                 )
         model.dlsa_checkpoint_status.update({
             'initialization': 'checkpoint_loaded_verified' if is_verified else 'checkpoint_loaded_unverified',
+            'verified': bool(is_verified),
             'checkpoint_name': os.path.basename(dlsa_checkpoint),
             'checkpoint_sha256': _file_sha256(dlsa_checkpoint),
             'selector_sha256': bank.canonical_selector_sha256(),
@@ -652,6 +654,10 @@ def load_sparkx_loop72_lsa(
                 state = torch.load(p, map_location='cpu')
                 state_path = p
                 break
+        if dlsa_checkpoint is None and attach_sparse_attention and (state is None or 'dlsa_index_bank' not in state):
+            cand_sel = os.path.join(repo_or_dir, 'visit_selectors_stage_e.pt')
+            if os.path.isfile(cand_sel):
+                dlsa_checkpoint = cand_sel
     elif repo_or_dir and str(repo_or_dir) != str(base_repo):
         try:
             from huggingface_hub import hf_hub_download as _hf_dl
@@ -834,6 +840,7 @@ def load_sparkx_loop72_lsa(
                 )
         model.dlsa_checkpoint_status = {
             'initialization': 'loop_state_checkpoint_loaded_verified' if is_verified else 'loop_state_checkpoint_loaded_unverified',
+            'verified': bool(is_verified),
             'quality_evidence': 'not_evaluated_in_loader',
             'checkpoint_name': os.path.basename(state_path) if state_path else None,
             'checkpoint_sha256': _file_sha256(state_path) if state_path else None,

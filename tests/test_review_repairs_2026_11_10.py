@@ -62,6 +62,7 @@ from train_spark_mhc import (
     _parameter_sha256,
     apply_hardware_profile_to_config,
     export_and_upload_recursive72_to_hub,
+    finalize_release_from_hub_stages,
     render_example_to_Ids_and_labels,
     run_mhc_training_pipeline,
     run_stage_a_verification,
@@ -677,6 +678,128 @@ class TestReviewRepairs20261110(unittest.TestCase):
         self.assertGreaterEqual(sum_aug["total_records"], 40)
         self.assertGreater(len(splits_aug["train"]), 0)
         self.assertGreater(len(splits_aug["dev"]), 0)
+
+    def test_15_finalize_release_from_hub_stages_and_embedded_selector_verified_status(self) -> None:
+        import shutil
+        import yaml
+
+        model = _build_tiny_loop_model(emit_callback=True)
+        fresh_base_snapshot = copy.deepcopy(model.base)
+        tiny_lsa_cfg = {
+            "model": {"preserve_native_activation": True},
+            "loop": {"recurrence_mode": "learned_mhc", "mhc_gain_mode": "sigmoid"},
+            "memory": {"m3_enabled": False},
+            "attention": {
+                "n_kv": 2,
+                "head_dim": 4,
+                "rope_dim": 1,
+                "d_idx": 6,
+                "sinks": 1,
+                "recent_tokens": 2,
+                "n_cluster": 2,
+                "n_pool": 1,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmp_root:
+            hub_mirror = pathlib.Path(tmp_root) / "hub_mirror"
+            hub_mirror.mkdir(parents=True, exist_ok=True)
+            train_out = pathlib.Path(tmp_root) / "train_out"
+            finalize_out = pathlib.Path(tmp_root) / "finalize_out"
+            final_commits = []
+
+            class _MirrorHubApi:
+                def whoami(self):
+                    return {"name": "TassP0lar"}
+
+                def create_repo(self, **kwargs):
+                    return None
+
+                def upload_folder(self, **kwargs):
+                    src = pathlib.Path(kwargs["folder_path"])
+                    for item in src.rglob("*"):
+                        if item.is_file():
+                            dst = hub_mirror / item.relative_to(src)
+                            dst.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(item, dst)
+                    final_commits.append(kwargs)
+                    return f"mirror_commit_{len(final_commits)}"
+
+            cfg_train = MHCTrainingConfig(
+                output_dir=str(train_out),
+                hardware_profile="cpu_test",
+                allow_smoke_fixtures=True,
+                seq_len=16,
+                stage_e_seq_len=16,
+                stage_b_steps=1,
+                stage_c_steps=1,
+                stage_d_steps=1,
+                stage_e_calibration_seqs=1,
+                stage_e_val_seqs=1,
+                stage_e_distill_steps=2,
+                hf_repo_id="TassP0lar/Spark-X2.6-4B-Recursive72",
+                push_to_hub=True,
+                push_intermediate_stages=True,
+                hf_token="hf_mock_token",
+                export_standalone_backbone=False,
+            )
+            run_mhc_training_pipeline(
+                model,
+                _OffsetCharTokenizer(),
+                cfg=cfg_train,
+                run_final_export=False,
+                api_client=_MirrorHubApi(),
+            )
+            # Simulate non-smoke corpus provenance in saved Hub stage manifests so release gate #3 is also exercised
+            for st_key in ("stage_b_retention", "stage_c_dense_mhc", "stage_d_omp_mhc"):
+                m_path = hub_mirror / "stages" / st_key / "training_manifest.json"
+                m_json = json.loads(m_path.read_text(encoding="utf-8"))
+                m_json["training_config"]["allow_smoke_fixtures"] = False
+                m_path.write_text(json.dumps(m_json, indent=2) + "\n", encoding="utf-8")
+
+            fresh_model = _build_tiny_loop_model(emit_callback=True)
+            cfg_fin = MHCTrainingConfig(
+                output_dir=str(finalize_out),
+                hardware_profile="cpu_test",
+                seq_len=16,
+                hf_repo_id="TassP0lar/Spark-X2.6-4B-Recursive72",
+                push_to_hub=True,
+                hf_token="hf_mock_token",
+                export_standalone_backbone=False,
+            )
+            fin_commits_before = len(final_commits)
+            fin_rep = finalize_release_from_hub_stages(
+                cfg=cfg_fin,
+                model=fresh_model,
+                tokenizer=_OffsetCharTokenizer(),
+                run_stage_a=True,
+                run_stage_f=False,
+                verify_local_reload_parity=False,
+                download_fn=lambda rel: str(hub_mirror / rel),
+                api_client=_MirrorHubApi(),
+                lsa_config_override=tiny_lsa_cfg,
+            )
+            self.assertTrue(fin_rep["completion_gates"]["production_release_ready"])
+            self.assertTrue(fin_rep["huggingface_export"]["uploaded"])
+            self.assertEqual(len(final_commits), fin_commits_before + 1)
+
+            # Verify `load_sparkx_loop72_lsa` against `final_loop72_mhc_dlsa_export` with embedded `dlsa_index_bank`
+            exp_dir = pathlib.Path(fin_rep["huggingface_export"]["export_dir"])
+            tiny_yaml = exp_dir / "configs" / "tiny_loop72_lsa.yaml"
+            tiny_yaml.write_text(yaml.safe_dump(tiny_lsa_cfg), encoding="utf-8")
+            with mock.patch("load_inference_v03.AutoTokenizer.from_pretrained", side_effect=lambda *a, **kw: _OffsetCharTokenizer()), \
+                 mock.patch("load_inference_v03.AutoModelForCausalLM.from_pretrained", side_effect=lambda *a, **kw: copy.deepcopy(fresh_base_snapshot)), \
+                 mock.patch("load_inference_v03.SparkXLoopV03", side_effect=lambda b, s, **kw: SparkXLoopV03(b, s, strict=False, patch_sdpa=False)):
+                reloaded, _ = load_sparkx_loop72_lsa(
+                    repo_or_dir=str(exp_dir),
+                    config_path=str(tiny_yaml),
+                    recurrence_mode="learned_mhc",
+                    strict_selector_provenance=True,
+                    require_verified_selectors=True,
+                )
+            sel_status = reloaded.execution_manifest()["selector_checkpoint_status"]
+            self.assertEqual(sel_status["initialization"], "loop_state_checkpoint_loaded_verified")
+            self.assertTrue(sel_status["verified"])
 
 
 if __name__ == "__main__":

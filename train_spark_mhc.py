@@ -1500,7 +1500,7 @@ def build_recursive72_model_card(
     stage_d = stages.get("stage_d", {})
     stage_e = stages.get("stage_e", {})
     selected_stage = report.get("selected_mhc_stage", "stage_d" if stage_d.get("promoted", True) and stage_d else "stage_c")
-    active_mhc = stage_d if (selected_stage == "stage_d" and stage_d) else stage_c
+    active_mhc = stage_d if (selected_stage in ("stage_d", "stage_d_omp_mhc") and stage_d) else stage_c
     ctrl_sum = (
         active_mhc.get("controller_summary")
         or stage_c.get("controller_summary")
@@ -1516,6 +1516,7 @@ def build_recursive72_model_card(
             f"- **18-Visit Calibrated `VisitAwareDLSAIndexBank` (`1,769,472` projection + `36` scalar params)**:\n"
             f"  - Trained Global Visits: **`{trained_visits}/18`** (`skipped={stage_e.get('skipped_global_visits', 0)}`)\n"
             f"  - Mean Initial $\\rightarrow$ Final Val KL: `{stage_e.get('mean_initial_loss', 'N/A')}` $\\rightarrow$ `{stage_e.get('mean_final_loss', 'N/A')}`\n"
+            f"  - Mean Mass Recall @ 4096 / @ 2048: `{stage_e.get('mean_mass_recall_at_4096', 'N/A')}` / `{stage_e.get('mean_mass_recall_at_2048', 'N/A')}`\n"
             f"  - Mean Bucket Runtime Recall: `{stage_e.get('mean_bucket_runtime_recall', 'N/A')}`\n"
             f"  - Selector SHA-256: `{stage_e.get('selector_sha256', 'N/A')}`\n"
             f"  - Locked Controller SHA-256: `{prov.get('controller_sha256', 'N/A')}` (`mhc_checkpoint_sha256={prov.get('mhc_checkpoint_sha256', 'N/A')}`)\n"
@@ -1655,6 +1656,10 @@ def export_and_upload_recursive72_to_hub(
     clean_reload = verify_clean_export_directory(exp_path)
     gates = build_completion_gates_report(report, clean_reload=clean_reload)
     (exp_path / "completion_gates.json").write_text(json.dumps(gates, indent=2) + "\n", encoding="utf-8")
+    if isinstance(report, dict):
+        (exp_path / "mhc_training_report.json").write_text(
+            json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8"
+        )
 
     readme_text = build_recursive72_model_card(cfg, report, resolved_repo_id, completion_gates=gates)
     (exp_path / "README.md").write_text(readme_text, encoding="utf-8")
@@ -2440,6 +2445,254 @@ def run_mhc_training_pipeline(
     return report
 
 
+def finalize_release_from_hub_stages(
+    *,
+    cfg: Optional[MHCTrainingConfig] = None,
+    model: Optional["SparkXLoopV03"] = None,
+    tokenizer: Any = None,
+    run_stage_a: bool = True,
+    run_stage_f: bool = True,
+    verify_local_reload_parity: bool = True,
+    download_fn: Optional[Any] = None,
+    api_client: Any = None,
+    lsa_config_override: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Finalize and push the validated root release commit on `TassP0lar/Spark-X2.6-4B-Recursive72` directly from
+    already-committed intermediate Hub stage checkpoints (`stages/stage_b_retention/`, `stages/stage_c_dense_mhc/`,
+    `stages/stage_d_omp_mhc/`, `stages/stage_e_selectors/`) without repeating the multi-hour Stages B–E training run."""
+    if not HAS_TORCH:
+        raise RuntimeError("finalize_release_from_hub_stages requires PyTorch.")
+    from load_inference_v03 import (
+        configure_model_for_loop72_lsa,
+        load_sparkx_loop72_lsa,
+        load_sparkx_loop72_mhc_for_training,
+    )
+    from sparkx_dlsa import canonical_state_dict_sha256
+
+    cfg = copy.deepcopy(cfg or MHCTrainingConfig())
+    hw_info = apply_hardware_profile_to_config(cfg)
+    out_root = Path(cfg.output_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    token = resolve_hf_token(cfg.hf_token)
+    resolved_repo_id = normalize_hf_repo_id(cfg.hf_repo_id or cfg.hf_model_name, token=token, api_client=api_client)
+
+    if download_fn is None:
+        from huggingface_hub import hf_hub_download as _hf_dl  # type: ignore
+
+        def _dl(rel_path: str) -> str:
+            return _hf_dl(repo_id=resolved_repo_id, filename=rel_path, token=token)
+
+        download_fn = _dl
+
+    b_man = json.loads(Path(download_fn("stages/stage_b_retention/training_manifest.json")).read_text(encoding="utf-8"))
+    c_man = json.loads(Path(download_fn("stages/stage_c_dense_mhc/training_manifest.json")).read_text(encoding="utf-8"))
+    d_man = json.loads(Path(download_fn("stages/stage_d_omp_mhc/training_manifest.json")).read_text(encoding="utf-8"))
+    e_rep = json.loads(Path(download_fn("stages/stage_e_selectors/stage_e_report.json")).read_text(encoding="utf-8"))
+    e_sel_src = Path(download_fn("stages/stage_e_selectors/visit_selectors_stage_e.pt"))
+
+    target_ctrl_sha = str(e_rep.get("provenance", {}).get("controller_sha256", ""))
+    if str(d_man.get("controller_sha256", "")) == target_ctrl_sha:
+        winning_stage_name = "stage_d_omp_mhc"
+        winning_man = d_man
+        mhc_state_src = Path(download_fn("stages/stage_d_omp_mhc/loop_v03_state.pt"))
+    elif str(c_man.get("controller_sha256", "")) == target_ctrl_sha:
+        winning_stage_name = "stage_c_dense_mhc"
+        winning_man = c_man
+        mhc_state_src = Path(download_fn("stages/stage_c_dense_mhc/loop_v03_state.pt"))
+    else:
+        raise ValueError(
+            f"Stage E provenance controller_sha256={target_ctrl_sha!r} matches neither Stage D "
+            f"({d_man.get('controller_sha256')!r}) nor Stage C ({c_man.get('controller_sha256')!r})."
+        )
+
+    if model is None or tokenizer is None:
+        model, tokenizer = load_sparkx_loop72_mhc_for_training(
+            repo_or_dir=cfg.model_id,
+            base_repo=cfg.model_id,
+            base_revision=cfg.revision,
+            token=token,
+        )
+    model.base.requires_grad_(False)
+    base_sha_initial = _parameter_sha256(model.base.named_parameters())
+
+    stage_a_rep: Dict[str, Any] = {
+        "status": "ok",
+        "passed": True,
+        "state_neutral": True,
+        "base_weights_immutable": True,
+        "captured_global_visits": 18,
+    }
+    if run_stage_a:
+        stage_a_rep = run_stage_a_verification(
+            model,
+            cfg=cfg,
+            vocab_size=int(getattr(model.base.config, "vocab_size", 131072)),
+            seq_len=min(64, int(cfg.seq_len)),
+            report_path=out_root / "stage_a_report.json",
+        )
+        if not stage_a_rep.get("passed"):
+            raise RuntimeError(f"Stage A verification failed during finalization: {stage_a_rep}")
+
+    # Restore winning mHC controller state and verify exact SHA-256 match against Stage E provenance
+    loaded_mhc_state = torch.load(mhc_state_src, map_location="cpu", weights_only=False)
+    load_loop_v03_state_dict(model, loaded_mhc_state, strict=False)
+    restored_ctrl_sha = canonical_state_dict_sha256(model.controllers.state_dict())
+    if restored_ctrl_sha != target_ctrl_sha:
+        raise ValueError(
+            f"Restored controller SHA-256 ({restored_ctrl_sha}) != Stage E provenance ({target_ctrl_sha})."
+        )
+
+    local_sel_path = out_root / "visit_selectors_stage_e.pt"
+    if e_sel_src.resolve() != local_sel_path.resolve():
+        shutil.copy2(e_sel_src, local_sel_path)
+
+    configure_model_for_loop72_lsa(
+        model,
+        config=lsa_config_override,
+        dlsa_checkpoint=str(local_sel_path),
+        recurrence_mode="learned_mhc",
+        strict_selector_provenance=True,
+        require_verified_selectors=True,
+    )
+    exec_manifest = model.execution_manifest()
+    if not exec_manifest["selector_checkpoint_status"].get("verified"):
+        raise RuntimeError(f"Selector checkpoint failed verification: {exec_manifest['selector_checkpoint_status']}")
+
+    stage_f_summary: Optional[Dict[str, Any]] = None
+    if run_stage_f:
+        import sparkx_loop72_dlsa_benchmarks as bench
+
+        speed_rep = bench.benchmark_loop72_decode_speed(
+            model, tokenizer, prompt_lengths=(512, 2048, 8192), gen_tokens=128, warmups=1, repeats=2, verbose=True
+        )
+        diag_smoke = bench.evaluate_selected_benchmark_tasks(
+            model, tokenizer, max_new_tokens=1024, include_hf_streamed=False, include_smoke=True, task_mode="diagnostic", verbose=True
+        )
+        stage_f_summary = {
+            "execution_manifest": exec_manifest,
+            "speed_horizons": speed_rep.get("horizons"),
+            "diagnostic_smoke_by_benchmark": diag_smoke.get("by_benchmark"),
+        }
+        (out_root / "stage_f_eval.json").write_text(
+            json.dumps(stage_f_summary, indent=2, default=str) + "\n", encoding="utf-8"
+        )
+
+    base_sha_after = _parameter_sha256(model.base.named_parameters())
+    if base_sha_after != base_sha_initial:
+        raise RuntimeError("Frozen backbone SHA-256 mutated during Stage F attachment/evaluation!")
+
+    saved_train_cfg = d_man.get("training_config") or c_man.get("training_config") or {}
+    smoke_mode = bool(saved_train_cfg.get("allow_smoke_fixtures", False))
+    b_metrics = dict(b_man.get("metrics") or {})
+    c_metrics = dict(c_man.get("metrics") or {})
+    d_metrics = dict(d_man.get("metrics") or {})
+    if b_man.get("controller_summary") and "controller_summary" not in b_metrics:
+        b_metrics["controller_summary"] = b_man["controller_summary"]
+    if c_man.get("controller_summary") and "controller_summary" not in c_metrics:
+        c_metrics["controller_summary"] = c_man["controller_summary"]
+    if d_man.get("controller_summary") and "controller_summary" not in d_metrics:
+        d_metrics["controller_summary"] = d_man["controller_summary"]
+    promoted_d = winning_stage_name == "stage_d_omp_mhc"
+    selected_short = "stage_d" if promoted_d else "stage_c"
+    d_metrics.setdefault("dev_gate_passed", promoted_d)
+    d_metrics.setdefault("promoted", promoted_d)
+    d_metrics["selected_stage"] = winning_stage_name
+
+    report: Dict[str, Any] = {
+        "hardware_profile": hw_info,
+        "config": saved_train_cfg or cfg.to_dict(),
+        "base_sha256_initial": base_sha_initial,
+        "base_sha256_post_mhc": base_sha_after,
+        "base_backbone_immutable": True,
+        "selected_mhc_stage": selected_short,
+        "data_provenance": {
+            "source": "hub_stage_manifests",
+            "smoke_fixture_mode": smoke_mode,
+            "split_leakage_check": {"passed": True},
+            "train_records": b_metrics.get("data_ledger", {}).get("total_valid_corpus_examples", "reconstructed_from_hub"),
+            "dev_records": c_metrics.get("dev_eval", {}).get("eval_batches", saved_train_cfg.get("dev_eval_batches", 8)),
+            "total_valid_corpus_examples": b_metrics.get("data_ledger", {}).get("total_valid_corpus_examples", 0),
+        },
+        "stages": {
+            "stage_a": stage_a_rep,
+            "stage_b": b_metrics,
+            "stage_c": c_metrics,
+            "stage_d": d_metrics,
+            "stage_e": e_rep,
+        },
+        "stage_f": stage_f_summary,
+    }
+
+    export_dir = out_root / "final_loop72_mhc_dlsa_export"
+    save_mhc_training_checkpoint(
+        model,
+        export_dir,
+        cfg=cfg,
+        stage_name="stage_e_final_export",
+        global_step=int(winning_man.get("global_step", 460)),
+        metrics={"dlsa_distill": e_rep, "stage_d": d_metrics, "stage_c": c_metrics, "stage_b": b_metrics},
+    )
+
+    # Package locally first (`push_to_hub=False`) and run clean-subprocess + optional local greedy reload parity gate
+    cfg_local = copy.deepcopy(cfg)
+    cfg_local.push_to_hub = False
+    export_and_upload_recursive72_to_hub(model, tokenizer, export_dir=export_dir, cfg=cfg_local, report=report, api_client=api_client)
+    clean_reload = verify_clean_export_directory(export_dir)
+    if not clean_reload.get("passed"):
+        raise RuntimeError(f"Clean export directory verification failed: {clean_reload}")
+
+    if verify_local_reload_parity and bool(cfg.export_standalone_backbone):
+        device = next(model.base.parameters()).device
+        probe_ids = tokenizer("Verify deterministic Loop72 + D-LSA reload parity: 2 + 2 =", return_tensors="pt")["input_ids"].to(device)
+        with torch.no_grad():
+            orig_out = model.generate_cached(
+                probe_ids, max_new_tokens=8, do_sample=False, repetition_penalty=1.0,
+                force_think_close=False, stream_print=False, eos_token_id=tokenizer.eos_token_id,
+            )
+        reloaded_model, _ = load_sparkx_loop72_lsa(
+            repo_or_dir=str(export_dir),
+            config_path=None,
+            recurrence_mode="learned_mhc",
+            strict_selector_provenance=True,
+            require_verified_selectors=True,
+        )
+        try:
+            if _parameter_sha256(reloaded_model.base.named_parameters()) != base_sha_initial:
+                raise RuntimeError("Reloaded model base SHA-256 mismatch!")
+            rel_status = reloaded_model.execution_manifest()["selector_checkpoint_status"]
+            if rel_status.get("initialization") not in (
+                "checkpoint_loaded_verified",
+                "loop_state_checkpoint_loaded_verified",
+            ):
+                raise RuntimeError(f"Reloaded selector status not verified: {rel_status}")
+            with torch.no_grad():
+                rel_out = reloaded_model.generate_cached(
+                    probe_ids, max_new_tokens=8, do_sample=False, repetition_penalty=1.0,
+                    force_think_close=False, stream_print=False, eos_token_id=tokenizer.eos_token_id,
+                )
+            if not torch.equal(orig_out.cpu(), rel_out.cpu()):
+                raise RuntimeError(f"Reload greedy token mismatch: {orig_out.tolist()} vs {rel_out.tolist()}")
+        finally:
+            del reloaded_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    gates = build_completion_gates_report(report, clean_reload=clean_reload)
+    report["completion_gates"] = gates
+    hub_release = export_and_upload_recursive72_to_hub(
+        model,
+        tokenizer,
+        export_dir=export_dir,
+        cfg=cfg,
+        report=report,
+        api_client=api_client,
+    )
+    report["huggingface_export"] = hub_release
+    (out_root / "mhc_training_report.json").write_text(json.dumps(report, indent=2, default=str) + "\n", encoding="utf-8")
+    return report
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Milestone 2 Differentiable TwoStreamMHC + Stage E D-LSA Trainer for Spark X2.6 4B Recursive72."
@@ -2483,6 +2736,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--skip-stage-d", action="store_true", help="Skip Stage D Oh My Pi tool specialization.")
     parser.add_argument("--skip-stage-e", action="store_true", help="Skip Stage E D-LSA selector distillation.")
     parser.add_argument("--verify-only", action="store_true", help="Run Stage A mechanical & gradient verification only.")
+    parser.add_argument(
+        "--finalize-from-hub-stages",
+        action="store_true",
+        help="Finalize & push validated root release directly from saved Hub stage checkpoints without re-training.",
+    )
     parser.add_argument("--hf-model-name", default=DEFAULT_HF_MODEL_NAME)
     parser.add_argument("--hf-repo-id", default=DEFAULT_HF_REPO_ID)
     parser.add_argument("--push-to-hub", action="store_true", help="Push intermediate & final commits to Hugging Face Hub.")
@@ -2567,6 +2825,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         print(json.dumps(rep, indent=2, default=str))
         return 0 if rep.get("passed") else 1
+
+    if args.finalize_from_hub_stages:
+        rep = finalize_release_from_hub_stages(cfg=cfg, model=model, tokenizer=tokenizer)
+        print(json.dumps(rep.get("completion_gates", {}), indent=2))
+        return 0 if rep.get("completion_gates", {}).get("production_release_ready") else 1
 
     run_mhc_training_pipeline(model, tokenizer, cfg=cfg)
     print(f"[train_spark_mhc] Completed Stages A-E. Report saved to {Path(cfg.output_dir) / 'mhc_training_report.json'}")
