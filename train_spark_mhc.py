@@ -2513,6 +2513,14 @@ def finalize_release_from_hub_stages(
             base_revision=cfg.revision,
             token=token,
         )
+    # Detach sparse attention if an already-attached runtime `model` was passed in before Stage A `.train()` check
+    if getattr(model, "_paged_dlsa_attached", False) or hasattr(model.base, "model"):
+        for _lyr in getattr(getattr(model.base, "model", None), "layers", []):
+            _attn = getattr(_lyr, "self_attn", None)
+            if _attn is not None and hasattr(_attn, "_sparkx_orig_forward"):
+                _attn.forward = _attn._sparkx_orig_forward
+                _attn._sparkx_loop72_dlsa_attached = False
+        model._paged_dlsa_attached = False
     model.base.requires_grad_(False)
     base_sha_initial = _parameter_sha256(model.base.named_parameters())
 
