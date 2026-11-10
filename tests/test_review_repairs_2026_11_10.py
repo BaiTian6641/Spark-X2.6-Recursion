@@ -45,7 +45,9 @@ from sparkx_sparse_attention import (
 )
 from sparkx_training_data import (
     OMP_V18_18_1_TOOLS,
+    _synthesize_verified_code_and_math_records,
     build_omp_tool_trajectory_examples,
+    build_real_five_domain_corpus,
     render_conversation_exact_labels,
 )
 from train_spark_dlsa import (
@@ -661,6 +663,20 @@ class TestReviewRepairs20261110(unittest.TestCase):
             self.assertEqual(len(hub_commits), 5)
             for c_kw in hub_commits:
                 self.assertEqual(c_kw["repo_id"], "TassP0lar/Spark-X2.6-4B-Recursive72")
+
+        # Verify all programmatic code/math synthesis branches & corpus builder execute cleanly
+        aug_records = _synthesize_verified_code_and_math_records(count_code=9, count_math=6, seed=42)
+        self.assertEqual(len(aug_records), 15)
+        splits_aug, sum_aug = build_real_five_domain_corpus(
+            target_total_records=40,
+            seed=42,
+            use_hf_streaming=False,
+            allow_programmatic_aug=True,
+            allow_smoke_fixtures=True,
+        )
+        self.assertGreaterEqual(sum_aug["total_records"], 40)
+        self.assertGreater(len(splits_aug["train"]), 0)
+        self.assertGreater(len(splits_aug["dev"]), 0)
 
 
 if __name__ == "__main__":

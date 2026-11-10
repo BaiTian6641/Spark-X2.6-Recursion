@@ -1167,8 +1167,8 @@ def _synthesize_verified_code_and_math_records(count_code: int, count_math: int,
                 "        px.append(px[-1] ^ int(x))\n"
                 "    return px\n\n"
                 "def prefix_xor_range(px: list[int], left: int, right: int) -> int:\n"
-                f"    if not (0 <= left <= right < len(px) - 1):\n"
-                f"        raise IndexError('Invalid inclusive range [{left}, {right}] (salt={mod_base})')\n"
+                "    if not (0 <= left <= right < len(px) - 1):\n"
+                f"        raise IndexError(f'Invalid inclusive range [{{left}}, {{right}}] (salt={mod_base})')\n"
                 "    return px[right + 1] ^ px[left]\n"
                 "```"
             )
