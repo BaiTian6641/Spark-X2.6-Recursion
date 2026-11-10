@@ -728,6 +728,31 @@ def _dispatch_spark_sdpa(
     )
 
 
+def _notify_sparkx_qkv_capture(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> None:
+    """Invoke per-visit Q/K/V capture callback (`F01`) and legacy sleep capture attributes when enabled."""
+    capture_cb = getattr(module, '_sparkx_qkv_capture_callback', None)
+    if callable(capture_cb):
+        capture_cb(
+            module=module,
+            visit_context=getattr(module, '_sparkx_active_visit', None),
+            query=query.detach(),
+            key=key.detach(),
+            value=value.detach(),
+        )
+    if getattr(module, '_capture_sleep_qkv', False):
+        qkv_tuple = (query.detach(), key.detach(), value.detach())
+        if getattr(module, '_sleep_last_qkv', None) is None or getattr(module, '_capture_all_visits_qkv', False):
+            module._sleep_last_qkv = qkv_tuple
+        visit_qkv_log = getattr(module, '_sleep_visit_qkv_list', None)
+        if isinstance(visit_qkv_log, list):
+            visit_qkv_log.append(qkv_tuple)
+
+
 def patch_spark_attention_for_long_context(
     base_model: nn.Module,
     preserve_native_activation: bool = False,
@@ -774,6 +799,8 @@ def patch_spark_attention_for_long_context(
             key = key.to(target_dtype)
         if value.dtype != target_dtype:
             value = value.to(target_dtype)
+
+        _notify_sparkx_qkv_capture(module, query, key, value)
 
         sw = getattr(module, '_sparkx_sliding_window', None) or getattr(module, 'sliding_window', None)
         if sw is not None and attention_mask is None and query.shape[-2] == 1 and key.shape[-2] > int(sw):
@@ -941,8 +968,7 @@ def patch_spark_attention_for_loglinear_kv(
         if value.dtype != target_dtype:
             value = value.to(target_dtype)
 
-        if getattr(module, '_capture_sleep_qkv', False) and getattr(module, '_sleep_last_qkv', None) is None:
-            module._sleep_last_qkv = (query.detach(), key.detach(), value.detach())
+        _notify_sparkx_qkv_capture(module, query, key, value)
 
         sw = getattr(module, '_sparkx_sliding_window', None) or getattr(module, 'sliding_window', None)
         is_nope_full = (sw is None) and (not getattr(module, 'is_sliding', False))
@@ -1408,9 +1434,7 @@ def patch_spark_attention_for_lsa(
         if value.dtype != target_dtype:
             value = value.to(target_dtype)
 
-        # Capture first-visit Q/K/V during sleep trace so Pass 2 / P3 does not overwrite Pass 1
-        if getattr(module, "_capture_sleep_qkv", False) and getattr(module, "_sleep_last_qkv", None) is None:
-            module._sleep_last_qkv = (query.detach(), key.detach(), value.detach())
+        _notify_sparkx_qkv_capture(module, query, key, value)
 
         sw = getattr(module, "_sparkx_sliding_window", None) or getattr(module, "sliding_window", None)
         is_nope_full = (sw is None) and (not getattr(module, "is_sliding", False))
@@ -2579,6 +2603,7 @@ class TwoStreamMHC(nn.Module):
         self.init_p2_gain = float(init_p2_gain)
         self.init_p3_gain = float(init_p3_gain)
         self.extra_pass_gate_multiplier = float(extra_pass_gate_multiplier)
+        self._validate_gain_settings()
 
         p2_init_logit = self._gain_to_raw_logit(self.init_p2_gain) if self.gain_mode == 'sigmoid' else 0.0
         p3_init_logit = self._gain_to_raw_logit(self.init_p3_gain) if self.gain_mode == 'sigmoid' else 0.0
@@ -2627,6 +2652,19 @@ class TwoStreamMHC(nn.Module):
             self.pass_down = None
             self.pass_up = None
 
+    def _validate_gain_settings(self) -> None:
+        mult = float(self.extra_pass_gate_multiplier)
+        if not math.isfinite(mult):
+            raise ValueError(f'TwoStreamMHC extra_pass_gate_multiplier must be finite, got {mult!r}')
+        if self.gain_mode == 'sigmoid':
+            if not (0.0 <= mult <= 1.0):
+                raise ValueError(
+                    f'TwoStreamMHC sigmoid gain_mode requires 0.0 <= extra_pass_gate_multiplier <= 1.0, got {mult}'
+                )
+            for name, val in (('init_p2_gain', self.init_p2_gain), ('init_p3_gain', self.init_p3_gain)):
+                if not (math.isfinite(val) and 0.0 < float(val) < 1.0):
+                    raise ValueError(f'TwoStreamMHC sigmoid {name} must be finite in (0, 1), got {val!r}')
+
     @staticmethod
     def _gain_to_raw_logit(prob: float) -> float:
         p = min(max(float(prob), 1e-6), 1.0 - 1e-6)
@@ -2660,6 +2698,7 @@ class TwoStreamMHC(nn.Module):
             self.init_p3_gain = float(init_p3_gain)
         if extra_pass_gate_multiplier is not None:
             self.extra_pass_gate_multiplier = float(extra_pass_gate_multiplier)
+        self._validate_gain_settings()
         if reset_gains:
             if self.gain_mode == 'sigmoid':
                 p2_logit = self._gain_to_raw_logit(self.init_p2_gain)
@@ -3007,7 +3046,14 @@ class TwoStreamMHC(nn.Module):
                 pc_f = sub_f['passes'][p_idx]
                 gain_f = pc_f['gain_extra'] if extra else 1.0
 
-                if HAS_TRITON and s0.is_cuda and s0.shape[-1] <= 8192:
+                if (
+                    HAS_TRITON
+                    and not self.training
+                    and not torch.is_grad_enabled()
+                    and not getattr(self, '_disable_triton_mhc', False)
+                    and s0.is_cuda
+                    and s0.shape[-1] <= 8192
+                ):
                     s0_c = s0.contiguous()
                     s1_c = s1.contiguous()
                     n_cols = int(s0_c.shape[-1])
@@ -4538,6 +4584,9 @@ class SparkXLoopV03(nn.Module):
             h = streams[0].float()
 
         # 3. Coda layers [loop_end..n_layers) (includes Anchor 7 at Layer 31 + Global Layer 35!)
+        coda_hook = getattr(self, '_coda_entry_hook', None)
+        if callable(coda_hook):
+            coda_hook(h)
         for idx in range(self.loop_end, self.n_layers):
             v_idx = visit_counts.get(idx, 0)
             visit_counts[idx] = v_idx + 1

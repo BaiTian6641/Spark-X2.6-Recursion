@@ -281,8 +281,10 @@ class TestLoop72TorchComponents(unittest.TestCase):
         )
         s_cfg = SparseAttentionConfig(exact_threshold=32, sparse_query_tile_tokens=8)
 
+        from sparkx_sparse_attention import SparseRuntimeTelemetry
+        telem_a = SparseRuntimeTelemetry()
         cache_a = Loop72HybridPagedCache(config=p_cfg)
-        slot_a = cache_a.append_global_visit(3, k_a, v_a)
+        slot_a = cache_a.append_global_visit(3, k_a, v_a, indexer=indexer)
         out_a = paged_dlsa_global_attention_forward(
             module=torch.nn.Module(),
             query=q_a,
@@ -291,10 +293,14 @@ class TestLoop72TorchComponents(unittest.TestCase):
             q_positions=torch.arange(t),
             scaling=1.0 / (d ** 0.5),
             sparse_cfg=s_cfg,
+            telemetry=telem_a,
         )
+        self.assertGreaterEqual(telem_a.sparse_prefill_calls, 1)
+        self.assertEqual(telem_a.dense_fallback_calls, 0)
 
+        telem_b = SparseRuntimeTelemetry()
         cache_b = Loop72HybridPagedCache(config=p_cfg)
-        slot_b = cache_b.append_global_visit(3, k_b, v_b)
+        slot_b = cache_b.append_global_visit(3, k_b, v_b, indexer=indexer)
         out_b = paged_dlsa_global_attention_forward(
             module=torch.nn.Module(),
             query=q_b,
@@ -303,7 +309,10 @@ class TestLoop72TorchComponents(unittest.TestCase):
             q_positions=torch.arange(t),
             scaling=1.0 / (d ** 0.5),
             sparse_cfg=s_cfg,
+            telemetry=telem_b,
         )
+        self.assertGreaterEqual(telem_b.sparse_prefill_calls, 1)
+        self.assertEqual(telem_b.dense_fallback_calls, 0)
         max_prefix_diff = float((out_a[:, :, :64, :] - out_b[:, :, :64, :]).abs().max().item())
         self.assertLess(max_prefix_diff, 1e-6)
 

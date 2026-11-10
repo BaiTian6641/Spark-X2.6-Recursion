@@ -2983,7 +2983,7 @@ def run_full_length_1m_context_benchmark(
 def generate_omp_models_yaml(
     output_path: Optional[str] = None,
     port: int = 8000,
-    model_id: str = "spark-x2.6-4b-loop72-dlsa",
+    model_id: str = "Spark-X2.6-4B-Recursive72",
     context_window: int = 131_072,
     max_tokens: int = 4096,
     **kwargs: Any,
@@ -3002,7 +3002,7 @@ def start_loop72_openai_compatible_server(
     tokenizer: Any,
     host: str = "127.0.0.1",
     port: int = 8000,
-    model_id: str = "spark-x2.6-4b-loop72-dlsa",
+    model_id: str = "Spark-X2.6-4B-Recursive72",
     background: bool = True,
     **kwargs: Any,
 ) -> Any:

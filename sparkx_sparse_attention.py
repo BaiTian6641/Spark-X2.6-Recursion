@@ -63,6 +63,7 @@ class SparseAttentionConfig:
     residual_compensation: bool = False
     residual_block_compensation: Optional[bool] = None
     unbounded_dense_fallback: bool = False
+    max_workspace_bytes: int = 128 * (1024 ** 2)
     yarn_scale_factor: float = 1.0
     yarn_orig_max_position: int = 1048576
     yarn_original_max_position: Optional[int] = None
@@ -337,11 +338,23 @@ def paged_dlsa_global_attention_forward(
         q_pos = torch.arange(max(0, max_upto - q_len), max_upto, device=dev, dtype=torch.long)
 
     idx_obj: Optional[PagedLatentIndex] = slot.dlsa_state_slot.get("index")
+    allow_dense_fallback = bool(sparse_cfg.unbounded_dense_fallback) if sparse_cfg is not None else False
+    max_ws_bytes = int(sparse_cfg.max_workspace_bytes) if sparse_cfg is not None else (128 * (1024 ** 2))
 
-    # Fast path 1: Sequence is within the exact budget threshold -> zero-copy GPU resident slice or gather `[0..max_upto)`
+    if max_upto > eff_exact_threshold and idx_obj is None and not allow_dense_fallback:
+        raise RuntimeError(
+            f"paged_dlsa_global_attention_forward: sequence length {max_upto} exceeds exact_threshold "
+            f"{eff_exact_threshold}, but GlobalPagedVisitSlot(visit={slot.virtual_visit}) has no PagedLatentIndex "
+            f"and unbounded_dense_fallback=False."
+        )
+
+    # Fast path 1: Sequence is within the exact budget threshold (or explicit unbounded_dense_fallback=True)
     if max_upto <= eff_exact_threshold or idx_obj is None:
         if telemetry is not None:
-            telemetry.exact_short_calls += 1
+            if max_upto <= eff_exact_threshold:
+                telemetry.exact_short_calls += 1
+            else:
+                telemetry.dense_fallback_calls += 1
         if slot.is_fully_gpu_resident(max_upto):
             k_all, v_all = slot.get_resident_prefix(max_upto)
         else:
@@ -430,10 +443,11 @@ def paged_dlsa_global_attention_forward(
     )
 
     if can_vectorize:
-        vec_tile_sz = max(tile_sz, 64) if q_len >= 64 else tile_sz
         q_proj_all = indexer.project_q(indexer._group_free_query_features(query[0]))  # [q_len, d_idx]
         dist_alpha_tau = float(indexer.dist_alpha_over_tau())
         exact_cutoff = indexer.n_sink + indexer.window + eff_budget
+        h_kv_est = int(slot.sink_k.shape[1]) if slot.sink_k is not None else (int(slot.tail_k.shape[1]) if slot.tail_k is not None else 4)
+        elem_sz = int(query.element_size())
 
         def _query_regime(pos_val: int) -> Tuple[bool, int]:
             u_val = min(pos_val + 1, idx_obj.t)
@@ -443,6 +457,22 @@ def paged_dlsa_global_attention_forward(
             if lim == 0:
                 return True, 0
             return False, lim
+
+        def _workspace_safe_tile_len(limit_blocks: int, base_tile: int) -> int:
+            if max_ws_bytes <= 0:
+                return max(1, base_tile)
+            c_slots_est = int(idx_obj.pools_per_block)
+            n_comp = (
+                int(idx_obj._block_compact_ends[limit_blocks - 1])
+                if (0 < limit_blocks <= len(idx_obj._block_compact_ends))
+                else (limit_blocks * c_slots_est)
+            )
+            score_row_bytes = max(1, n_comp) * 5  # float32 score + bool mask
+            base_kv_bytes = 2 * h_kv_est * (idx_obj.n_sink + idx_obj.window + idx_obj.n_cluster) * head_dim * elem_sz
+            per_q_kv_bytes = 2 * h_kv_est * max(1, eff_budget) * head_dim * elem_sz
+            avail = max(0, max_ws_bytes - base_kv_bytes)
+            per_q = max(1, score_row_bytes + per_q_kv_bytes)
+            return max(1, min(base_tile, avail // per_q if avail >= per_q else 1))
 
         s_i = 0
         while s_i < q_len:
@@ -480,9 +510,10 @@ def paged_dlsa_global_attention_forward(
                 s_i = e_i
                 continue
 
-            # Vectorized strictly-causal sparse tile with constant Ward block horizon `limit_s > 0`
+            # Vectorized strictly-causal sparse tile honoring `tile_sz` and `max_workspace_bytes` (`F18`)
+            eff_tile_sz = _workspace_safe_tile_len(limit_s, tile_sz)
             e_i = s_i + 1
-            max_e = min(q_len, s_i + vec_tile_sz)
+            max_e = min(q_len, s_i + eff_tile_sz)
             while e_i < max_e and _query_regime(q_pos_list[e_i]) == (False, limit_s):
                 e_i += 1
             t_len = e_i - s_i
@@ -491,28 +522,47 @@ def paged_dlsa_global_attention_forward(
             q_proj_tile = q_proj_all[s_i:e_i]
             max_tile_upto = min(q_pos_list[e_i - 1] + 1, idx_obj.t)
             clustered_end = idx_obj.mid_start + limit_s * idx_obj.n_cluster
-
-            cents_lim = idx_obj.centroids[:limit_s].to(dev)
-            toks_lim = idx_obj.bucket_tokens[:limit_s].to(dev)
-            c_slots = int(cents_lim.shape[1])
+            c_slots = int(idx_obj.pools_per_block)
             b_tot = limit_s * c_slots
+            n_comp = int(idx_obj._block_compact_ends[limit_s - 1]) if limit_s <= len(idx_obj._block_compact_ends) else 0
 
-            scores = torch.matmul(q_proj_tile, cents_lim.reshape(b_tot, -1).t())  # [t_len, b_tot]
-            if dist_alpha_tau > 0.0:
-                blk_centers = idx_obj.mid_start + (torch.arange(limit_s, device=dev, dtype=torch.float32) + 0.5) * float(idx_obj.n_cluster)
-                blk_pen = dist_alpha_tau * torch.log1p(
-                    (q_pos_tile.float().unsqueeze(1) - blk_centers.unsqueeze(0)).clamp(min=0.0) / max(1.0, float(idx_obj.window))
-                )
-                scores = (scores.view(t_len, limit_s, c_slots) - blk_pen.unsqueeze(2)).reshape(t_len, b_tot)
-
-            toks_flat = toks_lim.reshape(b_tot)
-            scores = scores.masked_fill(toks_flat.unsqueeze(0) == 0, float("-inf"))
-            stage1_budget = int(eff_budget)
-            max_cand_buckets = min(b_tot, max(16, stage1_budget // max(1, idx_obj.n_pool) + 8))
-            flat_s, flat_i = torch.topk(scores, k=max_cand_buckets, dim=-1, largest=True, sorted=True)
-            flat_t = toks_flat.unsqueeze(0).expand(t_len, b_tot).gather(1, flat_i)
-            csum = torch.cumsum(flat_t, dim=-1)
-            take = ((csum - flat_t) < stage1_budget) & torch.isfinite(flat_s)
+            if n_comp > 0 and idx_obj._buf_compact_cents.numel() > 0:
+                comp_cents = idx_obj._buf_compact_cents[:n_comp].to(dev)
+                comp_toks = idx_obj._buf_compact_btoks[:n_comp].to(dev)
+                comp_flat_ids = idx_obj._buf_compact_flat_ids[:n_comp].to(dev)
+                scores = torch.matmul(q_proj_tile, comp_cents.t())  # [t_len, n_comp]
+                if dist_alpha_tau > 0.0:
+                    blk_ids = torch.div(comp_flat_ids, c_slots, rounding_mode="floor")
+                    blk_centers = idx_obj.mid_start + (blk_ids.float() + 0.5) * float(idx_obj.n_cluster)
+                    blk_pen = dist_alpha_tau * torch.log1p(
+                        (q_pos_tile.float().unsqueeze(1) - blk_centers.unsqueeze(0)).clamp(min=0.0) / max(1.0, float(idx_obj.window))
+                    )
+                    scores = scores - blk_pen
+                stage1_budget = int(eff_budget)
+                max_cand_buckets = min(n_comp, max(16, stage1_budget // max(1, idx_obj.n_pool) + 8))
+                flat_s, comp_i = torch.topk(scores, k=max_cand_buckets, dim=-1, largest=True, sorted=True)
+                flat_t = comp_toks.unsqueeze(0).expand(t_len, n_comp).gather(1, comp_i)
+                csum = torch.cumsum(flat_t, dim=-1)
+                take = ((csum - flat_t) < stage1_budget) & torch.isfinite(flat_s)
+                flat_i = comp_flat_ids.unsqueeze(0).expand(t_len, n_comp).gather(1, comp_i)
+            else:
+                cents_lim = idx_obj.centroids[:limit_s].to(dev)
+                toks_lim = idx_obj.bucket_tokens[:limit_s].to(dev)
+                scores = torch.matmul(q_proj_tile, cents_lim.reshape(b_tot, -1).t())  # [t_len, b_tot]
+                if dist_alpha_tau > 0.0:
+                    blk_centers = idx_obj.mid_start + (torch.arange(limit_s, device=dev, dtype=torch.float32) + 0.5) * float(idx_obj.n_cluster)
+                    blk_pen = dist_alpha_tau * torch.log1p(
+                        (q_pos_tile.float().unsqueeze(1) - blk_centers.unsqueeze(0)).clamp(min=0.0) / max(1.0, float(idx_obj.window))
+                    )
+                    scores = (scores.view(t_len, limit_s, c_slots) - blk_pen.unsqueeze(2)).reshape(t_len, b_tot)
+                toks_flat = toks_lim.reshape(b_tot)
+                scores = scores.masked_fill(toks_flat.unsqueeze(0) == 0, float("-inf"))
+                stage1_budget = int(eff_budget)
+                max_cand_buckets = min(b_tot, max(16, stage1_budget // max(1, idx_obj.n_pool) + 8))
+                flat_s, flat_i = torch.topk(scores, k=max_cand_buckets, dim=-1, largest=True, sorted=True)
+                flat_t = toks_flat.unsqueeze(0).expand(t_len, b_tot).gather(1, flat_i)
+                csum = torch.cumsum(flat_t, dim=-1)
+                take = ((csum - flat_t) < stage1_budget) & torch.isfinite(flat_s)
 
             b_selected_mask = torch.zeros((t_len, b_tot), dtype=torch.bool, device=dev)
             b_selected_mask.scatter_(1, flat_i, take)
@@ -776,6 +826,15 @@ def attach_loop72_dlsa_attention(
                 else:
                     query_states, key_states = q_rot, k_rot
 
+            capture_cb = getattr(self_attn, "_sparkx_qkv_capture_callback", None)
+            if callable(capture_cb):
+                capture_cb(
+                    module=self_attn,
+                    visit_context=getattr(self_attn, "_sparkx_active_visit", None),
+                    query=query_states.detach(),
+                    key=key_states.detach(),
+                    value=value_states.detach(),
+                )
             if getattr(self_attn, "_capture_sleep_qkv", False):
                 self_attn._sleep_last_qkv = (
                     query_states.detach(),

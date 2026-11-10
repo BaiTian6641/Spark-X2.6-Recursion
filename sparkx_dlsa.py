@@ -242,63 +242,201 @@ class PagedLatentIndex:
         self.window = int(window)
         self.d = int(k_idx.shape[-1])
         d = self.d
+        dev = k_idx.device if k_idx.numel() > 0 else torch.device("cpu")
         mid_end = max(self.n_sink, self.t - self.window)
         n_blocks = max(0, (mid_end - self.n_sink) // self.n_cluster)
-        self.n_blocks = n_blocks
+        self.n_blocks = 0
         self.mid_start = self.n_sink
-        self.clustered_end = self.n_sink + n_blocks * self.n_cluster  # keys in [clustered_end, T) are always read
+        self.clustered_end = self.n_sink  # keys in [clustered_end, T) are always read
         self.pools_per_block = self.n_cluster // self.n_pool
         self.avg_bucket_size = int(avg_bucket_size)
         self.max_bucket_size = int(max_bucket_size)
         self.max_pools_per_bucket = max(1, int(self.max_bucket_size) // self.n_pool)
 
-        self._cent_pages: List[torch.Tensor] = []
-        self._label_pages: List[torch.Tensor] = []
-        self._btok_pages: List[torch.Tensor] = []
-        self._bpool_pages: List[torch.Tensor] = []
-        self._k_idx_pages: List[torch.Tensor] = []
-        self._materialized_blocks: int = -1
-        self._mat_centroids: torch.Tensor = torch.zeros(0, 0, d)
-        self._mat_labels: torch.Tensor = torch.zeros(0, 0, dtype=torch.long)
-        self._mat_btoks: torch.Tensor = torch.zeros(0, 0)
-        self._mat_bpools: torch.Tensor = torch.zeros(0, 0, self.max_pools_per_bucket, dtype=torch.long)
-        self._mat_k_idx_n: Optional[torch.Tensor] = None
-        self._k_idx_mat_t: int = -1
+        # Geometric (2x) append-only block capacity buffers (eliminating O(B) torch.cat rebuilds, F13)
+        self._index_device: torch.device = dev
+        self._cap_blocks: int = 0
+        self._buf_centroids: torch.Tensor = torch.zeros((0, self.pools_per_block, d), device=dev, dtype=torch.float32)
+        self._buf_labels: torch.Tensor = torch.zeros((0, self.pools_per_block), device=dev, dtype=torch.long)
+        self._buf_btoks: torch.Tensor = torch.zeros((0, self.pools_per_block), device=dev, dtype=torch.float32)
+        self._buf_bpools: torch.Tensor = torch.zeros((0, self.pools_per_block, self.max_pools_per_bucket), device=dev, dtype=torch.long)
+
+        # Compact non-empty leaf bucket buffers + incremental f-ary tree pyramid (F13)
+        self._compact_cap: int = 0
+        self._compact_len: int = 0
+        self._buf_compact_cents: torch.Tensor = torch.zeros((0, d), device=dev, dtype=torch.float32)
+        self._buf_compact_btoks: torch.Tensor = torch.zeros((0,), device=dev, dtype=torch.float32)
+        self._buf_compact_flat_ids: torch.Tensor = torch.zeros((0,), device=dev, dtype=torch.long)
+        self._block_compact_ends: List[int] = [0]
+        self._tree_level_bufs: List[torch.Tensor] = []
+        self._tree_level_lens: List[int] = []
+
+        # Geometric persistent token-latent buffer (only when persistent_token_latents=True)
+        self._k_idx_cap: int = 0
+        self._k_idx_len: int = 0
+        self._buf_k_idx_n: Optional[torch.Tensor] = None
+
+        # Cached horizon tree slice for repeated decode steps at fixed `limit`
         self._cached_tree_limit: int = -1
         self._cached_tree_valid_ids: Optional[torch.Tensor] = None
         self._cached_tree_levels: Optional[List[torch.Tensor]] = None
 
-        if self.persistent_token_latents and self.t > 0:
-            kk = F.normalize(k_idx.float(), dim=-1, eps=1e-6)
-            self._k_idx_pages.append(kk)
-        else:
-            kk = F.normalize(k_idx[self.mid_start: self.clustered_end].float(), dim=-1, eps=1e-6) if n_blocks > 0 else None
+        # Unclustered rolling tail covering strictly `[max(n_sink, clustered_end), t)` (F14)
+        self._unclustered_k_store: Optional[torch.Tensor] = None
+        self._unclustered_k_start: int = 0
+        self._unclustered_k_end: int = 0
+        self._unclustered_k_buf: torch.Tensor = torch.zeros((0, d), device=dev, dtype=torch.float32)
 
-        if n_blocks == 0:
+        if self.t > 0:
+            kk_full = F.normalize(k_idx.float(), dim=-1, eps=1e-6)
+            if self.persistent_token_latents:
+                self._append_persistent_k_latents(kk_full)
+            if n_blocks > 0:
+                end_init = self.n_sink + n_blocks * self.n_cluster
+                self._cluster_new_blocks_from_slice(kk_full[self.mid_start:end_init], target_total_t=self.t)
+            tail_lo = max(self.n_sink, self.clustered_end)
+            if self.t > tail_lo:
+                self._set_unclustered_tail(kk_full[tail_lo : self.t])
+
+    def _append_persistent_k_latents(self, kk_chunk: torch.Tensor) -> None:
+        c_len = int(kk_chunk.shape[0])
+        if c_len <= 0:
+            return
+        dev = kk_chunk.device
+        need = self._k_idx_len + c_len
+        if self._buf_k_idx_n is None or need > self._k_idx_cap or self._buf_k_idx_n.device != dev:
+            new_cap = max(256, need if self._k_idx_cap == 0 else max(self._k_idx_cap * 2, need))
+            new_buf = torch.empty((new_cap, self.d), device=dev, dtype=torch.float32)
+            if self._buf_k_idx_n is not None and self._k_idx_len > 0:
+                new_buf[: self._k_idx_len].copy_(self._buf_k_idx_n[: self._k_idx_len].to(dev))
+            self._buf_k_idx_n = new_buf
+            self._k_idx_cap = new_cap
+        self._buf_k_idx_n[self._k_idx_len : need].copy_(kk_chunk)
+        self._k_idx_len = need
+
+    def _ensure_block_capacity(self, needed_blocks: int, dev: torch.device) -> None:
+        if needed_blocks <= self._cap_blocks and self._buf_centroids.device == dev:
+            return
+        new_cap = max(16, needed_blocks if self._cap_blocks == 0 else max(self._cap_blocks * 2, needed_blocks))
+        p = self.pools_per_block
+        mp = self.max_pools_per_bucket
+        new_cents = torch.empty((new_cap, p, self.d), device=dev, dtype=torch.float32)
+        new_labels = torch.empty((new_cap, p), device=dev, dtype=torch.long)
+        new_btoks = torch.empty((new_cap, p), device=dev, dtype=torch.float32)
+        new_bpools = torch.empty((new_cap, p, mp), device=dev, dtype=torch.long)
+        if self.n_blocks > 0:
+            new_cents[: self.n_blocks].copy_(self._buf_centroids[: self.n_blocks].to(dev))
+            new_labels[: self.n_blocks].copy_(self._buf_labels[: self.n_blocks].to(dev))
+            new_btoks[: self.n_blocks].copy_(self._buf_btoks[: self.n_blocks].to(dev))
+            new_bpools[: self.n_blocks].copy_(self._buf_bpools[: self.n_blocks].to(dev))
+        self._buf_centroids = new_cents
+        self._buf_labels = new_labels
+        self._buf_btoks = new_btoks
+        self._buf_bpools = new_bpools
+        self._cap_blocks = new_cap
+        self._index_device = dev
+
+    def _append_compact_and_tree(self, new_cents: torch.Tensor, new_btoks: torch.Tensor, block_start_idx: int) -> None:
+        """Incrementally append non-empty buckets from newly sealed blocks into compact leaf arrays and update only newly
+        completed f-ary tree parent nodes ($O(\\log_f P)$ amortized work per block, F13)."""
+        b_cnt, p_cnt, d = new_cents.shape
+        dev = new_cents.device
+        if self._compact_len > 0 and self._buf_compact_cents.device != dev:
+            self._buf_compact_cents = self._buf_compact_cents.to(dev)
+            self._buf_compact_btoks = self._buf_compact_btoks.to(dev)
+            self._buf_compact_flat_ids = self._buf_compact_flat_ids.to(dev)
+            self._tree_level_bufs = [buf.to(dev) for buf in self._tree_level_bufs]
+
+        old_compact_len = self._compact_len
+        for local_b in range(b_cnt):
+            bt_row = new_btoks[local_b]
+            nz_slots = torch.nonzero(bt_row > 0, as_tuple=False).squeeze(1)
+            m = int(nz_slots.numel())
+            if m > 0:
+                need = self._compact_len + m
+                if need > self._compact_cap:
+                    new_ccap = max(128, max(self._compact_cap * 2, need))
+                    nc = torch.empty((new_ccap, d), device=dev, dtype=torch.float32)
+                    nt = torch.empty((new_ccap,), device=dev, dtype=torch.float32)
+                    nf = torch.empty((new_ccap,), device=dev, dtype=torch.long)
+                    if self._compact_len > 0:
+                        nc[: self._compact_len].copy_(self._buf_compact_cents[: self._compact_len])
+                        nt[: self._compact_len].copy_(self._buf_compact_btoks[: self._compact_len])
+                        nf[: self._compact_len].copy_(self._buf_compact_flat_ids[: self._compact_len])
+                    self._buf_compact_cents = nc
+                    self._buf_compact_btoks = nt
+                    self._buf_compact_flat_ids = nf
+                    self._compact_cap = new_ccap
+                s_idx = self._compact_len
+                self._buf_compact_cents[s_idx : s_idx + m].copy_(new_cents[local_b].index_select(0, nz_slots))
+                self._buf_compact_btoks[s_idx : s_idx + m].copy_(bt_row.index_select(0, nz_slots))
+                flat_ids = (block_start_idx + local_b) * p_cnt + nz_slots
+                self._buf_compact_flat_ids[s_idx : s_idx + m].copy_(flat_ids)
+                self._compact_len += m
+            self._block_compact_ends.append(self._compact_len)
+
+        if self._compact_len == old_compact_len:
             return
 
-        blk_src = kk[self.mid_start: self.clustered_end] if self.persistent_token_latents else kk
-        blk = blk_src.view(n_blocks, self.pools_per_block, self.n_pool, d)
-        pools = F.normalize(blk.mean(dim=2), dim=-1, eps=1e-6)  # [B, P, d]
-        target = max(1, self.n_cluster // int(avg_bucket_size))
-        labels = ward_partition(pools, target, max_pools_per_bucket=self.max_pools_per_bucket)
-        p = self.pools_per_block
-        onehot = F.one_hot(labels, num_classes=p).float()  # [B, P, C]
-        sums = torch.einsum("bpc,bpd->bcd", onehot, pools)
-        cents = F.normalize(sums, dim=-1, eps=1e-6)  # [B, C, d]
-        btoks = onehot.sum(dim=1) * self.n_pool  # [B, C] token count per bucket (0 = empty slot)
-        bpools = self._build_bucket_pool_bases(labels, block_start_idx=0)
-        self._cent_pages.append(cents)
-        self._label_pages.append(labels)
-        self._btok_pages.append(btoks)
-        self._bpool_pages.append(bpools)
+        # Incrementally extend complete f-ary parent nodes across tree levels 1, 2, ...
+        f = self.branching_factor
+        lvl = 0
+        child_buf = self._buf_compact_cents
+        child_len = self._compact_len
+        while child_len >= f:
+            complete_parents = child_len // f
+            if lvl >= len(self._tree_level_bufs):
+                init_pcap = max(32, complete_parents * 2)
+                self._tree_level_bufs.append(torch.empty((init_pcap, d), device=dev, dtype=torch.float32))
+                self._tree_level_lens.append(0)
+            prev_parents = self._tree_level_lens[lvl]
+            if complete_parents > prev_parents:
+                p_buf = self._tree_level_bufs[lvl]
+                if complete_parents > int(p_buf.shape[0]):
+                    new_pcap = max(int(p_buf.shape[0]) * 2, complete_parents)
+                    np_buf = torch.empty((new_pcap, d), device=dev, dtype=torch.float32)
+                    if prev_parents > 0:
+                        np_buf[:prev_parents].copy_(p_buf[:prev_parents])
+                    p_buf = np_buf
+                    self._tree_level_bufs[lvl] = p_buf
+                c_lo = prev_parents * f
+                c_hi = complete_parents * f
+                delta_p = complete_parents - prev_parents
+                parent_slice = F.normalize(
+                    child_buf[c_lo:c_hi].view(delta_p, f, d).sum(dim=1),
+                    dim=-1,
+                    eps=1e-6,
+                )
+                p_buf[prev_parents:complete_parents].copy_(parent_slice)
+                self._tree_level_lens[lvl] = complete_parents
+            child_buf = self._tree_level_bufs[lvl]
+            child_len = self._tree_level_lens[lvl]
+            lvl += 1
+
+    def offload_index_to_cpu(self) -> None:
+        """Move resident block/compact/tree index buffers to CPU to honor `index_gpu_budget_bytes` (`F11`)."""
+        cpu = torch.device("cpu")
+        self._index_device = cpu
+        self._buf_centroids = self._buf_centroids.to(cpu)
+        self._buf_labels = self._buf_labels.to(cpu)
+        self._buf_btoks = self._buf_btoks.to(cpu)
+        self._buf_bpools = self._buf_bpools.to(cpu)
+        self._buf_compact_cents = self._buf_compact_cents.to(cpu)
+        self._buf_compact_btoks = self._buf_compact_btoks.to(cpu)
+        self._buf_compact_flat_ids = self._buf_compact_flat_ids.to(cpu)
+        self._tree_level_bufs = [b.to(cpu) for b in self._tree_level_bufs]
+        if self._buf_k_idx_n is not None:
+            self._buf_k_idx_n = self._buf_k_idx_n.to(cpu)
+        if self._unclustered_k_store is not None:
+            self._unclustered_k_store = self._unclustered_k_store.to(cpu)
+            self._unclustered_k_buf = self._unclustered_k_store[self._unclustered_k_start : self._unclustered_k_end]
+        self._cached_tree_limit = -1
 
     def _build_bucket_pool_bases(self, labels: torch.Tensor, block_start_idx: int) -> torch.Tensor:
         """Build direct `[B, P, max_pools_per_bucket]` lookup table of absolute token base positions per bucket (-1 = unused)."""
         b_cnt, p_cnt = labels.shape
         dev = labels.device
         mp = self.max_pools_per_bucket
-        # `onehot_b`: `[B, C, P]` boolean membership of pool `p` in bucket `c`
         onehot_b = F.one_hot(labels, num_classes=p_cnt).permute(0, 2, 1).to(torch.long)  # [B, C, P]
         slot_rank = torch.cumsum(onehot_b, dim=2) - 1  # [B, C, P]
         valid = (onehot_b > 0) & (slot_rank < mp)
@@ -314,94 +452,89 @@ class PagedLatentIndex:
         return out
 
     def _ensure_materialized(self) -> None:
-        if self._materialized_blocks == self.n_blocks:
-            return
-        if not self._cent_pages or self.n_blocks == 0:
-            self._mat_centroids = torch.zeros(0, 0, self.d)
-            self._mat_labels = torch.zeros(0, 0, dtype=torch.long)
-            self._mat_btoks = torch.zeros(0, 0)
-            self._mat_bpools = torch.zeros(0, 0, self.max_pools_per_bucket, dtype=torch.long)
-        elif len(self._cent_pages) == 1:
-            self._mat_centroids = self._cent_pages[0]
-            self._mat_labels = self._label_pages[0]
-            self._mat_btoks = self._btok_pages[0]
-            self._mat_bpools = self._bpool_pages[0] if self._bpool_pages else self._build_bucket_pool_bases(self._mat_labels, 0)
-        else:
-            dev = self._cent_pages[0].device
-            ldev = self._label_pages[0].device
-            self._mat_centroids = torch.cat([c.to(dev) for c in self._cent_pages], dim=0)
-            self._mat_labels = torch.cat([l.to(ldev) for l in self._label_pages], dim=0)
-            self._mat_btoks = torch.cat([b.to(dev) for b in self._btok_pages], dim=0)
-            if self._bpool_pages and len(self._bpool_pages) == len(self._label_pages):
-                self._mat_bpools = torch.cat([bp.to(ldev) for bp in self._bpool_pages], dim=0)
-            else:
-                self._mat_bpools = self._build_bucket_pool_bases(self._mat_labels, 0)
-            self._cent_pages = [self._mat_centroids]
-            self._label_pages = [self._mat_labels]
-            self._btok_pages = [self._mat_btoks]
-            self._bpool_pages = [self._mat_bpools]
-        self._materialized_blocks = self.n_blocks
+        """Maintain legacy `_mat_*` views directly backed by the preallocated geometric `_buf_*` capacity arrays (zero copies)."""
+        self._mat_centroids = self._buf_centroids[: self.n_blocks]
+        self._mat_labels = self._buf_labels[: self.n_blocks]
+        self._mat_btoks = self._buf_btoks[: self.n_blocks]
+        self._mat_bpools = self._buf_bpools[: self.n_blocks]
+
+    def _rebuild_compact_from_full_buffers(self) -> None:
+        self._compact_len = 0
+        self._block_compact_ends = [0]
+        self._tree_level_bufs = []
+        self._tree_level_lens = []
+        self._cached_tree_limit = -1
+        if self.n_blocks > 0:
+            self._append_compact_and_tree(
+                self._buf_centroids[: self.n_blocks],
+                self._buf_btoks[: self.n_blocks],
+                block_start_idx=0,
+            )
 
     @property
     def centroids(self) -> torch.Tensor:
-        self._ensure_materialized()
-        return self._mat_centroids
+        return self._buf_centroids[: self.n_blocks]
 
     @centroids.setter
     def centroids(self, val: torch.Tensor) -> None:
-        self._cent_pages = [val] if val.numel() > 0 else []
-        self._mat_centroids = val
-        self._materialized_blocks = self.n_blocks
+        nb = int(val.shape[0]) if val.ndim >= 3 else 0
+        self.n_blocks = nb
+        if nb > 0:
+            self._ensure_block_capacity(nb, val.device)
+            self._buf_centroids[:nb].copy_(val)
+        self._rebuild_compact_from_full_buffers()
 
     @property
     def labels(self) -> torch.Tensor:
-        self._ensure_materialized()
-        return self._mat_labels
+        return self._buf_labels[: self.n_blocks]
 
     @labels.setter
     def labels(self, val: torch.Tensor) -> None:
-        self._label_pages = [val] if val.numel() > 0 else []
-        self._mat_labels = val
-        self._materialized_blocks = self.n_blocks
+        nb = int(val.shape[0]) if val.ndim >= 2 else 0
+        self.n_blocks = nb
+        if nb > 0:
+            self._ensure_block_capacity(nb, val.device)
+            self._buf_labels[:nb].copy_(val)
+            self._buf_bpools[:nb].copy_(self._build_bucket_pool_bases(val, block_start_idx=0))
+        self._cached_tree_limit = -1
 
     @property
     def bucket_tokens(self) -> torch.Tensor:
-        self._ensure_materialized()
-        return self._mat_btoks
+        return self._buf_btoks[: self.n_blocks]
 
     @bucket_tokens.setter
     def bucket_tokens(self, val: torch.Tensor) -> None:
-        self._btok_pages = [val] if val.numel() > 0 else []
-        self._mat_btoks = val
-        self._materialized_blocks = self.n_blocks
+        nb = int(val.shape[0]) if val.ndim >= 2 else 0
+        self.n_blocks = nb
+        if nb > 0:
+            self._ensure_block_capacity(nb, val.device)
+            self._buf_btoks[:nb].copy_(val)
+        self._rebuild_compact_from_full_buffers()
 
     @property
     def k_idx_n(self) -> Optional[torch.Tensor]:
-        if not self.persistent_token_latents or not self._k_idx_pages:
+        if not self.persistent_token_latents or self._buf_k_idx_n is None or self._k_idx_len <= 0:
             return None
-        if self._k_idx_mat_t != self.t or self._mat_k_idx_n is None:
-            if len(self._k_idx_pages) == 1:
-                self._mat_k_idx_n = self._k_idx_pages[0]
-            else:
-                dev = self._k_idx_pages[0].device
-                self._mat_k_idx_n = torch.cat([p.to(dev) for p in self._k_idx_pages], dim=0)
-                self._k_idx_pages = [self._mat_k_idx_n]
-            self._k_idx_mat_t = self.t
-        return self._mat_k_idx_n
+        return self._buf_k_idx_n[: self._k_idx_len]
 
     @k_idx_n.setter
     def k_idx_n(self, val: Optional[torch.Tensor]) -> None:
         if val is None:
-            self._k_idx_pages = []
-            self._mat_k_idx_n = None
-            self._k_idx_mat_t = -1
+            self._buf_k_idx_n = None
+            self._k_idx_cap = 0
+            self._k_idx_len = 0
         else:
-            self._k_idx_pages = [val]
-            self._mat_k_idx_n = val
-            self._k_idx_mat_t = int(val.shape[0])
+            self._buf_k_idx_n = None
+            self._k_idx_cap = 0
+            self._k_idx_len = 0
+            self._append_persistent_k_latents(val.float())
 
     def _set_unclustered_tail(self, k_tail: torch.Tensor) -> None:
+        """Reset the unclustered rolling tail representing strictly `[max(n_sink, clustered_end), t)`."""
         kk = F.normalize(k_tail.float(), dim=-1, eps=1e-6)
+        expected_len = max(0, self.t - max(self.n_sink, self.clustered_end))
+        if int(kk.shape[0]) > expected_len and expected_len >= 0:
+            kk = kk[int(kk.shape[0]) - expected_len :]
         n_tok = int(kk.shape[0])
         cap = max(2048, self.n_cluster * 2 + self.window + 512, n_tok + 512)
         store = torch.empty((cap, self.d), device=kk.device, dtype=torch.float32)
@@ -412,65 +545,79 @@ class PagedLatentIndex:
         self._unclustered_k_end = n_tok
         self._unclustered_k_buf = store[:n_tok]
 
+    def _append_to_unclustered_store(self, kk_mid: torch.Tensor) -> None:
+        """Append normalized key latents `kk_mid` (strictly at absolute positions `>= n_sink`) into the rolling tail buffer."""
+        m_len = int(kk_mid.shape[0])
+        if m_len <= 0:
+            return
+        target_dev = self._index_device if self._cap_blocks > 0 else kk_mid.device
+        kk_mid = kk_mid.to(target_dev)
+        store = self._unclustered_k_store
+        if store is None:
+            cap = max(2048, self.n_cluster * 2 + self.window + 512, m_len + 512)
+            store = torch.empty((cap, self.d), device=target_dev, dtype=torch.float32)
+            store[:m_len].copy_(kk_mid)
+            self._unclustered_k_store = store
+            self._unclustered_k_start = 0
+            self._unclustered_k_end = m_len
+            self._unclustered_k_buf = store[:m_len]
+            return
+
+        if store.device != target_dev:
+            store = store.to(target_dev)
+            self._unclustered_k_store = store
+        s_off = int(self._unclustered_k_start)
+        e_off = int(self._unclustered_k_end)
+        cur_len = e_off - s_off
+        cap = int(store.shape[0])
+        if e_off + m_len > cap:
+            if cur_len + m_len <= cap:
+                if cur_len > 0:
+                    store[:cur_len].copy_(store[s_off:e_off].clone())
+                s_off = 0
+                e_off = cur_len
+            else:
+                new_cap = max(cap * 2, cur_len + m_len + 1024)
+                new_store = torch.empty((new_cap, self.d), device=target_dev, dtype=torch.float32)
+                if cur_len > 0:
+                    new_store[:cur_len].copy_(store[s_off:e_off])
+                store = new_store
+                self._unclustered_k_store = store
+                s_off = 0
+                e_off = cur_len
+        store[e_off : e_off + m_len].copy_(kk_mid)
+        e_off += m_len
+        self._unclustered_k_start = s_off
+        self._unclustered_k_end = e_off
+        self._unclustered_k_buf = store[s_off:e_off]
+
     @torch.no_grad()
     def append_new_keys(self, k_idx_new: torch.Tensor) -> int:
-        """Append only newly arrived key latents `k_idx_new` (`[Delta_T, d]`) without passing the full prefix."""
+        """Append only newly arrived key latents `k_idx_new` (`[Delta_T, d]`) without passing the full prefix.
+        Strictly aligns across the `n_sink` boundary even when initial chunks have `1..3 < n_sink` tokens (`F14`)."""
         delta_t = int(k_idx_new.shape[0])
         if delta_t <= 0:
             return 0
-        kk_new = F.normalize(k_idx_new.float(), dim=-1, eps=1e-6)
+        old_t = self.t
+        new_t = old_t + delta_t
+        target_dev = self._index_device if (self._cap_blocks > 0 or self._unclustered_k_store is not None) else k_idx_new.device
+        kk_new = F.normalize(k_idx_new.to(target_dev).float(), dim=-1, eps=1e-6)
         if self.persistent_token_latents:
-            self._k_idx_pages.append(kk_new)
+            self._append_persistent_k_latents(kk_new)
 
-        store = getattr(self, "_unclustered_k_store", None)
-        tail_buf = getattr(self, "_unclustered_k_buf", None)
-        if store is None:
-            if tail_buf is None:
-                if self.persistent_token_latents and self.k_idx_n is not None:
-                    full_k = self.k_idx_n
-                    old_t = self.t
-                    self.t = old_t + delta_t
-                    return self._cluster_new_blocks_from_slice(full_k[self.clustered_end: self.t])
-                self._set_unclustered_tail(kk_new)
-                store = self._unclustered_k_store
-                s_off = self._unclustered_k_start
-                e_off = self._unclustered_k_end
-            else:
-                # Migrate legacy `_unclustered_k_buf` into rolling store
-                combined = torch.cat([tail_buf.to(kk_new.device), kk_new], dim=0)
-                self._set_unclustered_tail(combined)
-                store = self._unclustered_k_store
-                s_off = self._unclustered_k_start
-                e_off = self._unclustered_k_end
-        else:
-            s_off = int(getattr(self, "_unclustered_k_start", 0))
-            e_off = int(getattr(self, "_unclustered_k_end", 0))
-            cur_len = e_off - s_off
-            if store.device != kk_new.device:
-                store = store.to(kk_new.device)
-                self._unclustered_k_store = store
-            cap = int(store.shape[0])
-            if e_off + delta_t > cap:
-                if cur_len + delta_t <= cap:
-                    if cur_len > 0:
-                        store[:cur_len].copy_(store[s_off:e_off].clone())
-                    s_off = 0
-                    e_off = cur_len
-                else:
-                    new_cap = max(cap * 2, cur_len + delta_t + 1024)
-                    new_store = torch.empty((new_cap, self.d), device=kk_new.device, dtype=torch.float32)
-                    if cur_len > 0:
-                        new_store[:cur_len].copy_(store[s_off:e_off])
-                    store = new_store
-                    self._unclustered_k_store = store
-                    s_off = 0
-                    e_off = cur_len
-            store[e_off : e_off + delta_t].copy_(kk_new)
-            e_off += delta_t
+        # Skip any newly arrived tokens whose absolute position `< n_sink` so `_unclustered_k_store` ALWAYS starts at `clustered_end` (>= n_sink)
+        skip_sink = min(delta_t, max(0, self.n_sink - old_t))
+        kk_mid = kk_new[skip_sink:]
+        if int(kk_mid.shape[0]) > 0:
+            self._append_to_unclustered_store(kk_mid)
 
-        self.t += delta_t
-        active_slice = store[s_off:e_off]
-        added = self._cluster_new_blocks_from_slice(active_slice)
+        self.t = new_t
+        if self._unclustered_k_store is None:
+            return 0
+        s_off = int(self._unclustered_k_start)
+        e_off = int(self._unclustered_k_end)
+        active_slice = self._unclustered_k_store[s_off:e_off]
+        added = self._cluster_new_blocks_from_slice(active_slice, target_total_t=self.t)
         consumed = added * self.n_cluster
         s_off += consumed
         if s_off == e_off:
@@ -478,11 +625,12 @@ class PagedLatentIndex:
             e_off = 0
         self._unclustered_k_start = s_off
         self._unclustered_k_end = e_off
-        self._unclustered_k_buf = store[s_off:e_off]
+        self._unclustered_k_buf = self._unclustered_k_store[s_off:e_off]
         return added
 
-    def _cluster_new_blocks_from_slice(self, unclustered_slice: torch.Tensor) -> int:
-        mid_end = max(self.n_sink, self.t - self.window)
+    def _cluster_new_blocks_from_slice(self, unclustered_slice: torch.Tensor, target_total_t: Optional[int] = None) -> int:
+        eff_t = self.t if target_total_t is None else int(target_total_t)
+        mid_end = max(self.n_sink, eff_t - self.window)
         new_blocks = max(0, (mid_end - self.n_sink) // self.n_cluster)
         delta_blocks = new_blocks - self.n_blocks
         if delta_blocks <= 0:
@@ -490,7 +638,8 @@ class PagedLatentIndex:
         need_toks = delta_blocks * self.n_cluster
         if int(unclustered_slice.shape[0]) < need_toks:
             return 0
-        kk_new = unclustered_slice[:need_toks]
+        target_dev = self._index_device if self._cap_blocks > 0 else unclustered_slice.device
+        kk_new = unclustered_slice[:need_toks].to(target_dev)
         blk = kk_new.view(delta_blocks, self.pools_per_block, self.n_pool, self.d)
         pools = F.normalize(blk.mean(dim=2), dim=-1, eps=1e-6)
         avg_bs = getattr(self, "avg_bucket_size", 8)
@@ -502,13 +651,19 @@ class PagedLatentIndex:
         sums = torch.einsum("bpc,bpd->bcd", onehot, pools)
         new_centroids = F.normalize(sums, dim=-1, eps=1e-6)
         new_btoks = onehot.sum(dim=1) * self.n_pool
-        new_bpools = self._build_bucket_pool_bases(new_labels, block_start_idx=self.n_blocks)
-        self._cent_pages.append(new_centroids)
-        self._label_pages.append(new_labels)
-        self._btok_pages.append(new_btoks)
-        self._bpool_pages.append(new_bpools)
+        old_blocks = self.n_blocks
+        new_bpools = self._build_bucket_pool_bases(new_labels, block_start_idx=old_blocks)
+
+        self._ensure_block_capacity(new_blocks, target_dev)
+        self._buf_centroids[old_blocks:new_blocks].copy_(new_centroids)
+        self._buf_labels[old_blocks:new_blocks].copy_(new_labels)
+        self._buf_btoks[old_blocks:new_blocks].copy_(new_btoks)
+        self._buf_bpools[old_blocks:new_blocks].copy_(new_bpools)
+        self._append_compact_and_tree(new_centroids, new_btoks, block_start_idx=old_blocks)
+
         self.n_blocks = new_blocks
         self.clustered_end = self.n_sink + new_blocks * self.n_cluster
+        self._ensure_materialized()
         self._cached_tree_limit = -1
         return int(delta_blocks)
 
@@ -525,16 +680,23 @@ class PagedLatentIndex:
         self.t = new_t
         if self.persistent_token_latents:
             kk_tail = F.normalize(k_idx[old_t:new_t].float(), dim=-1, eps=1e-6)
-            self._k_idx_pages.append(kk_tail)
+            self._append_persistent_k_latents(kk_tail)
         mid_end = max(self.n_sink, new_t - self.window)
         new_blocks = max(0, (mid_end - self.n_sink) // self.n_cluster)
         delta_blocks = new_blocks - self.n_blocks
-        if delta_blocks <= 0:
-            return 0
-        start = self.clustered_end
-        end = self.n_sink + new_blocks * self.n_cluster
-        kk_new = F.normalize(k_idx[start:end].float(), dim=-1, eps=1e-6)
-        return self._cluster_new_blocks_from_slice(kk_new)
+        added = 0
+        if delta_blocks > 0:
+            start = self.clustered_end
+            end = self.n_sink + new_blocks * self.n_cluster
+            kk_new = F.normalize(k_idx[start:end].float(), dim=-1, eps=1e-6)
+            added = self._cluster_new_blocks_from_slice(kk_new, target_total_t=new_t)
+        tail_lo = max(self.n_sink, self.clustered_end)
+        if new_t > tail_lo:
+            self._set_unclustered_tail(k_idx[tail_lo:new_t])
+        else:
+            self._unclustered_k_start = 0
+            self._unclustered_k_end = 0
+        return added
 
     def bucket_stats(self) -> Dict[str, float]:
         if self.n_blocks == 0:
@@ -544,18 +706,77 @@ class PagedLatentIndex:
                 "max_tokens": float(nz.max())}
 
     def index_storage_bytes(self) -> int:
-        """Compute resident index storage bytes (centroids + labels + bucket token counts + optional token latents)."""
+        """Compute logical active resident index payload bytes (active slices of centroids, labels, btoks, bpools, compact tree, and k_idx)."""
         total = 0
-        for page_list in (self._cent_pages, self._label_pages, self._btok_pages, self._bpool_pages, self._k_idx_pages):
-            for t_obj in page_list:
-                if isinstance(t_obj, torch.Tensor):
-                    total += int(t_obj.numel() * t_obj.element_size())
+        for t_obj in (
+            self._buf_centroids[: self.n_blocks],
+            self._buf_labels[: self.n_blocks],
+            self._buf_btoks[: self.n_blocks],
+            self._buf_bpools[: self.n_blocks],
+            self._buf_compact_cents[: self._compact_len],
+            self._buf_compact_btoks[: self._compact_len],
+            self._buf_compact_flat_ids[: self._compact_len],
+        ):
+            total += int(t_obj.numel() * t_obj.element_size())
+        for lvl_i, buf in enumerate(self._tree_level_bufs):
+            used = self._tree_level_lens[lvl_i]
+            total += int(buf[:used].numel() * buf.element_size())
+        if self._buf_k_idx_n is not None and self._k_idx_len > 0:
+            total += int(self._buf_k_idx_n[: self._k_idx_len].numel() * self._buf_k_idx_n.element_size())
         return total
+
+    def index_allocated_bytes(self, device_type: Optional[str] = None) -> int:
+        """Compute physical allocated capacity bytes across all owned index buffers (optionally filtered by `'cuda'` or `'cpu'`)."""
+        seen_ptrs: set = set()
+        total = 0
+        tensors: List[Optional[torch.Tensor]] = [
+            self._buf_centroids,
+            self._buf_labels,
+            self._buf_btoks,
+            self._buf_bpools,
+            self._buf_compact_cents,
+            self._buf_compact_btoks,
+            self._buf_compact_flat_ids,
+            self._buf_k_idx_n,
+            self._unclustered_k_store,
+        ]
+        tensors.extend(self._tree_level_bufs)
+        for t_obj in tensors:
+            if not isinstance(t_obj, torch.Tensor) or t_obj.numel() == 0:
+                continue
+            if device_type is not None and t_obj.device.type != device_type:
+                continue
+            st = t_obj.untyped_storage()
+            key = (t_obj.device.type, t_obj.device.index, int(st.data_ptr()))
+            if key not in seen_ptrs:
+                seen_ptrs.add(key)
+                total += int(st.nbytes())
+        return total
+
+    def index_tensors(self) -> List[torch.Tensor]:
+        """Return all owned backing tensors for global deduplicated storage accounting."""
+        out: List[torch.Tensor] = [
+            self._buf_centroids,
+            self._buf_labels,
+            self._buf_btoks,
+            self._buf_bpools,
+            self._buf_compact_cents,
+            self._buf_compact_btoks,
+            self._buf_compact_flat_ids,
+        ]
+        out.extend(self._tree_level_bufs)
+        if self._buf_k_idx_n is not None:
+            out.append(self._buf_k_idx_n)
+        if self._unclustered_k_store is not None:
+            out.append(self._unclustered_k_store)
+        return out
 
     def _get_or_build_tree_levels(
         self, cents: torch.Tensor, flat_toks: torch.Tensor, limit: int
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        """Return cached `(valid_flat_ids, levels_cents)` for causal horizon `limit`, rebuilding only when `limit` changes."""
+        """Return `(valid_flat_ids, levels_cents)` for causal horizon `limit` in $O(\\log_f P)$ time using the
+        incrementally maintained compact pyramid (`_buf_compact_*`, `_tree_level_bufs`), without scanning or rebuilding
+        historical complete groups (`F13`)."""
         dev = cents.device
         if (
             self._cached_tree_limit == limit
@@ -565,30 +786,43 @@ class PagedLatentIndex:
         ):
             return self._cached_tree_valid_ids, self._cached_tree_levels
 
-        valid_mask = flat_toks > 0
-        valid_flat_ids = torch.nonzero(valid_mask).squeeze(1)
-        n_valid = int(valid_flat_ids.numel())
-        if n_valid == 0:
-            self._cached_tree_limit = limit
-            self._cached_tree_valid_ids = valid_flat_ids
-            self._cached_tree_levels = []
-            return valid_flat_ids, []
+        if limit <= 0 or limit >= len(self._block_compact_ends):
+            n_valid = self._compact_len if limit >= self.n_blocks else 0
+        else:
+            n_valid = int(self._block_compact_ends[limit])
 
-        d = int(cents.shape[-1])
-        f = self.branching_factor
-        valid_cents = cents.reshape(-1, d).index_select(0, valid_flat_ids)
+        if n_valid == 0:
+            empty_ids = torch.zeros(0, dtype=torch.long, device=dev)
+            self._cached_tree_limit = limit
+            self._cached_tree_valid_ids = empty_ids
+            self._cached_tree_levels = []
+            return empty_ids, []
+
+        valid_flat_ids = self._buf_compact_flat_ids[:n_valid].to(dev)
+        valid_cents = self._buf_compact_cents[:n_valid].to(dev)
         levels_cents: List[torch.Tensor] = [valid_cents]
+
+        f = self.branching_factor
         cur = valid_cents
+        lvl = 0
         while int(cur.shape[0]) > f * self.beam_width:
             n_cur = int(cur.shape[0])
-            n_parent = (n_cur + f - 1) // f
-            pad = n_parent * f - n_cur
-            if pad > 0:
-                cur_padded = torch.cat([cur, torch.zeros(pad, d, device=dev, dtype=cur.dtype)], dim=0)
+            complete_p = n_cur // f
+            rem = n_cur - complete_p * f
+            if lvl < len(self._tree_level_bufs) and self._tree_level_lens[lvl] >= complete_p and complete_p > 0:
+                p_prefix = self._tree_level_bufs[lvl][:complete_p].to(dev, dtype=cur.dtype)
+                if rem > 0:
+                    tail_parent = F.normalize(cur[complete_p * f : n_cur].sum(dim=0, keepdim=True), dim=-1, eps=1e-6)
+                    cur = torch.cat([p_prefix, tail_parent], dim=0)
+                else:
+                    cur = p_prefix
             else:
-                cur_padded = cur
-            cur = F.normalize(cur_padded.view(n_parent, f, d).sum(dim=1), dim=-1, eps=1e-6)
+                n_parent = (n_cur + f - 1) // f
+                pad = n_parent * f - n_cur
+                cur_padded = torch.cat([cur, torch.zeros(pad, int(cur.shape[-1]), device=dev, dtype=cur.dtype)], dim=0) if pad > 0 else cur
+                cur = F.normalize(cur_padded.view(n_parent, f, -1).sum(dim=1), dim=-1, eps=1e-6)
             levels_cents.append(cur)
+            lvl += 1
 
         self._cached_tree_limit = limit
         self._cached_tree_valid_ids = valid_flat_ids
@@ -830,6 +1064,7 @@ class FaithfulDLSAIndexer(nn.Module):
         self.n_sink, self.n_pool, self.n_cluster = n_sink, n_pool, n_cluster
         self.avg_bucket_size, self.max_bucket_size, self.window, self.k_long_range = avg_bucket_size, max_bucket_size, window, k_long_range
         din = self.n_kv * (head_dim - rope_dim)
+        self.d_in = din
         self.w_q = nn.Linear(din, d_idx, bias=False)
         self.w_k = nn.Linear(din, d_idx, bias=False)
         self.W_q = self.w_q
@@ -841,13 +1076,16 @@ class FaithfulDLSAIndexer(nn.Module):
         self.w_q.weight.data.copy_(self.w_k.weight.data)
         self._visit_state_slots: Dict[Any, Dict[str, Any]] = {}
 
+    def tau(self) -> torch.Tensor:
+        """Strictly positive student softmax inverse-temperature `tau = clamp(exp(log_tau), 1.0, 64.0)`."""
+        return self.log_tau.float().exp().clamp(1.0, 64.0)
+
     def dist_alpha(self) -> torch.Tensor:
-        """Non-negative query-time log-distance decay weight `alpha >= 0` (exactly `0.0` at init `-6.0`)."""
+        """Strictly smooth, positive query-time log-distance decay weight `alpha > 0` (`~0.0025` at init `-6.0`, nonzero gradient everywhere)."""
         raw = getattr(self, "raw_dist_alpha", None)
         if raw is None:
             return torch.tensor(0.0, device=self.log_tau.device)
-        base = F.softplus(torch.tensor(-6.0, device=raw.device, dtype=torch.float32))
-        return (F.softplus(raw.float()) - base).clamp(min=0.0, max=8.0)
+        return F.softplus(raw.float()).clamp(max=8.0)
 
     def dist_alpha_over_tau(self) -> float:
         # Selector scalars are constant during inference. Avoid two GPU-to-host
@@ -1011,16 +1249,10 @@ class FaithfulDLSAIndexer(nn.Module):
         if idx is not None and idx.t <= t and sig_prev is not None:
             if self._prefix_signature(k0, idx.t) == sig_prev:
                 if t > idx.t:
-                    # Only project the unclustered tail + new keys `[idx.clustered_end : t)` — no full-prefix k_idx copy!
-                    tail_start = idx.clustered_end
-                    _, k_in_tail = self.inputs(_dummy_q(k0[:, tail_start:t]), k0[:, tail_start:t])
-                    k_idx_tail = self.project_k(k_in_tail)
-                    if idx.persistent_token_latents and idx.k_idx_n is not None:
-                        _, k_in_new = self.inputs(_dummy_q(k0[:, idx.t:t]), k0[:, idx.t:t])
-                        k_idx_new = self.project_k(k_in_new)
-                        idx._k_idx_pages.append(F.normalize(k_idx_new.float(), dim=-1, eps=1e-6))
-                    idx.t = t
-                    idx._cluster_new_blocks_from_slice(F.normalize(k_idx_tail.float(), dim=-1, eps=1e-6))
+                    # Project ONLY the newly arrived keys `[idx.t : t)` (`1` token per decode step) via `append_new_keys`
+                    k_in_new = self._free_key_features(k0[:, idx.t:t])
+                    k_idx_new = self.project_k(k_in_new)
+                    idx.append_new_keys(k_idx_new)
                     sig_prev = self._prefix_signature(k0, t)
                     slot["sig"] = sig_prev
                     if visit_key is None and state_slot is None:
@@ -1135,23 +1367,53 @@ class FaithfulDLSAIndexer(nn.Module):
                 self._reuse_age = 0
         return sel
 
-    # ---- distillation
+    # ---- shared scoring & distillation (`F09`, `§8.2`)
+    def selectable_support_mask(self, seq_len: int, q_positions: torch.Tensor) -> torch.Tensor:
+        """Return boolean mask `[S, seq_len]` of exact long-range keys `M_t` selectable by `PagedLatentIndex.select` at
+        causal horizon `upto = q_pos + 1`: `n_sink <= j < n_sink + limit(upto) * n_cluster`, where
+        `limit(upto) = max(0, (max(n_sink, upto - window) - n_sink) // n_cluster)` (`§8.2`)."""
+        dev = q_positions.device
+        upto = q_positions.to(dtype=torch.long) + 1
+        mid_end = (upto - int(self.window)).clamp(min=int(self.n_sink))
+        limit_blocks = ((mid_end - int(self.n_sink)) // max(1, int(self.n_cluster))).clamp(min=0)
+        selectable_hi = int(self.n_sink) + limit_blocks * int(self.n_cluster)
+        k_idx = torch.arange(int(seq_len), device=dev, dtype=torch.long).unsqueeze(0)
+        return (k_idx >= int(self.n_sink)) & (k_idx < selectable_hi.unsqueeze(1))
+
+    def score_selectable_logits(
+        self,
+        q_in: torch.Tensor,
+        k_in: torch.Tensor,
+        q_positions: Optional[torch.Tensor] = None,
+        key_mask: Optional[torch.Tensor] = None,
+        k_positions: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Shared student logit formula used identically by `distill_loss`, `train_spark_dlsa`, and serving (`F09`):
+        `logits(t, j) = exp(log_tau) * <project_q(q_t), project_k(k_j)> - dist_alpha() * log(1 + (t - j) / window)`.
+        At serving time, dividing by `exp(log_tau) > 0` yields `<q_lat, k_lat> - dist_alpha_over_tau() * log(1 + (t - j) / window)`
+        with identical ranking order, while keeping both `log_tau` and `raw_dist_alpha` fully differentiable during training."""
+        tau = self.log_tau.float().exp().clamp(1.0, 64.0)
+        logits = tau * (self.project_q(q_in) @ self.project_k(k_in).t())
+        if q_positions is not None:
+            alpha = self.dist_alpha()
+            q_pos = q_positions.to(device=logits.device, dtype=torch.float32).unsqueeze(1)
+            if k_positions is not None:
+                k_pos = k_positions.to(device=logits.device, dtype=torch.float32).unsqueeze(0)
+            else:
+                k_pos = torch.arange(logits.shape[1], device=logits.device, dtype=torch.float32).unsqueeze(0)
+            dist_pen = alpha * torch.log1p((q_pos - k_pos).clamp(min=0.0) / max(1.0, float(self.window)))
+            logits = logits - dist_pen
+        if key_mask is not None:
+            logits = logits.masked_fill(~key_mask, float("-inf"))
+        return logits
+
     def distill_loss(self, q_in: torch.Tensor, k_in: torch.Tensor, teacher_p: torch.Tensor,
                      key_mask: Optional[torch.Tensor] = None,
                      q_positions: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Per-key KL(teacher || student) averaged over queries. `teacher_p`: [Tq, T] (rows sum to 1 over the allowed keys),
         `key_mask`: [Tq, T] bool of keys the student must rank (e.g. middle region, causal).
         When `q_positions` (`[Tq]`) is provided, includes the query-time log-distance prior `-alpha * log(1 + (p - j)/window)`."""
-        tau = self.log_tau.float().exp().clamp(1.0, 64.0)
-        logits = tau * self.project_q(q_in) @ self.project_k(k_in).t()
-        if q_positions is not None:
-            alpha = self.dist_alpha()
-            q_pos = q_positions.to(device=logits.device, dtype=torch.float32).unsqueeze(1)
-            k_pos = torch.arange(logits.shape[1], device=logits.device, dtype=torch.float32).unsqueeze(0)
-            dist_pen = alpha * torch.log1p((q_pos - k_pos).clamp(min=0.0) / max(1.0, float(self.window)))
-            logits = logits - dist_pen
-        if key_mask is not None:
-            logits = logits.masked_fill(~key_mask, float("-inf"))
+        logits = self.score_selectable_logits(q_in, k_in, q_positions=q_positions, key_mask=key_mask)
         logp = torch.log_softmax(logits, dim=-1)
         p = teacher_p.clamp(min=0)
         term = torch.where(p > 0, p * (torch.log(p.clamp(min=1e-12)) - logp), torch.zeros_like(p))
@@ -1198,6 +1460,51 @@ def mid_region_mask(q_positions: Sequence[int], t: int, n_sink: int, window: int
     pos = torch.as_tensor(list(q_positions), device=device).unsqueeze(1)
     kpos = torch.arange(t, device=device).unsqueeze(0)
     return (kpos >= n_sink) & (kpos <= pos - window)
+
+
+def selectable_support_mask(
+    q_positions: Sequence[int],
+    t: int,
+    n_sink: int,
+    window: int,
+    n_cluster: Optional[int] = None,
+    device: Any = "cpu",
+) -> torch.Tensor:
+    """Exact runtime selectable long-range support $\\mathcal{M}_t$ for each query `p` (`upto = p + 1`, §8.2, `F09`):
+    - Excludes always-read `sink` (`[0, n_sink)`) and `window` (`[upto - window, upto)`).
+    - When `n_cluster` is provided and at least one clustered block is causally complete (`upto - window - n_sink >= n_cluster`),
+      excludes trailing unclustered keys (`[clustered_end(upto), upto)`) that runtime always reads in `tail`.
+    - Falls back to `mid_region_mask` on shorter synthetic fixtures (`n_sink + window < upto < n_sink + window + n_cluster`)."""
+    pos = torch.as_tensor(list(q_positions), device=device, dtype=torch.long).unsqueeze(1)
+    kpos = torch.arange(t, device=device, dtype=torch.long).unsqueeze(0)
+    if n_cluster is not None and int(n_cluster) > 0:
+        nc = int(n_cluster)
+        upto = pos + 1
+        n_blk = torch.clamp((upto - int(window) - int(n_sink)) // nc, min=0)
+        clustered_end = int(n_sink) + n_blk * nc
+        has_blk = n_blk > 0
+        fallback_end = torch.clamp(upto - int(window), min=int(n_sink))
+        eff_end = torch.where(has_blk, clustered_end, fallback_end)
+        return (kpos >= int(n_sink)) & (kpos < eff_end)
+    return (kpos >= int(n_sink)) & (kpos <= pos - int(window))
+
+
+def canonical_state_dict_sha256(state_dict: Dict[str, Any]) -> str:
+    """Compute a full-byte canonical SHA-256 over sorted `(name, dtype, shape, raw_bytes)` of all tensors (`F04`, `§5.3`).
+    Never samples head/tail slices — every single byte of every tensor is hashed."""
+    import hashlib
+
+    h = hashlib.sha256()
+    for name in sorted(state_dict.keys()):
+        val = state_dict[name]
+        if not isinstance(val, torch.Tensor):
+            continue
+        t_cpu = val.detach().contiguous().cpu()
+        header = f"{name}|{t_cpu.dtype}|{tuple(int(s) for s in t_cpu.shape)}|".encode("utf-8")
+        h.update(header)
+        if t_cpu.numel() > 0:
+            h.update(t_cpu.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return h.hexdigest()
 
 
 @torch.no_grad()
@@ -1832,6 +2139,7 @@ class VisitAwareDLSAIndexBank(nn.Module):
 
         self.per_visit_budget_overrides: Dict[int, int] = {}
         self.provenance: Dict[str, Any] = {}
+        self.training_records: Dict[str, Any] = {}
         merged_overrides: Dict[Any, int] = {}
         if per_visit_budget_overrides:
             merged_overrides.update(per_visit_budget_overrides)
@@ -1968,30 +2276,40 @@ class VisitAwareDLSAIndexBank(nn.Module):
             ix.reset_decode_cache()
 
     def set_provenance(self, **kwargs: Any) -> Dict[str, Any]:
-        """Record mHC checkpoint SHA256, recurrence mode, and schema version used to calibrate this selector bank."""
+        """Record mHC checkpoint/controller SHA256, recurrence mode, and schema version used to calibrate this selector bank."""
         self.provenance.update({k: v for k, v in kwargs.items() if v is not None})
         return dict(self.provenance)
+
+    def canonical_selector_sha256(self) -> str:
+        """Compute canonical full-byte SHA-256 over all selector tensors (`w_q`, `w_k`, `log_tau`, `raw_dist_alpha`) (`F04`, `§5.3`)."""
+        return canonical_state_dict_sha256(self.state_dict())
 
     def parameter_manifest(self) -> Dict[str, Any]:
         map_params = self.total_map_parameters()
         total_params = sum(p.numel() for p in self.parameters())
+        scalar_params = int(total_params - map_params)
         return {
             "maps_per_global_visit": self.maps_per_global_visit,
             "num_indexer_modules": len(self.indexers),
             "global_visits": len(self.global_schedule),
             "map_parameters": int(map_params),
+            "scalar_parameters": int(scalar_params),
             "total_parameters": int(total_params),
+            "selector_sha256": self.canonical_selector_sha256(),
             "projection_revision": self.projection_revision,
             "search_mode": self.search_mode,
             "default_k_long_range": self.k_long_range,
             "per_visit_budget_overrides": dict(self.per_visit_budget_overrides),
             "provenance": dict(self.provenance),
+            "training_records": dict(self.training_records),
         }
 
     def export_manifest_state(self) -> Dict[str, Any]:
         return {
             "manifest": self.parameter_manifest(),
             "provenance": dict(self.provenance),
+            "training_records": dict(self.training_records),
+            "selector_sha256": self.canonical_selector_sha256(),
             "global_schedule": [dict(r) for r in self.global_schedule],
             "state_dict": {k: v.detach().cpu() for k, v in self.state_dict().items()},
         }
@@ -2004,6 +2322,9 @@ class VisitAwareDLSAIndexBank(nn.Module):
         prov = ckpt_data.get("provenance") or ckpt_data.get("manifest", {}).get("provenance")
         if isinstance(prov, dict):
             self.provenance = dict(prov)
+        t_rec = ckpt_data.get("training_records") or ckpt_data.get("manifest", {}).get("training_records")
+        if isinstance(t_rec, dict):
+            self.training_records = dict(t_rec)
         if "state_dict" in ckpt_data and isinstance(ckpt_data["state_dict"], dict):
             sd = ckpt_data["state_dict"]
             if any(k.startswith("indexers.") for k in sd.keys()):
@@ -2011,7 +2332,9 @@ class VisitAwareDLSAIndexBank(nn.Module):
                 return {
                     "mode": "visit_bank_state_dict",
                     "loaded_modules": len(self.indexers),
+                    "selector_sha256": self.canonical_selector_sha256(),
                     "provenance": dict(self.provenance),
+                    "training_records": dict(self.training_records),
                 }
         raw_visits = ckpt_data.get("visit_indexers")
         if isinstance(raw_visits, dict) and self.maps_per_global_visit:

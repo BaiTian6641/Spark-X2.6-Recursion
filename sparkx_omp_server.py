@@ -26,7 +26,7 @@ import uuid
 
 OMP_VERSION = "18.18.1"
 OMP_COMMIT = "24439066040e006eb08da7b204f0ac41c79d2de9"
-DEFAULT_MODEL_ID = "spark-x2.6-4b-loop72-dlsa"
+DEFAULT_MODEL_ID = "Spark-X2.6-4B-Recursive72"
 _NAME = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _END_MARKERS = ("<｜end▁of▁sentence｜>", "<|im_end|>", "<|endoftext|>", "<|eot_id|>")
 
@@ -385,25 +385,42 @@ class GenerationResult:
 
 
 class _TokenTextStreamer:
-    """Word/tag-boundary decoding, retaining incomplete UTF-8 until stable.
+    """Bounded-window word/tag-boundary decoding, retaining incomplete UTF-8 until stable.
 
-    Mirrors the tokenizer streamer's cache/print-length approach; generated IDs
-    are never skipped or changed. No generated token timings are inferred here.
+    Compacts the decoded token window (`max_window_tokens=48`, retaining a 4-token BPE
+    context prefix) so long single-line JSON/patch tool arguments run in O(1) time per
+    token instead of O(N^2) re-decoding (§11.7). Generated IDs are never skipped or changed.
     """
-    def __init__(self, tokenizer: Any, emit: Callable[[str], None]):
+    def __init__(self, tokenizer: Any, emit: Callable[[str], None], max_window_tokens: int = 48, context_tokens: int = 4):
         self.tokenizer, self.emit = tokenizer, emit
+        self.max_window_tokens = max(8, int(max_window_tokens))
+        self.context_tokens = max(1, min(int(context_tokens), self.max_window_tokens // 2))
         self.cache: list[int] = []
         self.printed = 0
+
+    def _compact_if_needed(self, text: str) -> None:
+        if len(self.cache) <= self.max_window_tokens or self.printed < len(text):
+            return
+        ctx = self.cache[-self.context_tokens:]
+        ctx_text = self.tokenizer.decode(ctx, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        if text.endswith(ctx_text):
+            self.cache = ctx
+            self.printed = len(ctx_text)
 
     def put(self, token_id: int) -> None:
         self.cache.append(int(token_id))
         text = self.tokenizer.decode(self.cache, skip_special_tokens=False, clean_up_tokenization_spaces=False)
         end = max(text.rfind(" ") + 1, text.rfind("\n") + 1, text.rfind(">") + 1)
+        if len(self.cache) > self.max_window_tokens and end <= self.printed and not text.endswith("\ufffd"):
+            # Long unbroken JSON/identifier token run without whitespace/newline: flush clean UTF-8
+            end = len(text)
         if end > self.printed:
             self.emit(text[self.printed:end])
             self.printed = end
         if text.endswith("\n"):
             self.cache, self.printed = [], 0
+        else:
+            self._compact_if_needed(text)
 
     def finish(self) -> None:
         text = self.tokenizer.decode(self.cache, skip_special_tokens=False, clean_up_tokenization_spaces=False)
@@ -415,7 +432,7 @@ class SparkGenerationBackend:
     """Calls the loaded Loop72 object, never a replacement base-model server."""
     backend_kind = "spark_loop72"
 
-    def __init__(self, model: Any, tokenizer: Any, context_limit_tokens: Optional[int] = None):
+    def __init__(self, model: Any, tokenizer: Any, context_limit_tokens: Optional[int] = None, enable_prefix_cache: bool = False):
         self.model, self.tokenizer = model, tokenizer
         if getattr(model, "training", False):
             raise ValueError("Call model.eval() before serving so the manifest reports the executed inference recurrence")
@@ -425,14 +442,31 @@ class SparkGenerationBackend:
         signature = inspect.signature(model.generate_cached)
         if not {"token_callback", "should_stop"}.issubset(signature.parameters):
             raise ValueError("generate_cached needs the explicit token_callback/should_stop streaming seam; buffered output is not presented as token streaming")
+        self._accepts_cache_kwarg = "cache" in signature.parameters
         configured = getattr(getattr(model, "paged_cache_cfg", None), "context_limit_tokens", None)
         if context_limit_tokens is None:
             if not isinstance(configured, int) or configured <= 0:
                 raise ValueError("Provide the measured/configured context_limit_tokens explicitly")
             context_limit_tokens = configured
         self.context_limit_tokens = min(int(context_limit_tokens), int(configured)) if isinstance(configured, int) and configured > 0 else int(context_limit_tokens)
-        self.manifest = {**self.manifest, "tokenizer_chat_template_sha256": hashlib.sha256(str(getattr(tokenizer, "chat_template", "")).encode()).hexdigest(),
-                         "cross_request_kv_reuse": False, "generation_policy": {"force_think_close": False}}
+        self.enable_prefix_cache = bool(enable_prefix_cache and self._accepts_cache_kwarg and callable(getattr(model, "create_inference_cache", None)))
+        self._prefix_state: Optional[dict] = None
+        self._template_sha256 = hashlib.sha256(str(getattr(tokenizer, "chat_template", "")).encode()).hexdigest()
+        self.manifest = {**self.manifest, "tokenizer_chat_template_sha256": self._template_sha256,
+                         "cross_request_kv_reuse": self.enable_prefix_cache, "generation_policy": {"force_think_close": False}}
+
+    def _runtime_fingerprint(self) -> str:
+        cur_m = self.model.execution_manifest()
+        sel_sha = (cur_m.get("selector_checkpoint_status") or {}).get("selector_sha256") or (cur_m.get("selector_checkpoint_status") or {}).get("checkpoint_sha256")
+        return json.dumps({
+            "template": self._template_sha256,
+            "behavior": cur_m.get("behavior_identity"),
+            "recurrence": cur_m.get("effective_recurrence_mode"),
+            "selector": sel_sha,
+        }, sort_keys=True)
+
+    def reset_prefix_cache(self) -> None:
+        self._prefix_state = None
 
     def prepare(self, request: ChatRequest) -> PreparedPrompt:
         if getattr(self.model, "training", False):
@@ -458,21 +492,69 @@ class SparkGenerationBackend:
     def generate(self, prepared: PreparedPrompt, request: ChatRequest, emit: Callable[[str], None], should_stop: Callable[[], bool]) -> GenerationResult:
         import torch
         device = next(self.model.base.parameters()).device
-        inp = torch.tensor([prepared.input_ids], dtype=torch.long, device=device)
         streamer = _TokenTextStreamer(self.tokenizer, emit)
-        # No external cache is accepted. generate_cached owns a fresh visit-aware
-        # request cache; the server serializes access and invokes no consolidation.
-        with torch.inference_mode():
-            out = self.model.generate_cached(inp, max_new_tokens=request.max_tokens, temperature=max(request.temperature, 1e-9),
-                                            top_p=request.top_p, top_k=request.top_k, repetition_penalty=request.repetition_penalty,
-                                            do_sample=request.temperature > 0, tokenizer=self.tokenizer, stream_print=False,
-                                            force_think_close=False, token_callback=streamer.put, should_stop=should_stop)
+        fp = self._runtime_fingerprint()
+        reuse_cache = None
+        prefix_hit_tokens = 0
+        feed_ids = prepared.input_ids
+        if self.enable_prefix_cache and self._prefix_state is not None:
+            st = self._prefix_state
+            committed: list[int] = st.get("committed_ids", [])
+            cand_cache = st.get("cache")
+            if (
+                st.get("fingerprint") == fp
+                and cand_cache is not None
+                and hasattr(cand_cache, "get_seq_length")
+                and int(cand_cache.get_seq_length()) == len(committed)
+                and 0 < len(committed) < len(prepared.input_ids)
+                and prepared.input_ids[:len(committed)] == committed
+            ):
+                reuse_cache = cand_cache
+                prefix_hit_tokens = len(committed)
+                feed_ids = prepared.input_ids[prefix_hit_tokens:]
+            else:
+                self._prefix_state = None
+        if self.enable_prefix_cache and reuse_cache is None:
+            reuse_cache = self.model.create_inference_cache(session_id="omp_prefix_session")
+
+        inp = torch.tensor([feed_ids], dtype=torch.long, device=device)
+        gen_kwargs: dict[str, Any] = dict(
+            max_new_tokens=request.max_tokens,
+            temperature=max(request.temperature, 1e-9),
+            top_p=request.top_p,
+            top_k=request.top_k,
+            repetition_penalty=request.repetition_penalty,
+            do_sample=request.temperature > 0,
+            tokenizer=self.tokenizer,
+            stream_print=False,
+            force_think_close=False,
+            token_callback=streamer.put,
+            should_stop=should_stop,
+        )
+        if reuse_cache is not None:
+            gen_kwargs["cache"] = reuse_cache
+        try:
+            with torch.inference_mode():
+                out = self.model.generate_cached(inp, **gen_kwargs)
+        except Exception:
+            self._prefix_state = None
+            raise
         streamer.finish()
         timing = dict(getattr(self.model, "last_generation_timing", {}) or {})
-        count = int(out.shape[-1]) - len(prepared.input_ids)
+        gen_ids = out[0, len(feed_ids):].tolist()
+        count = len(gen_ids)
         reason = timing.get("finish_reason")
         if reason not in {"stop", "length"}:
+            self._prefix_state = None
             raise ProtocolError("Runtime did not report a valid generation finish_reason", 500, "runtime_contract_error")
+        if self.enable_prefix_cache and reuse_cache is not None and hasattr(reuse_cache, "get_seq_length"):
+            timing["prefix_cache_hit"] = bool(prefix_hit_tokens > 0)
+            timing["prefix_cached_tokens"] = int(prefix_hit_tokens)
+            expected_cached = prepared.input_ids + (gen_ids[:-1] if len(gen_ids) >= 1 else [])
+            if int(reuse_cache.get_seq_length()) == len(expected_cached):
+                self._prefix_state = {"fingerprint": fp, "committed_ids": expected_cached, "cache": reuse_cache}
+            else:
+                self._prefix_state = None
         return GenerationResult(count, reason, timing)
 
 
@@ -484,10 +566,10 @@ def create_loop72_server(model: Any = None, tokenizer: Any = None, host: str = "
                          model_id: str = DEFAULT_MODEL_ID, background: bool = True, *, backend: Any = None,
                          context_limit_tokens: Optional[int] = None, max_output_tokens: int = 4096,
                          api_key: Optional[str] = None, request_timeout_seconds: float = 900.0,
-                         max_request_bytes: int = 16 * 1024 * 1024) -> Loop72HTTPServer:
+                         max_request_bytes: int = 16 * 1024 * 1024, enable_prefix_cache: bool = False) -> Loop72HTTPServer:
     if host not in {"127.0.0.1", "localhost", "::1"} and not api_key:
         raise ValueError("A non-loopback listener requires an explicit api_key")
-    backend = backend if backend is not None else SparkGenerationBackend(model, tokenizer, context_limit_tokens)
+    backend = backend if backend is not None else SparkGenerationBackend(model, tokenizer, context_limit_tokens, enable_prefix_cache=enable_prefix_cache)
     context_limit = min(int(context_limit_tokens or backend.context_limit_tokens), int(backend.context_limit_tokens))
     if context_limit < 2 or not 1 <= max_output_tokens < context_limit:
         raise ValueError("Require 1 <= max_output_tokens < context_limit_tokens")

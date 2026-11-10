@@ -6,8 +6,24 @@ import json
 import os
 from typing import Optional
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from huggingface_hub import hf_hub_download
+try:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+except ImportError:  # pragma: no cover
+    class AutoModelForCausalLM:  # type: ignore[no-redef]
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            raise ImportError("transformers is required to load pretrained Spark models (`pip install transformers`).")
+
+    class AutoTokenizer:  # type: ignore[no-redef]
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            raise ImportError("transformers is required to load pretrained Spark tokenizers (`pip install transformers`).")
+
+try:
+    from huggingface_hub import hf_hub_download
+except ImportError:  # pragma: no cover
+    def hf_hub_download(*args, **kwargs):  # type: ignore[misc]
+        raise ImportError("huggingface_hub is required to download Hub checkpoints (`pip install huggingface_hub`).")
 
 from sparkx_loop_v03_core import (
     LoopV03Settings,
@@ -280,13 +296,23 @@ def configure_model_for_loop72_lsa(
     config: Optional[dict] = None,
     dlsa_checkpoint: Optional[str] = None,
     attach_sparse_attention: bool = True,
+    strict_selector_provenance: bool = False,
+    require_verified_selectors: bool = False,
+    selector_checkpoint: Optional[str] = None,
+    recurrence_mode: Optional[str] = None,
 ) -> dict:
     """Configure an existing `SparkXLoopV03` instance for the Loop72 + Per-Visit Paged D-LSA runtime."""
-    from sparkx_dlsa import DLSAIndexConfig, VisitAwareDLSAIndexBank
+    import copy
+    import tempfile
+    from sparkx_dlsa import DLSAIndexConfig, VisitAwareDLSAIndexBank, canonical_state_dict_sha256
     from sparkx_paged_cache import PagedCacheConfig
     from sparkx_sparse_attention import SparseAttentionConfig, attach_loop72_dlsa_attention
 
-    cfg = config if isinstance(config, dict) else load_loop72_lsa_yaml_config()
+    if dlsa_checkpoint is None and selector_checkpoint is not None:
+        dlsa_checkpoint = selector_checkpoint
+    cfg = copy.deepcopy(config) if isinstance(config, dict) else load_loop72_lsa_yaml_config()
+    if recurrence_mode is not None:
+        cfg.setdefault('loop', {})['recurrence_mode'] = str(recurrence_mode)
     model_cfg = cfg.get('model', {})
     loop_cfg = cfg.get('loop', {})
     engram_cfg = cfg.get('engram', {})
@@ -374,6 +400,9 @@ def configure_model_for_loop72_lsa(
     default_exact_thresh = sinks_val + recent_val + lr_tokens
     exact_thresh_val = int(attn_cfg.get('exact_threshold', default_exact_thresh))
     base_idx_cfg = DLSAIndexConfig(
+        n_kv=int(attn_cfg.get('n_kv', 4)),
+        head_dim=int(attn_cfg.get('head_dim', 256)),
+        rope_dim=int(attn_cfg.get('rope_dim', 64)),
         d_idx=int(attn_cfg.get('index_dim', attn_cfg.get('d_idx', 64))),
         n_pool=pool_sz,
         n_cluster=cluster_blk,
@@ -429,20 +458,77 @@ def configure_model_for_loop72_lsa(
         if int(load_report.get('loaded_modules', 0)) == 0:
             raise ValueError('D-LSA checkpoint did not load any selector modules')
         prov = load_report.get('provenance') if isinstance(load_report, dict) else None
+        t_rec = load_report.get('training_records') if isinstance(load_report, dict) else None
+        cur_ctrl_sha = (
+            canonical_state_dict_sha256(model.controllers.state_dict())
+            if hasattr(model, 'controllers')
+            else None
+        )
+        prov_ctrl_sha = prov.get('controller_sha256') if isinstance(prov, dict) else None
+        ctrl_match = (
+            None
+            if not prov_ctrl_sha or not cur_ctrl_sha
+            else (str(prov_ctrl_sha) == str(cur_ctrl_sha))
+        )
         cur_rec_mode = model.effective_recurrence_mode(training=False)
         rec_match = (
             None
             if not isinstance(prov, dict) or not prov.get('recurrence_mode')
             else (str(prov.get('recurrence_mode')) == cur_rec_mode)
         )
+        cur_schema = int(getattr(model.settings, 'mhc_schema_version', 1))
+        schema_match = (
+            None
+            if not isinstance(prov, dict) or prov.get('mhc_schema_version') is None
+            else (int(prov.get('mhc_schema_version')) == cur_schema)
+        )
+        base_info = getattr(model, 'base_runtime_info', None) or {}
+        cur_base_rev = base_info.get('resolved_revision') or base_info.get('requested_revision')
+        prov_base_rev = prov.get('base_model_revision') if isinstance(prov, dict) else None
+        base_rev_match = (
+            True
+            if (not prov_base_rev or not cur_base_rev)
+            else (str(prov_base_rev) == str(cur_base_rev))
+        )
+        expected_visits = len(bank.indexers)
+        trained_visits = sum(
+            1 for v_rec in (t_rec or {}).values()
+            if isinstance(v_rec, dict) and int(v_rec.get('steps', 0)) > 0
+        )
+        is_verified = bool(
+            ctrl_match is True
+            and rec_match is True
+            and schema_match is True
+            and base_rev_match is True
+            and expected_visits > 0
+            and trained_visits == expected_visits
+        )
+        if strict_selector_provenance or require_verified_selectors:
+            if ctrl_match is False or rec_match is False or schema_match is False or base_rev_match is False:
+                raise ValueError(
+                    f'D-LSA selector provenance mismatch (controller_match={ctrl_match}, '
+                    f'recurrence_mode_match={rec_match}, schema_match={schema_match}, base_rev_match={base_rev_match}).'
+                )
+            if not is_verified:
+                raise ValueError(
+                    f'D-LSA selector checkpoint is not verified (trained_visits={trained_visits}/{expected_visits}, '
+                    f'controller_match={ctrl_match}, recurrence_mode_match={rec_match}, schema_match={schema_match}).'
+                )
         model.dlsa_checkpoint_status.update({
-            'initialization': 'checkpoint_loaded_unverified',
+            'initialization': 'checkpoint_loaded_verified' if is_verified else 'checkpoint_loaded_unverified',
             'checkpoint_name': os.path.basename(dlsa_checkpoint),
             'checkpoint_sha256': _file_sha256(dlsa_checkpoint),
+            'selector_sha256': bank.canonical_selector_sha256(),
             'load_report': load_report,
             'provenance': dict(prov) if isinstance(prov, dict) else {},
+            'controller_sha256_match': ctrl_match,
             'recurrence_mode_match': rec_match,
+            'schema_version_match': schema_match,
+            'base_revision_match': base_rev_match,
+            'trained_global_visits': int(trained_visits),
         })
+    elif require_verified_selectors:
+        raise ValueError('require_verified_selectors=True requires a verified Stage E D-LSA selector checkpoint.')
 
     gpu_hot_tok = int(cache_cfg.get('global_hot_tokens_per_visit', 8192))
     if gpu_hot_tok == 8192 and getattr(device, 'type', str(device).split(':')[0]) == 'cuda':
@@ -470,8 +556,25 @@ def configure_model_for_loop72_lsa(
         selection_reuse=bool(attn_cfg.get('selection_reuse', False)),
         enable_native_gqa=bool(attn_cfg.get('enable_native_gqa', True)),
         residual_block_compensation=bool(attn_cfg.get('residual_compensation', False)),
+        unbounded_dense_fallback=bool(attn_cfg.get('unbounded_dense_fallback', False)),
+        yarn_scale_factor=float(attn_cfg.get('yarn_scale_factor', 1.0)),
+        yarn_original_max_position=int(attn_cfg.get('yarn_original_max_position', attn_cfg.get('yarn_orig_max_position', 1048576))),
         local_window=int(cache_cfg.get('local_window', cache_cfg.get('local_ring_tokens', 512))),
     )
+    req_archive = str(cache_cfg.get('archive_backend', '')).strip().lower()
+    nvme_dir_cfg = cache_cfg.get('nvme_spill_dir')
+    nvme_flag = bool(cache_cfg.get('nvme_enabled', bool(nvme_dir_cfg)))
+    if req_archive == 'cpu_then_nvme' or (str(cache_cfg.get('archive', '')).strip().lower() == 'cpu_then_nvme' and nvme_flag):
+        eff_archive_backend = 'cpu_then_nvme'
+        eff_nvme_enabled = True
+        eff_nvme_dir = str(nvme_dir_cfg or os.path.join(tempfile.gettempdir(), 'sparkx_loop72_nvme_spill'))
+        eff_host_cold_budget = int(cache_cfg.get('host_cold_budget_bytes', 16 * (1024**3)))
+    else:
+        eff_archive_backend = 'cpu'
+        eff_nvme_enabled = False
+        eff_nvme_dir = None
+        eff_host_cold_budget = int(cache_cfg.get('host_cold_budget_bytes', 0))
+
     model.paged_cache_cfg = PagedCacheConfig(
         local_window=int(cache_cfg.get('local_window', cache_cfg.get('local_ring_tokens', 512))),
         sinks=sinks_val,
@@ -482,6 +585,10 @@ def configure_model_for_loop72_lsa(
         index_gpu_budget_bytes=int(cache_cfg.get('index_gpu_budget_bytes', 2 * (1024**3))),
         persistent_token_latents=bool(cache_cfg.get('persistent_token_latents', False)),
         context_limit_tokens=int(cache_cfg.get('context_limit_tokens', model_cfg.get('context_limit_tokens', 1048576))),
+        archive_backend=eff_archive_backend,
+        nvme_enabled=eff_nvme_enabled,
+        nvme_spill_dir=eff_nvme_dir,
+        host_cold_budget_bytes=eff_host_cold_budget,
         model_revision=str(model_cfg.get('base', model_cfg.get('backbone_id', 'XHToken/Spark-X2.6-4B'))),
         behavior_fingerprint=f'{runtime_identity}:{model.effective_recurrence_mode(training=False)}',
     )
@@ -505,15 +612,24 @@ def load_sparkx_loop72_lsa(
     token: Optional[str] = None,
     return_meta: bool = False,
     revision: Optional[str] = None,
+    base_revision: Optional[str] = None,
+    variant_revision: Optional[str] = None,
+    allow_unpinned_fallback: bool = False,
+    strict_selector_provenance: bool = False,
+    require_verified_selectors: bool = False,
     recurrence_mode: Optional[str] = None,
     attach_sparse_attention: bool = True,
 ):
     """Load the Spark-X2.6-4B-Loop72-LSA architecture strictly atop the original `XHToken/Spark-X2.6-4B` model
     (72 visits = 18 global + 54 local, native GELU, 0 Engram params)."""
+    from sparkx_dlsa import canonical_state_dict_sha256
+
     _patch_transformers_v5_tied_weights()
     if model_id is not None:
         base_repo = str(model_id)
         repo_or_dir = str(model_id)
+    eff_base_rev = base_revision if base_revision is not None else revision
+    eff_variant_rev = variant_revision
     cfg = load_loop72_lsa_yaml_config(config_path)
     if recurrence_mode is not None:
         cfg = {**cfg, 'loop': {**cfg.get('loop', {}), 'recurrence_mode': str(recurrence_mode)}}
@@ -542,43 +658,67 @@ def load_sparkx_loop72_lsa(
         except Exception:
             _hf_dl = None
         if _hf_dl is not None:
+            dl_kw = {'token': token}
+            if eff_variant_rev is not None:
+                dl_kw['revision'] = eff_variant_rev
+            last_variant_err: Optional[Exception] = None
             for cname in ('loop_config_v03.json', 'loop_config.json'):
                 try:
-                    p = _hf_dl(repo_or_dir, cname, token=token)
+                    p = _hf_dl(repo_or_dir, cname, **dl_kw)
                     with open(p, 'r', encoding='utf-8') as f:
                         meta = json.load(f)
                     break
-                except Exception:
-                    pass
+                except Exception as exc:
+                    last_variant_err = exc
             for sname in ('loop_v03_state.pt', 'loop_state.pt'):
                 try:
-                    p = _hf_dl(repo_or_dir, sname, token=token)
+                    p = _hf_dl(repo_or_dir, sname, **dl_kw)
                     state = torch.load(p, map_location='cpu')
                     state_path = p
                     break
-                except Exception:
-                    pass
+                except Exception as exc:
+                    last_variant_err = exc
+            if state is None and eff_variant_rev is not None and not allow_unpinned_fallback and last_variant_err is not None:
+                raise RuntimeError(
+                    f'Failed to download variant state from {repo_or_dir!r} at explicit variant_revision={eff_variant_rev!r} '
+                    f'(unpinned fallback disabled): {last_variant_err}'
+                ) from last_variant_err
             if dlsa_checkpoint is not None and not os.path.isfile(str(dlsa_checkpoint)):
+                resolved_dlsa: Optional[str] = None
+                last_dlsa_err: Optional[Exception] = None
                 for dname in (os.path.basename(str(dlsa_checkpoint)), 'visit_selectors_stage_e.pt'):
                     try:
-                        dlsa_checkpoint = _hf_dl(repo_or_dir, dname, token=token)
+                        resolved_dlsa = _hf_dl(repo_or_dir, dname, **dl_kw)
                         break
-                    except Exception:
-                        pass
-            elif dlsa_checkpoint is None:
+                    except Exception as exc:
+                        last_dlsa_err = exc
+                if resolved_dlsa is None and eff_variant_rev is not None and not allow_unpinned_fallback and last_dlsa_err is not None:
+                    raise RuntimeError(
+                        f'Failed to download D-LSA checkpoint from {repo_or_dir!r} at explicit variant_revision={eff_variant_rev!r}: {last_dlsa_err}'
+                    ) from last_dlsa_err
+                if resolved_dlsa is not None:
+                    dlsa_checkpoint = resolved_dlsa
+            elif dlsa_checkpoint is None and attach_sparse_attention:
                 try:
-                    dlsa_checkpoint = _hf_dl(repo_or_dir, 'visit_selectors_stage_e.pt', token=token)
+                    dlsa_checkpoint = _hf_dl(repo_or_dir, 'visit_selectors_stage_e.pt', **dl_kw)
                 except Exception:
                     pass
 
     backbone_source = repo_or_dir if (os.path.isdir(repo_or_dir) and not bool(use_pristine_base)) else base_repo
 
     try:
-        tok = AutoTokenizer.from_pretrained(backbone_source, trust_remote_code=True, token=token, revision=revision)
+        tok = AutoTokenizer.from_pretrained(backbone_source, trust_remote_code=True, token=token, revision=eff_base_rev)
     except Exception:
-        try:
-            tok = AutoTokenizer.from_pretrained(base_repo, trust_remote_code=True, token=token, revision=revision)
-        except Exception:
+        if backbone_source != base_repo:
+            try:
+                tok = AutoTokenizer.from_pretrained(base_repo, trust_remote_code=True, token=token, revision=eff_base_rev)
+            except Exception:
+                if eff_base_rev is not None and not allow_unpinned_fallback:
+                    raise
+                tok = AutoTokenizer.from_pretrained(base_repo, trust_remote_code=True, token=token)
+        else:
+            if eff_base_rev is not None and not allow_unpinned_fallback:
+                raise
             tok = AutoTokenizer.from_pretrained(base_repo, trust_remote_code=True, token=token)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
@@ -590,9 +730,11 @@ def load_sparkx_loop72_lsa(
             dtype=dtype,
             low_cpu_mem_usage=True,
             token=token,
-            revision=revision,
+            revision=eff_base_rev,
         ).to(device)
     except Exception:
+        if eff_base_rev is not None and not allow_unpinned_fallback:
+            raise
         base = AutoModelForCausalLM.from_pretrained(
             backbone_source,
             trust_remote_code=True,
@@ -609,7 +751,8 @@ def load_sparkx_loop72_lsa(
 
     model.base_runtime_info = {
         'source': backbone_source,
-        'requested_revision': revision,
+        'requested_revision': eff_base_rev,
+        'requested_variant_revision': eff_variant_rev,
         'resolved_revision': getattr(base.config, '_commit_hash', None),
         'tokenizer_source': getattr(tok, 'name_or_path', backbone_source),
         'tokenizer_resolved_revision': getattr(tok, 'init_kwargs', {}).get('_commit_hash'),
@@ -619,9 +762,13 @@ def load_sparkx_loop72_lsa(
         load_loop_v03_state_dict(model, state, strict=False)
         del state
 
+    # Defer require_verified_selectors check if we are about to restore embedded_dlsa_state below.
+    defer_verify = bool(embedded_dlsa_state is not None and dlsa_checkpoint is None and attach_sparse_attention)
     loop72_info = configure_model_for_loop72_lsa(
         model, config=cfg, dlsa_checkpoint=dlsa_checkpoint,
         attach_sparse_attention=attach_sparse_attention,
+        strict_selector_provenance=strict_selector_provenance if not defer_verify else False,
+        require_verified_selectors=require_verified_selectors if not defer_verify else False,
     )
     # The bank does not exist during load_loop_v03_state_dict above. Restore its
     # saved payload after attachment; an explicit D-LSA checkpoint takes precedence.
@@ -630,20 +777,73 @@ def load_sparkx_loop72_lsa(
         if int(load_report.get('loaded_modules', 0)) == 0:
             raise ValueError('Loop state did not restore any D-LSA selector modules')
         prov = load_report.get('provenance') if isinstance(load_report, dict) else None
+        t_rec = load_report.get('training_records') if isinstance(load_report, dict) else None
+        cur_ctrl_sha = (
+            canonical_state_dict_sha256(model.controllers.state_dict())
+            if hasattr(model, 'controllers')
+            else None
+        )
+        prov_ctrl_sha = prov.get('controller_sha256') if isinstance(prov, dict) else None
+        ctrl_match = (
+            None
+            if not prov_ctrl_sha or not cur_ctrl_sha
+            else (str(prov_ctrl_sha) == str(cur_ctrl_sha))
+        )
         cur_rec_mode = model.effective_recurrence_mode(training=False)
         rec_match = (
             None
             if not isinstance(prov, dict) or not prov.get('recurrence_mode')
             else (str(prov.get('recurrence_mode')) == cur_rec_mode)
         )
+        cur_schema = int(getattr(model.settings, 'mhc_schema_version', 1))
+        schema_match = (
+            None
+            if not isinstance(prov, dict) or prov.get('mhc_schema_version') is None
+            else (int(prov.get('mhc_schema_version')) == cur_schema)
+        )
+        cur_base_rev = model.base_runtime_info.get('resolved_revision') or model.base_runtime_info.get('requested_revision')
+        prov_base_rev = prov.get('base_model_revision') if isinstance(prov, dict) else None
+        base_rev_match = (
+            True
+            if (not prov_base_rev or not cur_base_rev)
+            else (str(prov_base_rev) == str(cur_base_rev))
+        )
+        expected_visits = len(model.dlsa_index_bank.indexers)
+        trained_visits = sum(
+            1 for v_rec in (t_rec or {}).values()
+            if isinstance(v_rec, dict) and int(v_rec.get('steps', 0)) > 0
+        )
+        is_verified = bool(
+            ctrl_match is True
+            and rec_match is True
+            and schema_match is True
+            and base_rev_match is True
+            and expected_visits > 0
+            and trained_visits == expected_visits
+        )
+        if strict_selector_provenance or require_verified_selectors:
+            if ctrl_match is False or rec_match is False or schema_match is False or base_rev_match is False:
+                raise ValueError(
+                    f'Embedded D-LSA selector provenance mismatch (controller_match={ctrl_match}, '
+                    f'recurrence_mode_match={rec_match}, schema_match={schema_match}, base_rev_match={base_rev_match}).'
+                )
+            if not is_verified:
+                raise ValueError(
+                    f'Embedded D-LSA selector payload is not verified (trained_visits={trained_visits}/{expected_visits}).'
+                )
         model.dlsa_checkpoint_status = {
-            'initialization': 'loop_state_checkpoint_loaded_unverified',
+            'initialization': 'loop_state_checkpoint_loaded_verified' if is_verified else 'loop_state_checkpoint_loaded_unverified',
             'quality_evidence': 'not_evaluated_in_loader',
             'checkpoint_name': os.path.basename(state_path) if state_path else None,
             'checkpoint_sha256': _file_sha256(state_path) if state_path else None,
+            'selector_sha256': model.dlsa_index_bank.canonical_selector_sha256(),
             'load_report': load_report,
             'provenance': dict(prov) if isinstance(prov, dict) else {},
+            'controller_sha256_match': ctrl_match,
             'recurrence_mode_match': rec_match,
+            'schema_version_match': schema_match,
+            'base_revision_match': base_rev_match,
+            'trained_global_visits': int(trained_visits),
         }
     elif embedded_dlsa_state is not None and not attach_sparse_attention:
         model.dlsa_checkpoint_status['saved_selector_payload_not_attached'] = True
@@ -654,4 +854,32 @@ def load_sparkx_loop72_lsa(
     if return_meta:
         return model, tok, model.loaded_meta
     return model, tok
+
+
+def load_sparkx_loop72_mhc_for_training(
+    repo_or_dir: str = 'XHToken/Spark-X2.6-4B',
+    base_repo: str = 'XHToken/Spark-X2.6-4B',
+    base_revision: Optional[str] = None,
+    variant_revision: Optional[str] = None,
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+    dtype: torch.dtype = torch.bfloat16,
+    token: Optional[str] = None,
+    config_path: Optional[str] = None,
+    return_meta: bool = False,
+):
+    """Load the differentiable 72-visit Loop72 + `learned_mhc` runtime (`attach_sparse_attention=False`) for Stage A–D training (`§12.2`)."""
+    return load_sparkx_loop72_lsa(
+        repo_or_dir=repo_or_dir,
+        base_repo=base_repo,
+        base_revision=base_revision,
+        variant_revision=variant_revision,
+        device=device,
+        dtype=dtype,
+        token=token,
+        config_path=config_path,
+        recurrence_mode='learned_mhc',
+        attach_sparse_attention=False,
+        return_meta=return_meta,
+    )
+
 
