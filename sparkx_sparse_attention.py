@@ -421,6 +421,148 @@ def paged_dlsa_global_attention_forward(
         q_pos = torch.arange(max(0, max_upto - q_len), max_upto, device=dev, dtype=torch.long)
     q_pos_list: List[int] = [int(x) for x in q_pos.tolist()]
 
+    idx_obj._ensure_materialized()
+    can_vectorize = (
+        int(getattr(indexer, "rerank", 1)) == 1
+        and str(getattr(indexer, "search_mode", "flat")).lower().strip() == "flat"
+        and (idx_obj.n_blocks == 0 or (idx_obj._mat_bpools.numel() > 0 and int(idx_obj._mat_bpools.shape[0]) >= idx_obj.n_blocks))
+        and all(q_pos_list[i] <= q_pos_list[i + 1] for i in range(len(q_pos_list) - 1))
+    )
+
+    if can_vectorize:
+        vec_tile_sz = max(tile_sz, 64) if q_len >= 64 else tile_sz
+        q_proj_all = indexer.project_q(indexer._group_free_query_features(query[0]))  # [q_len, d_idx]
+        dist_alpha_tau = float(indexer.dist_alpha_over_tau())
+        exact_cutoff = indexer.n_sink + indexer.window + eff_budget
+
+        def _query_regime(pos_val: int) -> Tuple[bool, int]:
+            u_val = min(pos_val + 1, idx_obj.t)
+            if u_val <= exact_cutoff or idx_obj.n_blocks == 0:
+                return True, 0
+            lim = max(0, min(idx_obj.n_blocks, (u_val - idx_obj.window - idx_obj.mid_start) // idx_obj.n_cluster))
+            if lim == 0:
+                return True, 0
+            return False, lim
+
+        s_i = 0
+        while s_i < q_len:
+            is_short_s, limit_s = _query_regime(q_pos_list[s_i])
+            if is_short_s:
+                # Coalesce the entire contiguous exact-prefix span into a single causal SDPA call
+                e_i = s_i + 1
+                while e_i < q_len and _query_regime(q_pos_list[e_i])[0]:
+                    e_i += 1
+                t_len = e_i - s_i
+                q_tile = query[:, :, s_i:e_i, :]
+                q_pos_tile = q_pos[s_i:e_i]
+                span_upto = min(q_pos_list[e_i - 1] + 1, idx_obj.t)
+                if slot.is_fully_gpu_resident(span_upto):
+                    k_span, v_span = slot.get_resident_prefix(span_upto)
+                else:
+                    all_span_pos = torch.arange(0, span_upto, device=dev, dtype=torch.long)
+                    k_span, v_span = slot.gather_selected(all_span_pos, device=dev, dtype=query.dtype, return_positions=False)
+                k_span_pos = torch.arange(0, span_upto, device=dev, dtype=torch.long)
+                allow_mask = k_span_pos.unsqueeze(0) <= q_pos_tile.unsqueeze(1)  # [t_len, span_upto]
+                if telemetry is not None:
+                    telemetry.total_selected_keys += int(allow_mask.sum().item())
+                    telemetry.total_sparse_queries += t_len
+                outs.append(
+                    _sdpa_gqa(
+                        q_tile,
+                        k_span,
+                        v_span,
+                        attn_mask=allow_mask.unsqueeze(0).unsqueeze(0),
+                        is_causal=False,
+                        scale=scale,
+                        enable_native_gqa=enable_native_gqa,
+                    )
+                )
+                s_i = e_i
+                continue
+
+            # Vectorized strictly-causal sparse tile with constant Ward block horizon `limit_s > 0`
+            e_i = s_i + 1
+            max_e = min(q_len, s_i + vec_tile_sz)
+            while e_i < max_e and _query_regime(q_pos_list[e_i]) == (False, limit_s):
+                e_i += 1
+            t_len = e_i - s_i
+            q_tile = query[:, :, s_i:e_i, :]
+            q_pos_tile = q_pos[s_i:e_i]
+            q_proj_tile = q_proj_all[s_i:e_i]
+            max_tile_upto = min(q_pos_list[e_i - 1] + 1, idx_obj.t)
+            clustered_end = idx_obj.mid_start + limit_s * idx_obj.n_cluster
+
+            cents_lim = idx_obj.centroids[:limit_s].to(dev)
+            toks_lim = idx_obj.bucket_tokens[:limit_s].to(dev)
+            c_slots = int(cents_lim.shape[1])
+            b_tot = limit_s * c_slots
+
+            scores = torch.matmul(q_proj_tile, cents_lim.reshape(b_tot, -1).t())  # [t_len, b_tot]
+            if dist_alpha_tau > 0.0:
+                blk_centers = idx_obj.mid_start + (torch.arange(limit_s, device=dev, dtype=torch.float32) + 0.5) * float(idx_obj.n_cluster)
+                blk_pen = dist_alpha_tau * torch.log1p(
+                    (q_pos_tile.float().unsqueeze(1) - blk_centers.unsqueeze(0)).clamp(min=0.0) / max(1.0, float(idx_obj.window))
+                )
+                scores = (scores.view(t_len, limit_s, c_slots) - blk_pen.unsqueeze(2)).reshape(t_len, b_tot)
+
+            toks_flat = toks_lim.reshape(b_tot)
+            scores = scores.masked_fill(toks_flat.unsqueeze(0) == 0, float("-inf"))
+            stage1_budget = int(eff_budget)
+            max_cand_buckets = min(b_tot, max(16, stage1_budget // max(1, idx_obj.n_pool) + 8))
+            flat_s, flat_i = torch.topk(scores, k=max_cand_buckets, dim=-1, largest=True, sorted=True)
+            flat_t = toks_flat.unsqueeze(0).expand(t_len, b_tot).gather(1, flat_i)
+            csum = torch.cumsum(flat_t, dim=-1)
+            take = ((csum - flat_t) < stage1_budget) & torch.isfinite(flat_s)
+
+            b_selected_mask = torch.zeros((t_len, b_tot), dtype=torch.bool, device=dev)
+            b_selected_mask.scatter_(1, flat_i, take)
+            union_buckets = torch.nonzero(b_selected_mask.any(dim=0)).squeeze(1)
+
+            if union_buckets.numel() > 0:
+                bpools_flat = idx_obj._mat_bpools[:limit_s].reshape(b_tot, idx_obj.max_pools_per_bucket).to(dev)
+                u_pool_bases = bpools_flat.index_select(0, union_buckets)
+                ub_idx, slot_idx = torch.nonzero(u_pool_bases >= 0, as_tuple=True)
+                valid_bases = u_pool_bases[ub_idx, slot_idx]
+                pool_bucket_id = union_buckets.index_select(0, ub_idx)
+                valid_bases, perm = torch.sort(valid_bases)
+                pool_bucket_id = pool_bucket_id.index_select(0, perm)
+                mid_tokens = (
+                    valid_bases.unsqueeze(1) + torch.arange(idx_obj.n_pool, device=dev, dtype=torch.long).unsqueeze(0)
+                ).reshape(-1)
+                allow_mid_pools = b_selected_mask.index_select(1, pool_bucket_id)
+                allow_mid = allow_mid_pools.unsqueeze(2).expand(t_len, -1, idx_obj.n_pool).reshape(t_len, -1)
+            else:
+                mid_tokens = torch.zeros(0, dtype=torch.long, device=dev)
+                allow_mid = torch.zeros((t_len, 0), dtype=torch.bool, device=dev)
+
+            sink_tokens = torch.arange(0, min(idx_obj.n_sink, max_tile_upto), device=dev, dtype=torch.long)
+            tail_tokens = torch.arange(clustered_end, max_tile_upto, device=dev, dtype=torch.long)
+            allow_sink = sink_tokens.unsqueeze(0) <= q_pos_tile.unsqueeze(1)
+            allow_tail = tail_tokens.unsqueeze(0) <= q_pos_tile.unsqueeze(1)
+
+            union_pos = torch.cat([sink_tokens, mid_tokens, tail_tokens], dim=0)
+            allow_mask = torch.cat([allow_sink, allow_mid, allow_tail], dim=1)
+
+            if telemetry is not None:
+                telemetry.total_selected_keys += int(allow_mask.sum().item())
+                telemetry.total_sparse_queries += t_len
+
+            k_u, v_u = slot.gather_selected(union_pos, device=dev, dtype=query.dtype, return_positions=False)
+            outs.append(
+                _sdpa_gqa(
+                    q_tile,
+                    k_u,
+                    v_u,
+                    attn_mask=allow_mask.unsqueeze(0).unsqueeze(0),
+                    is_causal=False,
+                    scale=scale,
+                    enable_native_gqa=enable_native_gqa,
+                )
+            )
+            s_i = e_i
+
+        return torch.cat(outs, dim=2) if len(outs) > 1 else outs[0]
+
     for s_i in range(0, q_len, tile_sz):
         e_i = min(q_len, s_i + tile_sz)
         t_len = e_i - s_i

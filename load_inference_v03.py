@@ -445,6 +445,15 @@ def configure_model_for_loop72_lsa(
         })
 
     gpu_hot_tok = int(cache_cfg.get('global_hot_tokens_per_visit', 8192))
+    if gpu_hot_tok == 8192 and getattr(device, 'type', str(device).split(':')[0]) == 'cuda':
+        try:
+            vram_bytes = torch.cuda.get_device_properties(device).total_memory
+            if vram_bytes >= 44 * (1024**3):
+                gpu_hot_tok = 65536
+            elif vram_bytes >= 20 * (1024**3):
+                gpu_hot_tok = 32768
+        except Exception:
+            gpu_hot_tok = 32768
     sparse_cfg = SparseAttentionConfig(
         index_dim=int(base_idx_cfg.d_idx),
         maps_per_global_visit=bool(attn_cfg.get('maps_per_global_visit', True)),

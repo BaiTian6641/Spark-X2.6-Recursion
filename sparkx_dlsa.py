@@ -400,31 +400,85 @@ class PagedLatentIndex:
             self._mat_k_idx_n = val
             self._k_idx_mat_t = int(val.shape[0])
 
+    def _set_unclustered_tail(self, k_tail: torch.Tensor) -> None:
+        kk = F.normalize(k_tail.float(), dim=-1, eps=1e-6)
+        n_tok = int(kk.shape[0])
+        cap = max(2048, self.n_cluster * 2 + self.window + 512, n_tok + 512)
+        store = torch.empty((cap, self.d), device=kk.device, dtype=torch.float32)
+        if n_tok > 0:
+            store[:n_tok].copy_(kk)
+        self._unclustered_k_store = store
+        self._unclustered_k_start = 0
+        self._unclustered_k_end = n_tok
+        self._unclustered_k_buf = store[:n_tok]
+
     @torch.no_grad()
     def append_new_keys(self, k_idx_new: torch.Tensor) -> int:
         """Append only newly arrived key latents `k_idx_new` (`[Delta_T, d]`) without passing the full prefix."""
         delta_t = int(k_idx_new.shape[0])
         if delta_t <= 0:
             return 0
-        # Keep an unclustered tail buffer of at most `n_cluster + window` key latents so block closing never needs full-history k_idx
-        tail_buf = getattr(self, "_unclustered_k_buf", None)
         kk_new = F.normalize(k_idx_new.float(), dim=-1, eps=1e-6)
         if self.persistent_token_latents:
             self._k_idx_pages.append(kk_new)
-        if tail_buf is None:
-            if self.persistent_token_latents and self.k_idx_n is not None:
-                # Extract from the already-stored pages starting at clustered_end
-                full_k = self.k_idx_n
-                old_t = self.t
-                self.t = old_t + delta_t
-                return self._cluster_new_blocks_from_slice(full_k[self.clustered_end: self.t])
-            tail_buf = kk_new
+
+        store = getattr(self, "_unclustered_k_store", None)
+        tail_buf = getattr(self, "_unclustered_k_buf", None)
+        if store is None:
+            if tail_buf is None:
+                if self.persistent_token_latents and self.k_idx_n is not None:
+                    full_k = self.k_idx_n
+                    old_t = self.t
+                    self.t = old_t + delta_t
+                    return self._cluster_new_blocks_from_slice(full_k[self.clustered_end: self.t])
+                self._set_unclustered_tail(kk_new)
+                store = self._unclustered_k_store
+                s_off = self._unclustered_k_start
+                e_off = self._unclustered_k_end
+            else:
+                # Migrate legacy `_unclustered_k_buf` into rolling store
+                combined = torch.cat([tail_buf.to(kk_new.device), kk_new], dim=0)
+                self._set_unclustered_tail(combined)
+                store = self._unclustered_k_store
+                s_off = self._unclustered_k_start
+                e_off = self._unclustered_k_end
         else:
-            tail_buf = torch.cat([tail_buf.to(kk_new.device), kk_new], dim=0)
+            s_off = int(getattr(self, "_unclustered_k_start", 0))
+            e_off = int(getattr(self, "_unclustered_k_end", 0))
+            cur_len = e_off - s_off
+            if store.device != kk_new.device:
+                store = store.to(kk_new.device)
+                self._unclustered_k_store = store
+            cap = int(store.shape[0])
+            if e_off + delta_t > cap:
+                if cur_len + delta_t <= cap:
+                    if cur_len > 0:
+                        store[:cur_len].copy_(store[s_off:e_off].clone())
+                    s_off = 0
+                    e_off = cur_len
+                else:
+                    new_cap = max(cap * 2, cur_len + delta_t + 1024)
+                    new_store = torch.empty((new_cap, self.d), device=kk_new.device, dtype=torch.float32)
+                    if cur_len > 0:
+                        new_store[:cur_len].copy_(store[s_off:e_off])
+                    store = new_store
+                    self._unclustered_k_store = store
+                    s_off = 0
+                    e_off = cur_len
+            store[e_off : e_off + delta_t].copy_(kk_new)
+            e_off += delta_t
+
         self.t += delta_t
-        added = self._cluster_new_blocks_from_slice(tail_buf)
+        active_slice = store[s_off:e_off]
+        added = self._cluster_new_blocks_from_slice(active_slice)
         consumed = added * self.n_cluster
-        self._unclustered_k_buf = tail_buf[consumed:]
+        s_off += consumed
+        if s_off == e_off:
+            s_off = 0
+            e_off = 0
+        self._unclustered_k_start = s_off
+        self._unclustered_k_end = e_off
+        self._unclustered_k_buf = store[s_off:e_off]
         return added
 
     def _cluster_new_blocks_from_slice(self, unclustered_slice: torch.Tensor) -> int:
@@ -615,11 +669,11 @@ class PagedLatentIndex:
         dev = q_idx.device
         upto = self.t if upto is None else min(int(upto), self.t)
         limit = 0 if self.n_blocks == 0 else max(0, min(self.n_blocks, (upto - self.window - self.mid_start) // self.n_cluster))
-        clustered_end = self.mid_start + limit * self.n_cluster
-        sink = torch.arange(0, min(self.n_sink, upto), device=dev)
-        tail = torch.arange(clustered_end, upto, device=dev)
         if limit == 0:
-            return torch.cat([sink, tail]).unique(), torch.zeros(0, dtype=torch.long, device=dev)
+            return torch.arange(0, upto, device=dev, dtype=torch.long), torch.zeros(0, dtype=torch.long, device=dev)
+        clustered_end = self.mid_start + limit * self.n_cluster
+        sink = torch.arange(0, min(self.n_sink, upto), device=dev, dtype=torch.long)
+        tail = torch.arange(clustered_end, upto, device=dev, dtype=torch.long)
         q = F.normalize(q_idx.float().reshape(-1, q_idx.shape[-1]).mean(dim=0), dim=-1, eps=1e-6)
         cents = self.centroids[:limit].to(dev)
         toks = self.bucket_tokens[:limit].to(dev)
@@ -680,7 +734,9 @@ class PagedLatentIndex:
                     tok_pen = float(dist_alpha_over_tau) * torch.log1p((q_pos - mid.float()).clamp(min=0.0) / max(1.0, float(self.window)))
                     tok_scores = tok_scores - tok_pen
                 mid = mid[tok_scores.topk(int(budget)).indices]
-        return torch.cat([sink, mid, tail]).unique(), sel_flat
+        if mid.numel() > 0:
+            mid = torch.sort(mid).values
+        return torch.cat([sink, mid, tail], dim=0), sel_flat
 
     @torch.no_grad()
     def select(self, q_idx: torch.Tensor, budget: int, upto: Optional[int] = None,
@@ -829,16 +885,24 @@ class FaithfulDLSAIndexer(nn.Module):
     def inputs(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         return free_slice_inputs(q, k, self.rope_dim, self.rope_first)
 
+    def _free_key_features(self, k: torch.Tensor) -> torch.Tensor:
+        """Extract RoPE-free key features `[T_k, n_kv * (head_dim - rope_dim)]` from `k` (`[H_kv, T_k, D]`) without dummy `q` allocation."""
+        hkv, tk, d = k.shape
+        sl = slice(self.rope_dim, d) if self.rope_first else slice(0, d - self.rope_dim)
+        return k[..., sl].float().permute(1, 0, 2).reshape(tk, -1)
+
     def _group_free_query_features(self, q: torch.Tensor) -> torch.Tensor:
-        """Extract group-summed RoPE-free query features `[T_q, n_kv * (head_dim - rope_dim)]` from `q` (`[H_q, T_q, D]`)."""
-        dummy_k = torch.zeros((self.n_kv, 1, self.head_dim), device=q.device, dtype=q.dtype)
-        q_in, _ = self.inputs(q, dummy_k)
-        return q_in
+        """Extract group-summed RoPE-free query features `[T_q, n_kv * (head_dim - rope_dim)]` from `q` (`[H_q, T_q, D]`) without dummy `k` allocation."""
+        hq, tq, d = q.shape
+        g = hq // self.n_kv
+        sl = slice(self.rope_dim, d) if self.rope_first else slice(0, d - self.rope_dim)
+        qf = q[..., sl].float().reshape(self.n_kv, g, tq, -1).sum(dim=1)
+        return qf.permute(1, 0, 2).reshape(tq, -1)
 
     def encode_keys(self, k: torch.Tensor) -> torch.Tensor:
         """Project `k` (`[H_kv, T, D]` or `[T, din]`) onto the unit hypersphere $\\mathbb{S}^{d_{\\text{idx}}-1}$."""
         if k.ndim == 3:
-            _, k_in = self.inputs(_dummy_q(k), k)
+            k_in = self._free_key_features(k)
         else:
             k_in = k
         return self.project_k(k_in)

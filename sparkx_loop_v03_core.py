@@ -156,6 +156,124 @@ if HAS_TRITON:
         out = (x_f32 * rstd) * w_f32
         tl.store(out_ptr + row_idx * stride_x_row + col_offsets, out.to(x_raw.dtype), mask=mask)
 
+    @triton.jit
+    def _mhc_pre_sublayer_fwd_kernel(
+        s0_ptr,
+        s1_ptr,
+        dyn0_ptr,
+        dyn1_ptr,
+        bias8_ptr,
+        ln_w_ptr,
+        normed_out_ptr,
+        coeff_out_ptr,
+        adapter_normed_ptr,
+        n_cols: int,
+        mhc_eps: float,
+        ln_eps: float,
+        gain: float,
+        HAS_DYN: tl.constexpr,
+        WRITE_ADAPTER_NORMED: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        row_idx = tl.program_id(0)
+        col_offsets = tl.arange(0, BLOCK_SIZE)
+        mask = col_offsets < n_cols
+        row_start = row_idx * n_cols
+
+        s0 = tl.load(s0_ptr + row_start + col_offsets, mask=mask, other=0.0).to(tl.float32)
+        s1 = tl.load(s1_ptr + row_start + col_offsets, mask=mask, other=0.0).to(tl.float32)
+
+        if HAS_DYN:
+            msq01 = (tl.sum(s0 * s0, axis=0) + tl.sum(s1 * s1, axis=0)) / (2.0 * n_cols)
+            rms = tl.rsqrt(msq01 + mhc_eps)
+            d_base = row_idx * 8
+            r0 = (tl.load(dyn0_ptr + d_base + 0) + tl.load(dyn1_ptr + d_base + 0)) * rms + tl.load(bias8_ptr + 0)
+            r1_l = (tl.load(dyn0_ptr + d_base + 1) + tl.load(dyn1_ptr + d_base + 1)) * rms + tl.load(bias8_ptr + 1)
+            w0_l = (tl.load(dyn0_ptr + d_base + 2) + tl.load(dyn1_ptr + d_base + 2)) * rms + tl.load(bias8_ptr + 2)
+            w1_l = (tl.load(dyn0_ptr + d_base + 3) + tl.load(dyn1_ptr + d_base + 3)) * rms + tl.load(bias8_ptr + 3)
+            m0 = (tl.load(dyn0_ptr + d_base + 4) + tl.load(dyn1_ptr + d_base + 4)) * rms + tl.load(bias8_ptr + 4)
+            m1 = (tl.load(dyn0_ptr + d_base + 5) + tl.load(dyn1_ptr + d_base + 5)) * rms + tl.load(bias8_ptr + 5)
+            m2 = (tl.load(dyn0_ptr + d_base + 6) + tl.load(dyn1_ptr + d_base + 6)) * rms + tl.load(bias8_ptr + 6)
+            m3 = (tl.load(dyn0_ptr + d_base + 7) + tl.load(dyn1_ptr + d_base + 7)) * rms + tl.load(bias8_ptr + 7)
+        else:
+            r0 = tl.load(bias8_ptr + 0)
+            r1_l = tl.load(bias8_ptr + 1)
+            w0_l = tl.load(bias8_ptr + 2)
+            w1_l = tl.load(bias8_ptr + 3)
+            m0 = tl.load(bias8_ptr + 4)
+            m1 = tl.load(bias8_ptr + 5)
+            m2 = tl.load(bias8_ptr + 6)
+            m3 = tl.load(bias8_ptr + 7)
+
+        m0 = tl.minimum(tl.maximum(m0, -30.0), 30.0)
+        m1 = tl.minimum(tl.maximum(m1, -30.0), 30.0)
+        m2 = tl.minimum(tl.maximum(m2, -30.0), 30.0)
+        m3 = tl.minimum(tl.maximum(m3, -30.0), 30.0)
+
+        r1 = 1.0 / (1.0 + tl.exp(-(r1_l - r0)))
+        w1 = 1.0 / (1.0 + tl.exp(-(w1_l - w0_l)))
+        w0 = 1.0 - w1
+        diag_adv = 0.5 * ((m0 + m3) - (m1 + m2))
+        p_swap = 1.0 - (1.0 / (1.0 + tl.exp(-diag_adv)))
+        alpha = gain * p_swap
+
+        c_base = row_idx * 3
+        tl.store(coeff_out_ptr + c_base + 0, w0)
+        tl.store(coeff_out_ptr + c_base + 1, w1)
+        tl.store(coeff_out_ptr + c_base + 2, alpha)
+
+        diff = s1 - s0
+        mixed = s0 + r1 * diff
+        mean_sq_m = tl.sum(mixed * mixed, axis=0) / n_cols
+
+        if WRITE_ADAPTER_NORMED:
+            rstd_ad = tl.rsqrt(mean_sq_m + mhc_eps)
+            tl.store(adapter_normed_ptr + row_start + col_offsets, mixed * rstd_ad, mask=mask)
+
+        rstd_ln = tl.rsqrt(mean_sq_m + ln_eps)
+        ln_w = tl.load(ln_w_ptr + col_offsets, mask=mask, other=1.0).to(tl.float32)
+        normed = (mixed * rstd_ln) * ln_w
+        tl.store(normed_out_ptr + row_start + col_offsets, normed.to(normed_out_ptr.dtype.element_ty), mask=mask)
+
+    @triton.jit
+    def _mhc_post_sublayer_fwd_kernel(
+        s0_ptr,
+        s1_ptr,
+        sub_out_ptr,
+        adapter_out_ptr,
+        coeff_ptr,
+        out0_ptr,
+        out1_ptr,
+        n_cols: int,
+        gain: float,
+        HAS_ADAPTER: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        row_idx = tl.program_id(0)
+        col_offsets = tl.arange(0, BLOCK_SIZE)
+        mask = col_offsets < n_cols
+        row_start = row_idx * n_cols
+
+        s0 = tl.load(s0_ptr + row_start + col_offsets, mask=mask, other=0.0).to(tl.float32)
+        s1 = tl.load(s1_ptr + row_start + col_offsets, mask=mask, other=0.0).to(tl.float32)
+        sub_val = tl.load(sub_out_ptr + row_start + col_offsets, mask=mask, other=0.0).to(tl.float32)
+        if HAS_ADAPTER:
+            ad_val = tl.load(adapter_out_ptr + row_start + col_offsets, mask=mask, other=0.0).to(tl.float32)
+            sub_val = sub_val + ad_val
+
+        c_base = row_idx * 3
+        w0 = tl.load(coeff_ptr + c_base + 0)
+        w1 = tl.load(coeff_ptr + c_base + 1)
+        alpha = tl.load(coeff_ptr + c_base + 2)
+
+        diff = s1 - s0
+        delta = gain * sub_val
+        out0 = s0 + alpha * diff + w0 * delta
+        out1 = s1 - alpha * diff + w1 * delta
+
+        tl.store(out0_ptr + row_start + col_offsets, out0.to(out0_ptr.dtype.element_ty), mask=mask)
+        tl.store(out1_ptr + row_start + col_offsets, out1.to(out1_ptr.dtype.element_ty), mask=mask)
+
 
 class _TritonSwiGLUFn(torch.autograd.Function):
     @staticmethod
@@ -2734,6 +2852,120 @@ class TwoStreamMHC(nn.Module):
             'static_effective_mix_min_entry': effective_mix_min,
         }
 
+    def _eval_cache_key(self) -> Optional[tuple]:
+        try:
+            dw_a = self.dynamic_proj.weight if (self.dynamic and self.dynamic_proj is not None) else None
+            dw_f = self.ffn_dynamic_proj.weight if (self.dynamic and self.ffn_dynamic_proj is not None) else None
+            nw_a = getattr(self, 'norm_weight', None)
+            nw_f = getattr(self, 'ffn_norm_weight', None)
+            up_vers = tuple(m.weight._version for m in self.pass_up) if self.pass_up is not None else ()
+            dn_vers = tuple(m.weight._version for m in self.pass_down) if self.pass_down is not None else ()
+            return (
+                self.gain_mode,
+                float(getattr(self, 'extra_pass_gate_multiplier', 1.0)),
+                float(getattr(self, 'min_extra_gain', 0.0)),
+                float(getattr(self, 'min_p3_gain', 0.0)),
+                self.mix_logits.device,
+                self.mix_logits._version,
+                self.read_logits._version,
+                self.write_logits._version,
+                self.extra_gain._version,
+                self.p3_extra_gain._version,
+                self.ffn_mix_logits._version,
+                self.ffn_read_logits._version,
+                self.ffn_write_logits._version,
+                self.ffn_extra_gain._version,
+                self.p3_ffn_extra_gain._version,
+                self.pass_routing_bias._version,
+                dw_a._version if dw_a is not None else -1,
+                dw_f._version if dw_f is not None else -1,
+                nw_a._version if nw_a is not None else -1,
+                nw_f._version if nw_f is not None else -1,
+                up_vers,
+                dn_vers,
+            )
+        except RuntimeError:
+            return None
+
+    @torch.no_grad()
+    def _get_eval_cache(self) -> Optional[dict]:
+        if self.training or torch.is_grad_enabled():
+            return None
+        key = self._eval_cache_key()
+        if key is None:
+            return None
+        cached = getattr(self, '_eval_cache_data', None)
+        if cached is not None and getattr(self, '_eval_cache_last_key', None) == key:
+            return cached
+
+        dim = self.width
+        sub_caches = []
+        for sub_idx in (0, 1):
+            is_ffn = (sub_idx == 1)
+            base_r = (self.ffn_read_logits if is_ffn else self.read_logits).detach().float()
+            base_w = (self.ffn_write_logits if is_ffn else self.write_logits).detach().float()
+            base_m = (self.ffn_mix_logits if is_ffn else self.mix_logits).detach().float().reshape(4)
+            proj = self.ffn_dynamic_proj if is_ffn else self.dynamic_proj
+            nw = getattr(self, 'ffn_norm_weight' if is_ffn else 'norm_weight', None)
+
+            if self.dynamic and proj is not None:
+                w_proj = proj.weight.detach().float()
+                if nw is not None:
+                    nw_f = nw.detach().float()
+                    w0_eff = (w_proj[:, :dim] * nw_f[:dim].unsqueeze(0)).contiguous()
+                    w1_eff = (w_proj[:, dim:] * nw_f[dim:].unsqueeze(0)).contiguous()
+                else:
+                    w0_eff = w_proj[:, :dim].contiguous()
+                    w1_eff = w_proj[:, dim:].contiguous()
+                dyn_zero = bool(w0_eff.abs().max().item() == 0.0 and w1_eff.abs().max().item() == 0.0)
+            else:
+                w0_eff = None
+                w1_eff = None
+                dyn_zero = True
+
+            passes_list = []
+            for p_idx in range(self.max_passes):
+                p_bias = self.pass_routing_bias[p_idx, sub_idx].detach().float()
+                r_b = base_r + p_bias[0:2]
+                w_b = base_w + p_bias[2:4]
+                m_b = base_m + p_bias[4:8]
+                bias8 = torch.cat([r_b, w_b, m_b], dim=0).view(1, 1, 8).contiguous()
+                r1_s = float(torch.sigmoid(r_b[1] - r_b[0]).item())
+                w1_s = float(torch.sigmoid(w_b[1] - w_b[0]).item())
+                w0_s = 1.0 - w1_s
+                m_clamped = m_b.clamp(min=-30.0, max=30.0)
+                diag_adv = 0.5 * ((m_clamped[0] + m_clamped[3]) - (m_clamped[1] + m_clamped[2]))
+                p_swap_s = float((1.0 - torch.sigmoid(diag_adv)).item())
+
+                g_param = (
+                    (self.p3_ffn_extra_gain if p_idx >= 2 else self.ffn_extra_gain)
+                    if is_ffn
+                    else (self.p3_extra_gain if p_idx >= 2 else self.extra_gain)
+                )
+                g_extra = float(self._effective_gain(g_param.detach(), pass_idx=p_idx, extra=True))
+                adapter_zero = True
+                if is_ffn and self.pass_down is not None and self.pass_up is not None:
+                    adapter_zero = bool(self.pass_up[p_idx].weight.detach().abs().max().item() == 0.0)
+
+                passes_list.append({
+                    'bias8': bias8,
+                    'static_scalars': (r1_s, w0_s, w1_s, p_swap_s),
+                    'gain_extra': g_extra,
+                    'adapter_zero': adapter_zero,
+                })
+
+            sub_caches.append({
+                'w0_eff': w0_eff,
+                'w1_eff': w1_eff,
+                'dyn_zero': dyn_zero,
+                'passes': passes_list,
+            })
+
+        data = {'sub': sub_caches, 'dummy_f32': torch.zeros(1, dtype=torch.float32, device=self.mix_logits.device)}
+        self._eval_cache_last_key = key
+        self._eval_cache_data = data
+        return data
+
     def _apply_pass_adapter(self, x: torch.Tensor, pass_idx: int) -> torch.Tensor:
         if self.pass_down is None or self.pass_up is None:
             return torch.zeros_like(x, dtype=torch.float32)
@@ -2745,7 +2977,7 @@ class TwoStreamMHC(nn.Module):
 
     def forward(
         self,
-        streams: torch.Tensor,
+        streams: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         layer: nn.Module,
         position_embeddings,
         attention_mask,
@@ -2753,12 +2985,159 @@ class TwoStreamMHC(nn.Module):
         pass_idx: int = 0,
         past_key_values=None,
         cache_position=None,
-    ) -> torch.Tensor:
-        orig_dtype = streams.dtype
-        s0, s1 = streams[0].float(), streams[1].float()
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        is_tuple = isinstance(streams, tuple)
+        if is_tuple:
+            orig_dtype = streams[0].dtype
+            s0 = streams[0] if orig_dtype == torch.float32 else streams[0].float()
+            s1 = streams[1] if streams[1].dtype == torch.float32 else streams[1].float()
+        else:
+            orig_dtype = streams.dtype
+            s0, s1 = streams[0].float(), streams[1].float()
 
         if self.sublayer_mhc and hasattr(layer, 'input_layernorm') and hasattr(layer, 'post_attention_layernorm'):
             target_dtype = layer.mlp.gate_proj.weight.dtype
+            eval_cache = self._get_eval_cache()
+            if eval_cache is not None:
+                p_idx = min(max(0, int(pass_idx)), self.max_passes - 1)
+                sub_a = eval_cache['sub'][0]
+                pc_a = sub_a['passes'][p_idx]
+                gain_a = pc_a['gain_extra'] if extra else 1.0
+                sub_f = eval_cache['sub'][1]
+                pc_f = sub_f['passes'][p_idx]
+                gain_f = pc_f['gain_extra'] if extra else 1.0
+
+                if HAS_TRITON and s0.is_cuda and s0.shape[-1] <= 8192:
+                    s0_c = s0.contiguous()
+                    s1_c = s1.contiguous()
+                    n_cols = int(s0_c.shape[-1])
+                    n_rows = int(s0_c.numel() // n_cols)
+                    block_size = triton.next_power_of_2(n_cols)
+                    dummy = eval_cache['dummy_f32']
+
+                    # 1. Fused Attention sublayer mHC pre-mix + RMSNorm
+                    has_dyn_a = not sub_a['dyn_zero']
+                    if has_dyn_a:
+                        dyn0_a = F.linear(s0_c, sub_a['w0_eff'])
+                        dyn1_a = F.linear(s1_c, sub_a['w1_eff'])
+                    else:
+                        dyn0_a = dummy
+                        dyn1_a = dummy
+                    normed_a = torch.empty(s0_c.shape, device=s0_c.device, dtype=target_dtype)
+                    coeff_a = torch.empty((n_rows, 3), device=s0_c.device, dtype=torch.float32)
+                    ln_a_eps = float(getattr(layer.input_layernorm, 'variance_epsilon', 1e-6))
+                    _mhc_pre_sublayer_fwd_kernel[(n_rows,)](
+                        s0_c, s1_c, dyn0_a, dyn1_a, pc_a['bias8'], layer.input_layernorm.weight,
+                        normed_a, coeff_a, dummy,
+                        n_cols, float(self.norm_eps), ln_a_eps, float(gain_a),
+                        HAS_DYN=has_dyn_a, WRITE_ADAPTER_NORMED=False, BLOCK_SIZE=block_size,
+                    )
+                    attn_out, _ = layer.self_attn(
+                        hidden_states=normed_a,
+                        position_embeddings=position_embeddings,
+                        attention_mask=attention_mask,
+                        past_key_values=past_key_values,
+                        cache_position=cache_position,
+                    )
+                    attn_c = attn_out.contiguous()
+                    m0 = torch.empty_like(s0_c)
+                    m1 = torch.empty_like(s1_c)
+                    _mhc_post_sublayer_fwd_kernel[(n_rows,)](
+                        s0_c, s1_c, attn_c, dummy, coeff_a, m0, m1,
+                        n_cols, float(gain_a), HAS_ADAPTER=False, BLOCK_SIZE=block_size,
+                    )
+
+                    # 2. Fused FFN sublayer mHC pre-mix + RMSNorm + Pass Adapter
+                    has_dyn_f = not sub_f['dyn_zero']
+                    if has_dyn_f:
+                        dyn0_f = F.linear(m0, sub_f['w0_eff'])
+                        dyn1_f = F.linear(m1, sub_f['w1_eff'])
+                    else:
+                        dyn0_f = dummy
+                        dyn1_f = dummy
+                    need_adapter = not pc_f['adapter_zero']
+                    normed_f = torch.empty(m0.shape, device=m0.device, dtype=target_dtype)
+                    coeff_f = torch.empty((n_rows, 3), device=m0.device, dtype=torch.float32)
+                    adapter_normed = torch.empty_like(m0) if need_adapter else dummy
+                    ln_f_eps = float(getattr(layer.post_attention_layernorm, 'variance_epsilon', 1e-6))
+                    _mhc_pre_sublayer_fwd_kernel[(n_rows,)](
+                        m0, m1, dyn0_f, dyn1_f, pc_f['bias8'], layer.post_attention_layernorm.weight,
+                        normed_f, coeff_f, adapter_normed,
+                        n_cols, float(self.norm_eps), ln_f_eps, float(gain_f),
+                        HAS_DYN=has_dyn_f, WRITE_ADAPTER_NORMED=need_adapter, BLOCK_SIZE=block_size,
+                    )
+                    mlp_raw = layer.mlp(normed_f).contiguous()
+                    if need_adapter:
+                        adapter_out = self.pass_up[p_idx](F.silu(self.pass_down[p_idx](adapter_normed))).contiguous()
+                    else:
+                        adapter_out = dummy
+                    _mhc_post_sublayer_fwd_kernel[(n_rows,)](
+                        m0, m1, mlp_raw, adapter_out, coeff_f, m0, m1,
+                        n_cols, float(gain_f), HAS_ADAPTER=need_adapter, BLOCK_SIZE=block_size,
+                    )
+                    if is_tuple:
+                        return (m0, m1) if orig_dtype == torch.float32 else (m0.to(orig_dtype), m1.to(orig_dtype))
+                    return torch.stack((m0.to(orig_dtype), m1.to(orig_dtype)), dim=0)
+
+                # Fast pre-folded PyTorch eval path (CPU or non-Triton fallback)
+                if sub_a['dyn_zero']:
+                    r1_a, w0_a, w1_a, p_swap_a = pc_a['static_scalars']
+                else:
+                    rms_a = torch.rsqrt(
+                        0.5 * (s0.square().mean(dim=-1, keepdim=True) + s1.square().mean(dim=-1, keepdim=True)) + self.norm_eps
+                    )
+                    dyn_a = (F.linear(s0, sub_a['w0_eff']) + F.linear(s1, sub_a['w1_eff'])) * rms_a + pc_a['bias8']
+                    r1_a = torch.sigmoid(dyn_a[..., 1:2] - dyn_a[..., 0:1])
+                    w1_a = torch.sigmoid(dyn_a[..., 3:4] - dyn_a[..., 2:3])
+                    w0_a = 1.0 - w1_a
+                    m_log_a = dyn_a[..., 4:8].clamp(min=-30.0, max=30.0)
+                    diag_adv_a = 0.5 * ((m_log_a[..., 0:1] + m_log_a[..., 3:4]) - (m_log_a[..., 1:2] + m_log_a[..., 2:3]))
+                    p_swap_a = 1.0 - torch.sigmoid(diag_adv_a)
+
+                diff_a = s1 - s0
+                mixed_a = s0 + r1_a * diff_a
+                normed_a = layer.input_layernorm(mixed_a if orig_dtype == torch.float32 else mixed_a.to(orig_dtype)).to(target_dtype)
+                attn_out, _ = layer.self_attn(
+                    hidden_states=normed_a,
+                    position_embeddings=position_embeddings,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    cache_position=cache_position,
+                )
+                alpha_a = gain_a * p_swap_a
+                attn_delta = gain_a * attn_out.float()
+                m0 = s0 + alpha_a * diff_a + w0_a * attn_delta
+                m1 = s1 - alpha_a * diff_a + w1_a * attn_delta
+
+                if sub_f['dyn_zero']:
+                    r1_f, w0_f, w1_f, p_swap_f = pc_f['static_scalars']
+                else:
+                    rms_f = torch.rsqrt(
+                        0.5 * (m0.square().mean(dim=-1, keepdim=True) + m1.square().mean(dim=-1, keepdim=True)) + self.norm_eps
+                    )
+                    dyn_f = (F.linear(m0, sub_f['w0_eff']) + F.linear(m1, sub_f['w1_eff'])) * rms_f + pc_f['bias8']
+                    r1_f = torch.sigmoid(dyn_f[..., 1:2] - dyn_f[..., 0:1])
+                    w1_f = torch.sigmoid(dyn_f[..., 3:4] - dyn_f[..., 2:3])
+                    w0_f = 1.0 - w1_f
+                    m_log_f = dyn_f[..., 4:8].clamp(min=-30.0, max=30.0)
+                    diag_adv_f = 0.5 * ((m_log_f[..., 0:1] + m_log_f[..., 3:4]) - (m_log_f[..., 1:2] + m_log_f[..., 2:3]))
+                    p_swap_f = 1.0 - torch.sigmoid(diag_adv_f)
+
+                diff_f = m1 - m0
+                mixed_f = m0 + r1_f * diff_f
+                normed_f = layer.post_attention_layernorm(mixed_f if orig_dtype == torch.float32 else mixed_f.to(orig_dtype)).to(target_dtype)
+                mlp_out = layer.mlp(normed_f).float()
+                if not pc_f['adapter_zero']:
+                    mlp_out = mlp_out + self._apply_pass_adapter(mixed_f, pass_idx)
+                alpha_f = gain_f * p_swap_f
+                mlp_delta = gain_f * mlp_out
+                out0 = m0 + alpha_f * diff_f + w0_f * mlp_delta
+                out1 = m1 - alpha_f * diff_f + w1_f * mlp_delta
+                if is_tuple:
+                    return (out0, out1) if orig_dtype == torch.float32 else (out0.to(orig_dtype), out1.to(orig_dtype))
+                return torch.stack((out0.to(orig_dtype), out1.to(orig_dtype)), dim=0)
+
+            # Differentiable training path
             # 1. Attention sublayer mHC (exact 3D closed-form 2x2 Sinkhorn)
             r1_a, w0_a, w1_a, p_swap_a = self._compute_routing_scalars(s0, s1, pass_idx=pass_idx, is_ffn=False)
             diff_a = s1 - s0
@@ -2790,6 +3169,8 @@ class TwoStreamMHC(nn.Module):
             mlp_delta = gain_f * mlp_out
             out0 = m0 + alpha_f * diff_f + w0_f * mlp_delta
             out1 = m1 - alpha_f * diff_f + w1_f * mlp_delta
+            if is_tuple:
+                return (out0, out1) if orig_dtype == torch.float32 else (out0.to(orig_dtype), out1.to(orig_dtype))
             return torch.stack((out0.to(orig_dtype), out1.to(orig_dtype)), dim=0)
 
         r1, w0, w1, p_swap = self._compute_routing_scalars(s0, s1, pass_idx=pass_idx, is_ffn=False)
@@ -2809,6 +3190,8 @@ class TwoStreamMHC(nn.Module):
         scaled_delta = gain * delta
         out0 = s0 + alpha * diff + w0 * scaled_delta
         out1 = s1 - alpha * diff + w1 * scaled_delta
+        if is_tuple:
+            return (out0, out1) if orig_dtype == torch.float32 else (out0.to(orig_dtype), out1.to(orig_dtype))
         return torch.stack((out0.to(orig_dtype), out1.to(orig_dtype)), dim=0)
 
 
@@ -3838,7 +4221,10 @@ class SparkXLoopV03(nn.Module):
                 sw = int(getattr(cfg, 'sliding_window', 512) or 512)
                 sw_ok = causal_ok & ((q_idx - k_idx) < sw)
                 masks['sliding_attention'] = torch.where(sw_ok, zero_val, min_val)
-        implementation = importlib.import_module(type(model.layers[0].self_attn).__module__)
+        implementation = getattr(self, '_attn_impl_mod', None)
+        if implementation is None:
+            implementation = importlib.import_module(type(model.layers[0].self_attn).__module__)
+            self._attn_impl_mod = implementation
         rope = {}
         sparse_cfg = getattr(self, 'sparse_attention_cfg', None)
         yarn_scale = float(getattr(sparse_cfg, 'yarn_scale_factor', 1.0) or 1.0) if sparse_cfg is not None else 1.0
@@ -4059,19 +4445,22 @@ class SparkXLoopV03(nn.Module):
         else:
             # At >=8K training, store between-layer checkpoint boundary streams in BF16 (saves >10GB VRAM at 16K/60L-72L)
             # while TwoStreamMHC.forward executes all internal Sinkhorn & residual math in FP32.
-            stream_dtype = kv_dtype if (self.training and self.enable_checkpoint and input_ids.shape[1] >= 8192) else h.dtype
-            streams = torch.stack((h.to(stream_dtype), h.to(stream_dtype)), dim=0)
-            if (
-                past_key_values is None
-                and self.training
-                and torch.is_grad_enabled()
-                and not streams.requires_grad
-                and (
-                    any(p.requires_grad for p in self.controllers.parameters())
-                    or (self.engram_enabled and any(p.requires_grad for p in self.backbone_engrams.parameters()))
-                )
-            ):
-                streams = streams.detach().requires_grad_(True)
+            use_ckpt_loop = bool(past_key_values is None and self.training and self.enable_checkpoint)
+            if use_ckpt_loop:
+                stream_dtype = kv_dtype if input_ids.shape[1] >= 8192 else h.dtype
+                streams: Any = torch.stack((h.to(stream_dtype), h.to(stream_dtype)), dim=0)
+                if (
+                    torch.is_grad_enabled()
+                    and not streams.requires_grad
+                    and (
+                        any(p.requires_grad for p in self.controllers.parameters())
+                        or (self.engram_enabled and any(p.requires_grad for p in self.backbone_engrams.parameters()))
+                    )
+                ):
+                    streams = streams.detach().requires_grad_(True)
+            else:
+                streams = (h, h)
+
             for p, s_idx, e_idx in pass_spans:
                 for idx in range(s_idx, e_idx):
                     v_idx = visit_counts.get(idx, 0)
@@ -4096,32 +4485,54 @@ class SparkXLoopV03(nn.Module):
                         else None
                     )
                     virtual_idx += 1
-                    def step(s, _ctrl=ctrl, _layer=layer, _rp=rp, _mk=mk, _extra=(p > 0), _p=p, _vc=v_cache, _cp=cache_position, _eng=eng_mod, _idx=idx, _v_idx=v_idx, _virtual_idx=eff_v_idx, _pf=engram_pass_filter):
-                        with _attention_visit_context(getattr(_layer, 'self_attn', None), _idx, _virtual_idx, _v_idx):
-                            s_out = _ctrl(s, _layer, _rp, _mk, extra=_extra, pass_idx=_p,
-                                          past_key_values=_vc, cache_position=_cp)
-                        if cap_hook is not None:
-                            cap_hook(_idx, _v_idx, _p, 'post_layer', s_out[0])
-                        if _eng is not None and (_pf is None or _p in _pf):
-                            eng_delta = _eng(
-                                input_ids, s_out.dtype, prev_ids=prev_ids, hidden_states=s_out[0],
-                                pass_idx=_p, ngram_indices=ngram_indices,
-                            )
-                            if _extra:
-                                fgain_param = _ctrl.p3_ffn_extra_gain if _p >= 2 else _ctrl.ffn_extra_gain
-                                fgain = _ctrl._effective_gain(fgain_param, pass_idx=_p, extra=True)
-                                eng_delta = (eng_delta.float() * fgain).to(s_out.dtype)
-                            s_out = torch.stack((s_out[0] + eng_delta, s_out[1]), dim=0)
-                        if esm_on and (esm_visits_mode == 'all' or _v_idx == 0) and str(_idx) in self.esm:
-                            esm_m = self.esm[str(_idx)]
-                            if esm_m.has_active_writes():
-                                esm_d = esm_m(s_out[0]).to(s_out.dtype)
-                                s_out = torch.stack((s_out[0] + esm_d, s_out[1]), dim=0)
-                        return s_out
-                    if v_cache is None and self.training and self.enable_checkpoint:
+                    if use_ckpt_loop:
+                        def step(s, _ctrl=ctrl, _layer=layer, _rp=rp, _mk=mk, _extra=(p > 0), _p=p, _vc=v_cache, _cp=cache_position, _eng=eng_mod, _idx=idx, _v_idx=v_idx, _virtual_idx=eff_v_idx, _pf=engram_pass_filter):
+                            with _attention_visit_context(getattr(_layer, 'self_attn', None), _idx, _virtual_idx, _v_idx):
+                                s_out = _ctrl(s, _layer, _rp, _mk, extra=_extra, pass_idx=_p,
+                                              past_key_values=_vc, cache_position=_cp)
+                            if cap_hook is not None:
+                                cap_hook(_idx, _v_idx, _p, 'post_layer', s_out[0])
+                            if _eng is not None and (_pf is None or _p in _pf):
+                                eng_delta = _eng(
+                                    input_ids, s_out.dtype, prev_ids=prev_ids, hidden_states=s_out[0],
+                                    pass_idx=_p, ngram_indices=ngram_indices,
+                                )
+                                if _extra:
+                                    fgain_param = _ctrl.p3_ffn_extra_gain if _p >= 2 else _ctrl.ffn_extra_gain
+                                    fgain = _ctrl._effective_gain(fgain_param, pass_idx=_p, extra=True)
+                                    eng_delta = (eng_delta.float() * fgain).to(s_out.dtype)
+                                s_out = torch.stack((s_out[0] + eng_delta, s_out[1]), dim=0)
+                            if esm_on and (esm_visits_mode == 'all' or _v_idx == 0) and str(_idx) in self.esm:
+                                esm_m = self.esm[str(_idx)]
+                                if esm_m.has_active_writes():
+                                    esm_d = esm_m(s_out[0]).to(s_out.dtype)
+                                    s_out = torch.stack((s_out[0] + esm_d, s_out[1]), dim=0)
+                            return s_out
                         streams = checkpoint(step, streams, use_reentrant=False)
                     else:
-                        streams = step(streams)
+                        with _attention_visit_context(getattr(layer, 'self_attn', None), idx, eff_v_idx, v_idx):
+                            s_out = ctrl(streams, layer, rp, mk, extra=(p > 0), pass_idx=p,
+                                         past_key_values=v_cache, cache_position=cache_position)
+                        if cap_hook is not None:
+                            cap_hook(idx, v_idx, p, 'post_layer', s_out[0])
+                        if eng_mod is not None and (engram_pass_filter is None or p in engram_pass_filter):
+                            s0_dtype = s_out[0].dtype
+                            eng_delta = eng_mod(
+                                input_ids, s0_dtype, prev_ids=prev_ids, hidden_states=s_out[0],
+                                pass_idx=p, ngram_indices=ngram_indices,
+                            )
+                            if p > 0:
+                                fgain_param = ctrl.p3_ffn_extra_gain if p >= 2 else ctrl.ffn_extra_gain
+                                fgain = ctrl._effective_gain(fgain_param, pass_idx=p, extra=True)
+                                eng_delta = (eng_delta.float() * fgain).to(s0_dtype)
+                            s_out = (s_out[0] + eng_delta, s_out[1]) if isinstance(s_out, tuple) else torch.stack((s_out[0] + eng_delta, s_out[1]), dim=0)
+                        if esm_on and (esm_visits_mode == 'all' or v_idx == 0) and str(idx) in self.esm:
+                            esm_m = self.esm[str(idx)]
+                            if esm_m.has_active_writes():
+                                s0_dtype = s_out[0].dtype
+                                esm_d = esm_m(s_out[0]).to(s0_dtype)
+                                s_out = (s_out[0] + esm_d, s_out[1]) if isinstance(s_out, tuple) else torch.stack((s_out[0] + esm_d, s_out[1]), dim=0)
+                        streams = s_out
                     if cap_hook is not None:
                         cap_hook(idx, v_idx, p, 'post_block', streams[0])
             h = streams[0].float()

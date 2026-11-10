@@ -291,6 +291,171 @@ class RuntimeContractTests(unittest.TestCase):
                 expected = ids if keep is None or keep <= 0 else ids[:, -keep:]
                 self.assertTrue(torch.equal(got[..., 0], expected.float()))
 
+    def test_mhc_eval_cache_parity_and_invalidation(self):
+        from sparkx_loop_v03_core import TwoStreamMHC
+
+        torch.manual_seed(7)
+        dim = 16
+        ctrl = TwoStreamMHC(width=dim, max_passes=3, pass_adapter_rank=4, gain_mode='sigmoid')
+        with torch.no_grad():
+            ctrl.dynamic_proj.weight.normal_(0.0, 0.05)
+            ctrl.ffn_dynamic_proj.weight.normal_(0.0, 0.05)
+            ctrl.pass_routing_bias.normal_(0.0, 0.1)
+            for p_idx in range(3):
+                ctrl.pass_up[p_idx].weight.normal_(0.0, 0.05)
+                ctrl.pass_down[p_idx].weight.normal_(0.0, 0.05)
+            ctrl.extra_gain.fill_(0.8)
+            ctrl.ffn_extra_gain.fill_(0.3)
+            ctrl.p3_extra_gain.fill_(-0.4)
+            ctrl.p3_ffn_extra_gain.fill_(-0.2)
+
+        class DummySublayer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer_type = 'sliding_attention'
+                self.input_layernorm = torch.nn.RMSNorm(dim, eps=1e-6)
+                self.post_attention_layernorm = torch.nn.RMSNorm(dim, eps=1e-6)
+                self.lin1 = torch.nn.Linear(dim, dim, bias=False)
+                self.mlp = torch.nn.Linear(dim, dim, bias=False)
+                self.mlp.gate_proj = self.mlp
+                self.self_attn = lambda **kw: (self.lin1(kw['hidden_states']), None)
+
+        layer = DummySublayer()
+        s0 = torch.randn(1, 5, dim)
+        s1 = torch.randn(1, 5, dim)
+
+        for p_idx in (0, 1, 2):
+            ctrl.train(True)
+            train_out = ctrl(torch.stack([s0.clone(), s1.clone()], dim=0), layer, None, None, pass_idx=p_idx)
+            ctrl.train(False)
+            with torch.no_grad():
+                eval_s0, eval_s1 = ctrl((s0.clone(), s1.clone()), layer, None, None, pass_idx=p_idx)
+            torch.testing.assert_close(train_out[0], eval_s0, atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(train_out[1], eval_s1, atol=1e-5, rtol=1e-5)
+
+        key_before = getattr(ctrl, '_eval_cache_last_key', None)
+        self.assertIsNotNone(key_before)
+        with torch.no_grad():
+            ctrl.extra_gain.add_(0.75)
+            mutated_s0, _ = ctrl((s0.clone(), s1.clone()), layer, None, None, pass_idx=1)
+        self.assertNotEqual(key_before, getattr(ctrl, '_eval_cache_last_key', None))
+        ctrl.train(True)
+        train_mut = ctrl(torch.stack([s0.clone(), s1.clone()], dim=0), layer, None, None, pass_idx=1)
+        torch.testing.assert_close(mutated_s0, train_mut[0], atol=1e-5, rtol=1e-5)
+
+    def test_paged_visit_slot_gpu_resident_views_and_coalesced_cold_gather(self):
+        from sparkx_paged_cache import GlobalPagedVisitSlot, PagedCacheConfig
+
+        torch.manual_seed(11)
+        cfg = PagedCacheConfig(
+            sinks=4,
+            recent_tokens=16,
+            kv_page_tokens=8,
+            global_hot_tokens_per_visit=32,
+            cold_codec='bf16',
+        )
+        slot = GlobalPagedVisitSlot(
+            virtual_visit=0,
+            physical_layer=3,
+            pass_idx=0,
+            global_visit_id=0,
+            layer_visit_ordinal=0,
+            cfg=cfg,
+        )
+        k_all = torch.randn(1, 2, 48, 8, dtype=torch.bfloat16)
+        v_all = torch.randn(1, 2, 48, 8, dtype=torch.bfloat16)
+
+        slot.append(k_all[:, :, :24, :], v_all[:, :, :24, :])
+        self.assertTrue(slot.is_fully_gpu_resident())
+        for step in range(24, 32):
+            slot.append(k_all[:, :, step:step + 1, :], v_all[:, :, step:step + 1, :])
+        self.assertTrue(slot.is_fully_gpu_resident())
+        k_res, v_res = slot.gather_selected(torch.tensor([0, 3, 7, 19, 31]), return_positions=False)
+        torch.testing.assert_close(k_res, k_all[:, :, [0, 3, 7, 19, 31], :])
+        torch.testing.assert_close(v_res, v_all[:, :, [0, 3, 7, 19, 31], :])
+
+        # Append beyond gpu_resident_cap=32 to trigger cold page archival and coalesced gather
+        slot.append(k_all[:, :, 32:48, :], v_all[:, :, 32:48, :])
+        self.assertFalse(slot.is_fully_gpu_resident())
+        sel = torch.tensor([0, 2, 5, 9, 14, 18, 25, 33, 44, 47])
+        k_cold, v_cold = slot.gather_selected(sel, return_positions=False)
+        torch.testing.assert_close(k_cold, k_all[:, :, sel, :])
+        torch.testing.assert_close(v_cold, v_all[:, :, sel, :])
+
+    def test_vectorized_dlsa_sparse_prefill_causality_and_decode_consistency(self):
+        from sparkx_dlsa import DLSAIndexConfig, FaithfulDLSAIndexer
+        from sparkx_paged_cache import GlobalPagedVisitSlot, PagedCacheConfig
+        from sparkx_sparse_attention import SparseAttentionConfig, paged_dlsa_global_attention_forward
+
+        torch.manual_seed(19)
+        num_q_heads = 4
+        num_kv_heads = 2
+        head_dim = 8
+        rope_dim = 2
+        seq_len = 48
+
+        dlsa_cfg = DLSAIndexConfig(
+            n_kv=num_kv_heads,
+            head_dim=head_dim,
+            rope_dim=rope_dim,
+            d_idx=8,
+            n_sink=4,
+            n_pool=2,
+            n_cluster=16,
+            avg_bucket_size=4,
+            max_bucket_size=8,
+            window=16,
+            k_long_range=8,
+        )
+        indexer = FaithfulDLSAIndexer(dlsa_cfg).eval()
+        sparse_cfg = SparseAttentionConfig(
+            sinks=4,
+            recent_tokens=16,
+            long_range_tokens=8,
+            exact_threshold=24,
+            sparse_query_tile_tokens=8,
+        )
+        cache_cfg = PagedCacheConfig(
+            sinks=4,
+            recent_tokens=16,
+            kv_page_tokens=8,
+            global_hot_tokens_per_visit=64,
+        )
+
+        q = torch.randn(1, num_q_heads, seq_len, head_dim)
+        k = torch.randn(1, num_kv_heads, seq_len, head_dim)
+        v = torch.randn(1, num_kv_heads, seq_len, head_dim)
+
+        q_pert = q.clone()
+        k_pert = k.clone()
+        v_pert = v.clone()
+        q_pert[:, :, 40:, :] = torch.randn(1, num_q_heads, 8, head_dim)
+        k_pert[:, :, 40:, :] = torch.randn(1, num_kv_heads, 8, head_dim)
+        v_pert[:, :, 40:, :] = torch.randn(1, num_kv_heads, 8, head_dim)
+
+        slot_a = GlobalPagedVisitSlot(0, 3, 0, 0, 0, cache_cfg)
+        slot_a.append(k, v, indexer=indexer)
+        out_a = paged_dlsa_global_attention_forward(
+            query=q, slot=slot_a, indexer=indexer, sparse_cfg=sparse_cfg
+        )
+
+        slot_b = GlobalPagedVisitSlot(0, 3, 0, 0, 0, cache_cfg)
+        slot_b.append(k_pert, v_pert, indexer=indexer)
+        out_b = paged_dlsa_global_attention_forward(
+            query=q_pert, slot=slot_b, indexer=indexer, sparse_cfg=sparse_cfg
+        )
+        # Strict causality: perturbing tokens >= 40 must have zero effect on queries < 40
+        torch.testing.assert_close(out_a[:, :, :40, :], out_b[:, :, :40, :], atol=1e-6, rtol=1e-6)
+
+        # Last query of vectorized multi-query prefill must match single-query decode at position 47
+        slot_split = GlobalPagedVisitSlot(0, 3, 0, 0, 0, cache_cfg)
+        slot_split.append(k[:, :, :47, :], v[:, :, :47, :], indexer=indexer)
+        slot_split.append(k[:, :, 47:48, :], v[:, :, 47:48, :], indexer=indexer)
+        out_decode_last = paged_dlsa_global_attention_forward(
+            query=q[:, :, 47:48, :], slot=slot_split, indexer=indexer, sparse_cfg=sparse_cfg, known_upto=48
+        )
+        torch.testing.assert_close(out_a[:, :, 47:48, :], out_decode_last, atol=1e-5, rtol=1e-5)
+
 
 @unittest.skipIf(torch is None, 'torch not installed')
 class GenerationHookTests(unittest.TestCase):

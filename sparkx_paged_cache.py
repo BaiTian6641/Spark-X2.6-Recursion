@@ -385,8 +385,8 @@ class GlobalPagedVisitSlot:
                 self._insert_hot_page(page_id, k_slice, v_slice)
 
         consumed = n_new_pages * self.page_tokens
-        self.tail_k = self.tail_k[:, :, consumed:, :].detach()
-        self.tail_v = self.tail_v[:, :, consumed:, :].detach()
+        self.tail_k = self.tail_k[:, :, consumed:, :].detach().contiguous()
+        self.tail_v = self.tail_v[:, :, consumed:, :].detach().contiguous()
         self.paged_end += consumed
         # Once cold pages exist, release the contiguous GPU-resident mirror so GPU memory stays bounded by `global_hot_tokens_per_visit`
         if self.cold_pages:
@@ -460,7 +460,10 @@ class GlobalPagedVisitSlot:
         if indexer is not None:
             from sparkx_dlsa import PagedLatentIndex, _dummy_q
             k0_new = key_states[0]  # [H_kv, q_len, D]
-            _, k_in_new = indexer.inputs(_dummy_q(k0_new), k0_new)
+            if hasattr(indexer, "_free_key_features"):
+                k_in_new = indexer._free_key_features(k0_new)
+            else:
+                _, k_in_new = indexer.inputs(_dummy_q(k0_new), k0_new)
             k_idx_new = indexer.project_k(k_in_new)
             idx: Optional[PagedLatentIndex] = self.dlsa_state_slot.get("index")
             if idx is None:
@@ -479,7 +482,7 @@ class GlobalPagedVisitSlot:
                     persistent_token_latents=self.cfg.persistent_token_latents,
                 )
                 if idx.t > idx.clustered_end:
-                    idx._unclustered_k_buf = F.normalize(k_idx_new[idx.clustered_end : idx.t].float(), dim=-1, eps=1e-6)
+                    idx._set_unclustered_tail(k_idx_new[idx.clustered_end : idx.t])
                 self.dlsa_state_slot["index"] = idx
             else:
                 idx.append_new_keys(k_idx_new)
@@ -487,7 +490,27 @@ class GlobalPagedVisitSlot:
         # 2. Maintain fast GPU-resident contiguous buffer while within `gpu_resident_cap` and `codec == "bf16"`
         if self.codec_cfg.codec == "bf16" and not self.cold_pages and self.logical_seq_length <= self.gpu_resident_cap:
             self._append_to_gpu_resident(key_states, value_states)
+            assert self._gpu_res_k is not None and self._gpu_res_v is not None
+            sink_end = min(self._gpu_res_len, self.sinks)
+            self.sink_k = self._gpu_res_k[:, :, :sink_end, :]
+            self.sink_v = self._gpu_res_v[:, :, :sink_end, :]
+            self.paged_end = sink_end
+            if self._gpu_res_len > sink_end:
+                self.tail_k = self._gpu_res_k[:, :, sink_end : self._gpu_res_len, :]
+                self.tail_v = self._gpu_res_v[:, :, sink_end : self._gpu_res_len, :]
+            else:
+                self.tail_k = None
+                self.tail_v = None
+            return self.logical_seq_length
         elif self._gpu_res_k is not None:
+            if self.sink_k is not None:
+                self.sink_k = self.sink_k.clone()
+            if self.sink_v is not None:
+                self.sink_v = self.sink_v.clone()
+            if self.tail_k is not None:
+                self.tail_k = self.tail_k.clone()
+            if self.tail_v is not None:
+                self.tail_v = self.tail_v.clone()
             self._gpu_res_k = None
             self._gpu_res_v = None
             self._gpu_res_len = 0
@@ -601,12 +624,17 @@ class GlobalPagedVisitSlot:
                     fetched_pages[pid] = self._fetch_page_to_gpu(
                         pid, device=device, dtype=dtype, protected_pids=protected_set
                     )
-            # Phase C: Slice tokens per page in ascending order
-            for grp_idx, pid in enumerate(unique_page_list):
-                offs = page_offs[inverse_idx == grp_idx]
-                kp, vp = fetched_pages[pid]
-                k_parts.append(kp.index_select(-2, offs))
-                v_parts.append(vp.index_select(-2, offs))
+            # Phase C: Coalesced single index_select across all fetched pages (replaces O(U) per-page kernel loop with 1 gather)
+            if len(unique_page_list) == 1:
+                kp0, vp0 = fetched_pages[unique_page_list[0]]
+                k_parts.append(kp0.index_select(-2, page_offs))
+                v_parts.append(vp0.index_select(-2, page_offs))
+            else:
+                k_pages = torch.cat([fetched_pages[pid][0] for pid in unique_page_list], dim=-2)
+                v_pages = torch.cat([fetched_pages[pid][1] for pid in unique_page_list], dim=-2)
+                flat_gather_idx = inverse_idx * self.page_tokens + page_offs
+                k_parts.append(k_pages.index_select(-2, flat_gather_idx))
+                v_parts.append(v_pages.index_select(-2, flat_gather_idx))
 
         # 3. Resident tail positions `[paged_end, logical_seq_length)`
         tail_mask = sel >= self.paged_end
