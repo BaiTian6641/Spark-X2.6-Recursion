@@ -742,6 +742,7 @@ def load_sparkx_loop72_lsa(
             low_cpu_mem_usage=True,
             token=token,
         ).to(device)
+    base.requires_grad_(False)
 
     settings = LoopV03Settings.for_loop72_lsa(checkpoint_layers=False, offload_checkpoint_to_cpu=False)
     model = SparkXLoopV03(base, settings, patch_sdpa=True).to(device)

@@ -817,6 +817,28 @@ def patch_spark_attention_for_long_context(
         return out, None
 
     attn_mod.eager_attention_forward = fused_sdpa_attention_forward
+    if hasattr(attn_mod, 'ALL_ATTENTION_FUNCTIONS') and not getattr(attn_mod, '_sparkx_all_attn_proxied', False):
+        _orig_all_attn = attn_mod.ALL_ATTENTION_FUNCTIONS
+
+        class _SparkXAttentionRegistryProxy:
+            def __getitem__(self, key: str):
+                if key in ('eager', 'sdpa'):
+                    return lambda *a, **kw: attn_mod.eager_attention_forward(*a, **kw)
+                return _orig_all_attn[key]
+
+            def get(self, key: str, default=None):
+                if key in ('eager', 'sdpa'):
+                    return lambda *a, **kw: attn_mod.eager_attention_forward(*a, **kw)
+                return _orig_all_attn.get(key, default) if hasattr(_orig_all_attn, 'get') else default
+
+            def __contains__(self, key: str) -> bool:
+                return key in ('eager', 'sdpa') or (key in _orig_all_attn)
+
+            def __getattr__(self, attr: str):
+                return getattr(_orig_all_attn, attr)
+
+        attn_mod.ALL_ATTENTION_FUNCTIONS = _SparkXAttentionRegistryProxy()
+        attn_mod._sparkx_all_attn_proxied = True
     attn_mod._sparkx_sdpa_patched = True
     attn_mod._sparkx_loglinear_patched = False
     return len(layers)

@@ -1468,6 +1468,12 @@ def build_completion_gates_report(report: Dict[str, Any], clean_reload: Optional
         ),
         "gate_7_clean_export_closure_verified": bool((clean_reload or {}).get("passed", False)),
     }
+    gates["frozen_backbone_verified"] = bool(
+        report.get("base_backbone_immutable", True) and st_a.get("base_weights_immutable", True)
+    )
+    gates["stage_a_state_neutral_passed"] = gates["gate_1_stage_a_state_neutral_and_base_immutable"]
+    gates["stage_e_all_18_visits_calibrated"] = gates["gate_6_stage_e_all_18_global_visits_distilled"]
+    gates["clean_export_subprocess_verified"] = gates["gate_7_clean_export_closure_verified"]
     gates["production_release_ready"] = bool(
         gates["gate_1_stage_a_state_neutral_and_base_immutable"]
         and gates["gate_2_data_split_disjoint"]
