@@ -297,6 +297,44 @@ class StatisticalBenchmarkTests(unittest.TestCase):
             idx_36 = [idx for is_72, _th, idx in observed_modes if not is_72]
             self.assertEqual(idx_72, idx_36)
 
+    def test_extract_calibrated_speeds_matches_benchmark_loop72_decode_speed_schema(self):
+        # Exact list-of-dicts schema returned by `benchmark_loop72_decode_speed`
+        speed_report = {
+            "status": "completed",
+            "horizons": [
+                {
+                    "prompt_tokens": 512,
+                    "status": "completed",
+                    "decode_tok_per_s": 29.08,
+                    "prefill_tok_per_s": 7897.4,
+                    "ttft_ms": 64.8,
+                },
+                {
+                    "prompt_tokens": 8192,
+                    "status": "completed",
+                    "decode_tok_per_s": 22.08,
+                    "prefill_tok_per_s": 958.4,
+                    "ttft_ms": 8548.0,
+                },
+            ],
+        }
+        speeds = stat.extract_calibrated_speeds(speed_report)
+        self.assertEqual(speeds["decode_tok_per_s_short"], 29.08)
+        self.assertEqual(speeds["decode_tok_per_s_long"], 22.08)
+        self.assertEqual(speeds["prefill_tok_per_s_short"], 7897.4)
+        self.assertEqual(speeds["prefill_tok_per_s_long"], 958.4)
+        est = stat.estimate_preset_budget_table(
+            "quick",
+            decode_tok_per_s=speeds["decode_tok_per_s_short"],
+            decode_tok_per_s_long=speeds["decode_tok_per_s_long"],
+            prefill_tok_per_s_short=speeds["prefill_tok_per_s_short"],
+            prefill_tok_per_s_long=speeds["prefill_tok_per_s_long"],
+        )
+        self.assertGreater(est["estimated_total_minutes"], 0.0)
+        # Empty / blocked fallback never raises
+        fb = stat.extract_calibrated_speeds({"status": "blocked", "horizons": []})
+        self.assertGreater(fb["decode_tok_per_s_short"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

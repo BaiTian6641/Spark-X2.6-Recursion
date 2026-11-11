@@ -170,13 +170,13 @@ STAT_SUITE_SPECS: Dict[str, StatSuiteSpec] = {
         revision=None,
         files=None,
         metric_label="exact_match_pct",
-        preset_n={"ultra_fast": 8, "quick": 12, "standard": 30, "thorough": 30},
+        preset_n={"ultra_fast": 8, "quick": 12, "standard": 33, "thorough": 33},
         default_max_new_tokens=16384,
         est_avg_gen_tokens=3800,
         est_avg_prompt_tokens=240,
         max_scan_rows=None,
         reference_spark_x26_36l=73.3,
-        reference_note="N=30 total problems; 'standard'/'thorough' evaluate 100% of split (FPC=0).",
+        reference_note="N=33 total problems; 'standard'/'thorough' evaluate 100% of split (FPC=0).",
     ),
     "imo_answerbench": StatSuiteSpec(
         name="imo_answerbench",
@@ -264,7 +264,7 @@ STAT_SUITE_SPECS: Dict[str, StatSuiteSpec] = {
         config_name=None,
         candidate_splits=("train",),
         revision=None,
-        files=("BFCL_v4_simple_python.json",),
+        files=("BFCL_v3_simple.json", "BFCL_v3_live_simple.json"),
         metric_label="tool_ast_pct",
         preset_n={"ultra_fast": 12, "quick": 20, "standard": 40, "thorough": 80},
         default_max_new_tokens=4096,
@@ -272,7 +272,7 @@ STAT_SUITE_SPECS: Dict[str, StatSuiteSpec] = {
         est_avg_prompt_tokens=550,
         max_scan_rows=None,
         reference_spark_x26_36l=71.8,
-        reference_note="Single-turn simple Python call subset (official BFCL-V4 also includes multi-turn/live/parallel).",
+        reference_note="Single-turn simple + live_simple Python AST subset (N=261 single-valued items).",
     ),
 }
 
@@ -597,11 +597,71 @@ def recommend_sample_size(
     return max(1, int(math.ceil(n0)))
 
 
+def extract_calibrated_speeds(speed_report: Optional[Mapping[str, Any]]) -> Dict[str, float]:
+    """Extract short-context and sparse long-context prefill/decode tok/s from `benchmark_loop72_decode_speed`."""
+    defaults = {
+        "decode_tok_per_s_short": 27.4,
+        "decode_tok_per_s_long": 22.0,
+        "prefill_tok_per_s_short": 7500.0,
+        "prefill_tok_per_s_long": 1000.0,
+    }
+    if not isinstance(speed_report, Mapping):
+        return defaults
+
+    raw_horizons = speed_report.get("horizons")
+    entries: List[Mapping[str, Any]] = []
+    if isinstance(raw_horizons, Sequence) and not isinstance(raw_horizons, (str, bytes)):
+        for item in raw_horizons:
+            if isinstance(item, Mapping):
+                entries.append(item)
+    elif isinstance(raw_horizons, Mapping):
+        for k, v in raw_horizons.items():
+            if isinstance(v, Mapping):
+                merged = dict(v)
+                if "prompt_tokens" not in merged:
+                    try:
+                        merged["prompt_tokens"] = int(k)
+                    except (TypeError, ValueError):
+                        pass
+                entries.append(merged)
+
+    short_dec: List[float] = []
+    long_dec: List[float] = []
+    short_pf: List[float] = []
+    long_pf: List[float] = []
+    for row in entries:
+        ptok = int(row.get("prompt_tokens", 0) or 0)
+        dec = row.get("decode_tok_per_s", row.get("decode_tok_per_s_median"))
+        pf = row.get("prefill_tok_per_s", row.get("prefill_tok_per_s_median"))
+        if dec is not None and float(dec) > 0.0:
+            if ptok <= 4612:
+                short_dec.append(float(dec))
+            else:
+                long_dec.append(float(dec))
+        if pf is not None and float(pf) > 0.0:
+            if ptok <= 4612:
+                short_pf.append(float(pf))
+            else:
+                long_pf.append(float(pf))
+
+    dec_s = statistics.median(short_dec) if short_dec else (statistics.median(long_dec) if long_dec else defaults["decode_tok_per_s_short"])
+    dec_l = statistics.median(long_dec) if long_dec else dec_s
+    pf_s = statistics.median(short_pf) if short_pf else defaults["prefill_tok_per_s_short"]
+    pf_l = statistics.median(long_pf) if long_pf else defaults["prefill_tok_per_s_long"]
+    return {
+        "decode_tok_per_s_short": round(float(dec_s), 2),
+        "decode_tok_per_s_long": round(float(dec_l), 2),
+        "prefill_tok_per_s_short": round(float(pf_s), 2),
+        "prefill_tok_per_s_long": round(float(pf_l), 2),
+    }
+
+
 def estimate_preset_budget_table(
     preset: str = "quick",
     *,
     suites: Optional[Sequence[str]] = None,
     decode_tok_per_s: float = 27.4,
+    decode_tok_per_s_long: Optional[float] = None,
     prefill_tok_per_s_short: float = 7500.0,
     prefill_tok_per_s_long: float = 1200.0,
     confidence: float = 0.95,
@@ -613,13 +673,14 @@ def estimate_preset_budget_table(
     rows: List[Dict[str, Any]] = []
     total_sec = 0.0
     total_questions = 0
+    eff_dec_long = float(decode_tok_per_s_long) if decode_tok_per_s_long is not None else float(decode_tok_per_s)
     known_pop = {
         "longbench_v2": 503,
         "aime_2026": 30,
-        "hmmt_feb_2026": 30,
+        "hmmt_feb_2026": 33,
         "gpqa_diamond": 198,
-        "ifeval": 480,
-        "bfcl_v4_simple": 360,
+        "ifeval": 426,
+        "bfcl_v4_simple": 261,
         "imo_answerbench": 400,
     }
     for name in suite_names:
@@ -632,9 +693,11 @@ def estimate_preset_budget_table(
         p_prior = (spec.reference_spark_x26_36l / 100.0) if spec.reference_spark_x26_36l else 0.70
         w_lo, w_hi = _wilson_ci_pct(100.0 * p_prior, n=n, fpc=fpc, confidence=confidence)
         est_moe = 0.5 * (w_hi - w_lo)
-        pf_rate = prefill_tok_per_s_long if spec.est_avg_prompt_tokens > 4612 else prefill_tok_per_s_short
+        is_long = spec.est_avg_prompt_tokens > 4612
+        pf_rate = prefill_tok_per_s_long if is_long else prefill_tok_per_s_short
+        dec_rate = eff_dec_long if is_long else decode_tok_per_s
         sec_per_q = (spec.est_avg_prompt_tokens / max(1.0, pf_rate)) + (
-            spec.est_avg_gen_tokens / max(1.0, decode_tok_per_s)
+            spec.est_avg_gen_tokens / max(1.0, dec_rate)
         )
         suite_sec = n * sec_per_q
         total_sec += suite_sec
@@ -655,6 +718,7 @@ def estimate_preset_budget_table(
     return {
         "preset": preset,
         "assumed_decode_tok_per_s": decode_tok_per_s,
+        "assumed_decode_tok_per_s_long": eff_dec_long,
         "total_planned_questions": total_questions,
         "estimated_total_minutes": round(total_sec / 60.0, 1),
         "estimated_total_hours": round(total_sec / 3600.0, 2),
@@ -733,6 +797,8 @@ def _assign_stratum(spec: StatSuiteSpec, row: Mapping[str, Any], task: Mapping[s
         return cat if cat else f"pos_bin_{int(row_index) // 100}"
     if spec.name == "gaokao_2026":
         return str(task.get("verifier", "math"))
+    if spec.name == "bfcl_v4_simple":
+        return str(row.get("_bfcl_subset") or "simple")
     if spec.task_mode == "official":
         # Long-context suites: stratify across context-length tiers
         if prompt_tokens <= 16384:
@@ -812,37 +878,56 @@ def stratified_sample_without_replacement(
 
 
 def _load_bfcl_all_simple_rows(token: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Load the complete BFCL_v4_simple_python JSONL split + ground-truth answers."""
-    from huggingface_hub import hf_hub_download
+    """Load the BFCL simple + live_simple Python splits + ground-truth answers from Hub or HTTPS."""
+    import urllib.request
 
     repo_id = "gorilla-llm/Berkeley-Function-Calling-Leaderboard"
-    q_path = hf_hub_download(repo_id=repo_id, filename="BFCL_v4_simple_python.json", repo_type="dataset", token=token)
-    a_path = hf_hub_download(
-        repo_id=repo_id,
-        filename="possible_answer/BFCL_v4_simple_python.json",
-        repo_type="dataset",
-        token=token,
-    )
-    q_lines = Path(q_path).read_text(encoding="utf-8").splitlines()
-    a_lines = Path(a_path).read_text(encoding="utf-8").splitlines()
-    answers_by_id: Dict[str, Any] = {}
-    for line in a_lines:
-        s = line.strip()
-        if not s:
-            continue
-        obj = json.loads(s)
-        if "id" in obj:
-            answers_by_id[str(obj["id"])] = obj.get("ground_truth", [])
+
+    def _read_lines(rel_path: str) -> List[str]:
+        try:
+            from huggingface_hub import hf_hub_download
+
+            local_p = hf_hub_download(repo_id=repo_id, filename=rel_path, repo_type="dataset", token=token)
+            return Path(local_p).read_text(encoding="utf-8").splitlines()
+        except Exception:
+            url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{rel_path}"
+            headers = {"User-Agent": "SparkX-Loop72-StatBench/1.0"}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15.0) as resp:
+                return resp.read().decode("utf-8").splitlines()
+
     merged: List[Dict[str, Any]] = []
-    for line in q_lines:
-        s = line.strip()
-        if not s:
+    for filename, subset_tag in (
+        ("BFCL_v3_simple.json", "simple"),
+        ("BFCL_v3_live_simple.json", "live_simple"),
+    ):
+        try:
+            q_lines = _read_lines(filename)
+            a_lines = _read_lines(f"possible_answer/{filename}")
+        except Exception:
             continue
-        q = dict(json.loads(s))
-        qid = str(q.get("id", ""))
-        if qid in answers_by_id:
-            q["ground_truth"] = answers_by_id[qid]
-        merged.append(q)
+        answers_by_id: Dict[str, Any] = {}
+        for line in a_lines:
+            s = line.strip()
+            if not s:
+                continue
+            obj = json.loads(s)
+            if "id" in obj:
+                answers_by_id[str(obj["id"])] = obj.get("ground_truth", [])
+        for line in q_lines:
+            s = line.strip()
+            if not s:
+                continue
+            q = dict(json.loads(s))
+            qid = str(q.get("id", ""))
+            if qid in answers_by_id:
+                q["ground_truth"] = answers_by_id[qid]
+            q["_bfcl_subset"] = subset_tag
+            merged.append(q)
+    if not merged:
+        raise RuntimeError(f"Could not download BFCL simple files from {repo_id}")
     return merged
 
 
@@ -946,6 +1031,10 @@ def build_candidate_frame_and_sample(
             if "problem_type" not in row:
                 raise ValueError("GraphWalks row missing problem_type")
             if str(row.get("problem_type", "")).lower() != "bfs":
+                excluded_filter += 1
+                continue
+        if spec.name == "gaokao_2026":
+            if bool(row.get("is_proof")) or str(row.get("modality", "text") or "text").lower() not in ("text",):
                 excluded_filter += 1
                 continue
 
@@ -1407,6 +1496,10 @@ def format_statistical_markdown_table(report: Mapping[str, Any]) -> str:
         if st == "blocked_gated_dataset":
             lines.append(f"| `{name}` | `{mode}` | gated | — | *(requires HF_TOKEN gate)* | — | — | — | — | {s.get('reference_spark_x26_36l_card') or '—'} |")
             continue
+        if st == "suite_error":
+            err_msg = str(s.get("reason") or "error")[:48]
+            lines.append(f"| `{name}` | `{mode}` | error | — | *({err_msg})* | — | — | — | — | {s.get('reference_spark_x26_36l_card') or '—'} |")
+            continue
         stat = s.get("statistics") or {}
         frame = s.get("frame") or {}
         n = stat.get("n", 0)
@@ -1475,21 +1568,41 @@ def run_statistical_benchmarks(
                 f"max_new_tokens={max_new}, max_context={max_context_tokens}, resume={resume}) ===",
                 flush=True,
             )
-        entry = run_statistical_suite(
-            model,
-            tokenizer,
-            spec,
-            dest,
-            sample_size=planned_n,
-            seed=seed,
-            max_new_tokens=max_new,
-            max_context_tokens=max_context_tokens,
-            confidence=confidence,
-            generation_options=generation_options,
-            token=token,
-            verbose=verbose,
-            resume=resume,
-        )
+        try:
+            entry = run_statistical_suite(
+                model,
+                tokenizer,
+                spec,
+                dest,
+                sample_size=planned_n,
+                seed=seed,
+                max_new_tokens=max_new,
+                max_context_tokens=max_context_tokens,
+                confidence=confidence,
+                generation_options=generation_options,
+                token=token,
+                verbose=verbose,
+                resume=resume,
+            )
+        except (KeyboardInterrupt, ResumeIntegrityError):
+            raise
+        except Exception as exc:
+            entry = {
+                "suite": name,
+                "benchmark_name": spec.benchmark_name,
+                "category": spec.category,
+                "task_mode": spec.task_mode,
+                "sampling_mode": "statistical_subset",
+                "status": "suite_error",
+                "complete": False,
+                "official_comparable": False,
+                "published_score_comparable": False,
+                "reason": f"{type(exc).__name__}: {exc}",
+                "reference_spark_x26_36l_card": spec.reference_spark_x26_36l,
+                "statistics": compute_statistical_summary([]),
+            }
+            if verbose:
+                print(f"  [{name}] ERROR (continuing remaining suites): {entry['reason']}", flush=True)
         results.append(entry)
 
     report: Dict[str, Any] = {
