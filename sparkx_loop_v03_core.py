@@ -644,6 +644,36 @@ def _unwrap_input_ids(x: Any) -> Any:
     return x
 
 
+def _detect_periodic_token_loop(
+    tokens: Sequence[int],
+    max_period: int = 64,
+    min_repeats: int = 16,
+    min_total_span: int = 160,
+) -> Optional[Tuple[int, int]]:
+    """Detect an exact trailing periodic cycle `(w_1 ... w_p)^k` in `tokens` (`O(max_period)` list-slice check, 0 GPU syncs).
+
+    Returns `(period, repeats)` for the smallest period `1 <= p <= max_period` whose trailing suffix repeats at least
+    `max(min_repeats, ceil(min_total_span / p))` consecutive times, or `None` if no such suffix cycle exists.
+    """
+    n = len(tokens)
+    if n < max(2, int(min_total_span)) or int(min_repeats) < 2:
+        return None
+    max_p = min(int(max_period), n // int(min_repeats))
+    last_tok = tokens[n - 1]
+    for p in range(1, max_p + 1):
+        if tokens[n - 1 - p] != last_tok:
+            continue
+        need_reps = max(int(min_repeats), (int(min_total_span) + p - 1) // p)
+        span = p * need_reps
+        if span > n:
+            continue
+        if tokens[n - span + p - 1] != last_tok:
+            continue
+        if tokens[n - span : n - p] == tokens[n - span + p : n]:
+            return (p, need_reps)
+    return None
+
+
 def _dispatch_spark_sdpa(
     module: nn.Module,
     query: torch.Tensor,
@@ -4748,6 +4778,7 @@ class SparkXLoopV03(nn.Module):
         force_think_close: bool = True,
         token_callback: Optional[Callable[[int], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
+        abort_on_degenerate_loop: bool = True,
         **kwargs,
     ):
         """KV-cached generation using the model's configured recurrence.
@@ -4776,6 +4807,8 @@ class SparkXLoopV03(nn.Module):
         ext_cache = kwargs.pop('cache', None) or kwargs.pop('past_key_values', None)
         cache = ext_cache if ext_cache is not None else (self.make_inference_cache() if use_paged else DynamicCache())
         prefill_chunk = int(kwargs.pop('prefill_chunk_tokens', getattr(self.settings, 'prefill_chunk_tokens', 2048)) or 0)
+        think_loop_guard = bool(kwargs.pop('think_loop_guard', True))
+        is_greedy_decode = (not bool(do_sample)) or (float(temperature) <= 1e-5)
         out = input_ids
 
         stop_ids = set()
@@ -4846,6 +4879,8 @@ class SparkXLoopV03(nn.Module):
         ttft_sec: float = 0.0
         itl_ms_list: list[float] = []
         finish_reason = 'length'
+        think_loop_guard_closed = False
+        degenerate_loop_info: Optional[Dict[str, int]] = None
 
         def _check_cancelled() -> None:
             if should_stop is not None and should_stop():
@@ -4934,8 +4969,22 @@ class SparkXLoopV03(nn.Module):
             while step_i < max_new_tokens:
                 _check_cancelled()
                 t_step_0 = time.perf_counter()
-                # Enforce think_budget_tokens so the model NEVER truncates mid-thought without emitting </think>
-                if not think_closed and eff_think_budget is not None and len(gen_list) >= eff_think_budget:
+                # Enforce think_budget_tokens (and periodic <think> cycle guard when force_think_close=True)
+                close_reason: Optional[str] = None
+                if not think_closed:
+                    if eff_think_budget is not None and len(gen_list) >= eff_think_budget:
+                        close_reason = f"budget={eff_think_budget}"
+                    elif (
+                        force_think_close
+                        and think_loop_guard
+                        and len(gen_list) >= 160
+                        and len(gen_list) % 16 == 0
+                    ):
+                        cyc = _detect_periodic_token_loop(gen_list, max_period=32, min_repeats=16, min_total_span=160)
+                        if cyc is not None:
+                            close_reason = f"loop(period={cyc[0]},repeats={cyc[1]})"
+                            think_loop_guard_closed = True
+                if close_reason is not None:
                     for cid in close_seq_ids:
                         if step_i >= max_new_tokens:
                             break
@@ -4955,9 +5004,10 @@ class SparkXLoopV03(nn.Module):
                         dec_dt = max(1e-3, time.perf_counter() - t_decode_start)
                         e2e_dt = max(1e-3, time.perf_counter() - t_start)
                         dec_tps = max(0, len(gen_list) - 1) / dec_dt
+                        tag = "72L Loop-Guard </think>" if think_loop_guard_closed else "72L Budget </think>"
                         print(
-                            f"  [72L Budget </think>] Closed </think> at budget={eff_think_budget} tokens "
-                            f"(decode={dec_tps:.1f} tok/s | e2e={len(gen_list)/e2e_dt:.1f} tok/s | TTFT={ttft_sec*1000:.0f}ms).",
+                            f"  [{tag}] Closed </think> at {close_reason} ({len(gen_list)} tokens | "
+                            f"decode={dec_tps:.1f} tok/s | e2e={len(gen_list)/e2e_dt:.1f} tok/s | TTFT={ttft_sec*1000:.0f}ms).",
                             flush=True,
                         )
                     if step_i >= max_new_tokens:
@@ -5020,6 +5070,34 @@ class SparkXLoopV03(nn.Module):
                             flush=True,
                         )
                     break
+
+                if (
+                    abort_on_degenerate_loop
+                    and is_greedy_decode
+                    and int(max_new_tokens) > 512
+                    and len(gen_list) >= 768
+                    and len(gen_list) % 32 == 0
+                ):
+                    deg_cyc = _detect_periodic_token_loop(gen_list, max_period=64, min_repeats=16, min_total_span=768)
+                    if deg_cyc is not None:
+                        finish_reason = 'degenerate_loop'
+                        degenerate_loop_info = {
+                            'period': int(deg_cyc[0]),
+                            'repeats': int(deg_cyc[1]),
+                            'span_tokens': int(deg_cyc[0] * deg_cyc[1]),
+                        }
+                        if stream_print:
+                            dec_dt = max(1e-3, time.perf_counter() - t_decode_start)
+                            e2e_dt = max(1e-3, time.perf_counter() - t_start)
+                            dec_tps = max(0, len(gen_list) - 1) / dec_dt
+                            print(
+                                f"  [Gen Aborted] Stopped deterministic greedy loop "
+                                f"(period={deg_cyc[0]}, repeats={deg_cyc[1]}, span={deg_cyc[0] * deg_cyc[1]} tok) "
+                                f"at {len(gen_list)} tokens (decode={dec_tps:.1f} tok/s | "
+                                f"e2e={len(gen_list)/e2e_dt:.1f} tok/s | TTFT={ttft_sec*1000:.0f}ms).",
+                                flush=True,
+                            )
+                        break
         except InterruptedError:
             finish_reason = 'cancelled'
             raise
@@ -5049,6 +5127,10 @@ class SparkXLoopV03(nn.Module):
                 "itl_p95_ms": round(sorted_itl[min(n_itl - 1, int(0.95 * n_itl))], 2),
                 "itl_p99_ms": round(sorted_itl[min(n_itl - 1, int(0.99 * n_itl))], 2),
             }
+            if think_loop_guard_closed:
+                self.last_generation_timing["think_loop_guard_closed"] = True
+            if degenerate_loop_info is not None:
+                self.last_generation_timing["degenerate_loop"] = degenerate_loop_info
             self.train(prev_train)
         return out_buf[:, :cur_len]
 

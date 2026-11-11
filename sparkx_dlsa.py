@@ -280,6 +280,8 @@ class PagedLatentIndex:
         self._cached_tree_limit: int = -1
         self._cached_tree_valid_ids: Optional[torch.Tensor] = None
         self._cached_tree_levels: Optional[List[torch.Tensor]] = None
+        self._iota_cache: Optional[torch.Tensor] = None
+        self._alloc_version: int = 1
 
         # Unclustered rolling tail covering strictly `[max(n_sink, clustered_end), t)` (F14)
         self._unclustered_k_store: Optional[torch.Tensor] = None
@@ -298,6 +300,14 @@ class PagedLatentIndex:
             if self.t > tail_lo:
                 self._set_unclustered_tail(kk_full[tail_lo : self.t])
 
+    def _get_range(self, lo: int, hi: int, dev: torch.device) -> torch.Tensor:
+        if hi <= lo:
+            return torch.zeros(0, dtype=torch.long, device=dev)
+        if self._iota_cache is None or self._iota_cache.device != dev or int(self._iota_cache.shape[0]) < hi:
+            cap = max(8192, hi if self._iota_cache is None else max(int(self._iota_cache.shape[0]) * 2, hi))
+            self._iota_cache = torch.arange(0, cap, device=dev, dtype=torch.long)
+        return self._iota_cache[lo:hi]
+
     def _append_persistent_k_latents(self, kk_chunk: torch.Tensor) -> None:
         c_len = int(kk_chunk.shape[0])
         if c_len <= 0:
@@ -311,6 +321,7 @@ class PagedLatentIndex:
                 new_buf[: self._k_idx_len].copy_(self._buf_k_idx_n[: self._k_idx_len].to(dev))
             self._buf_k_idx_n = new_buf
             self._k_idx_cap = new_cap
+            self._alloc_version += 1
         self._buf_k_idx_n[self._k_idx_len : need].copy_(kk_chunk)
         self._k_idx_len = need
 
@@ -335,6 +346,7 @@ class PagedLatentIndex:
         self._buf_bpools = new_bpools
         self._cap_blocks = new_cap
         self._index_device = dev
+        self._alloc_version += 1
 
     def _append_compact_and_tree(self, new_cents: torch.Tensor, new_btoks: torch.Tensor, block_start_idx: int) -> None:
         """Incrementally append non-empty buckets from newly sealed blocks into compact leaf arrays and update only newly
@@ -346,6 +358,7 @@ class PagedLatentIndex:
             self._buf_compact_btoks = self._buf_compact_btoks.to(dev)
             self._buf_compact_flat_ids = self._buf_compact_flat_ids.to(dev)
             self._tree_level_bufs = [buf.to(dev) for buf in self._tree_level_bufs]
+            self._alloc_version += 1
 
         old_compact_len = self._compact_len
         for local_b in range(b_cnt):
@@ -367,6 +380,7 @@ class PagedLatentIndex:
                     self._buf_compact_btoks = nt
                     self._buf_compact_flat_ids = nf
                     self._compact_cap = new_ccap
+                    self._alloc_version += 1
                 s_idx = self._compact_len
                 self._buf_compact_cents[s_idx : s_idx + m].copy_(new_cents[local_b].index_select(0, nz_slots))
                 self._buf_compact_btoks[s_idx : s_idx + m].copy_(bt_row.index_select(0, nz_slots))
@@ -389,6 +403,7 @@ class PagedLatentIndex:
                 init_pcap = max(32, complete_parents * 2)
                 self._tree_level_bufs.append(torch.empty((init_pcap, d), device=dev, dtype=torch.float32))
                 self._tree_level_lens.append(0)
+                self._alloc_version += 1
             prev_parents = self._tree_level_lens[lvl]
             if complete_parents > prev_parents:
                 p_buf = self._tree_level_bufs[lvl]
@@ -399,6 +414,7 @@ class PagedLatentIndex:
                         np_buf[:prev_parents].copy_(p_buf[:prev_parents])
                     p_buf = np_buf
                     self._tree_level_bufs[lvl] = p_buf
+                    self._alloc_version += 1
                 c_lo = prev_parents * f
                 c_hi = complete_parents * f
                 delta_p = complete_parents - prev_parents
@@ -430,7 +446,9 @@ class PagedLatentIndex:
         if self._unclustered_k_store is not None:
             self._unclustered_k_store = self._unclustered_k_store.to(cpu)
             self._unclustered_k_buf = self._unclustered_k_store[self._unclustered_k_start : self._unclustered_k_end]
+        self._iota_cache = None
         self._cached_tree_limit = -1
+        self._alloc_version += 1
 
     def _build_bucket_pool_bases(self, labels: torch.Tensor, block_start_idx: int) -> torch.Tensor:
         """Build direct `[B, P, max_pools_per_bucket]` lookup table of absolute token base positions per bucket (-1 = unused)."""
@@ -544,6 +562,7 @@ class PagedLatentIndex:
         self._unclustered_k_start = 0
         self._unclustered_k_end = n_tok
         self._unclustered_k_buf = store[:n_tok]
+        self._alloc_version += 1
 
     def _append_to_unclustered_store(self, kk_mid: torch.Tensor) -> None:
         """Append normalized key latents `kk_mid` (strictly at absolute positions `>= n_sink`) into the rolling tail buffer."""
@@ -561,11 +580,13 @@ class PagedLatentIndex:
             self._unclustered_k_start = 0
             self._unclustered_k_end = m_len
             self._unclustered_k_buf = store[:m_len]
+            self._alloc_version += 1
             return
 
         if store.device != target_dev:
             store = store.to(target_dev)
             self._unclustered_k_store = store
+            self._alloc_version += 1
         s_off = int(self._unclustered_k_start)
         e_off = int(self._unclustered_k_end)
         cur_len = e_off - s_off
@@ -583,6 +604,7 @@ class PagedLatentIndex:
                     new_store[:cur_len].copy_(store[s_off:e_off])
                 store = new_store
                 self._unclustered_k_store = store
+                self._alloc_version += 1
                 s_off = 0
                 e_off = cur_len
         store[e_off : e_off + m_len].copy_(kk_mid)
@@ -898,27 +920,55 @@ class PagedLatentIndex:
         dist_alpha_over_tau: float = 0.0,
         search_mode: Optional[str] = None,
         candidate_key_fn: Optional[Any] = None,
+        _q_already_unit: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Select exact key positions AND return `(selected_positions, selected_flat_buckets)`."""
         dev = q_idx.device
         upto = self.t if upto is None else min(int(upto), self.t)
         limit = 0 if self.n_blocks == 0 else max(0, min(self.n_blocks, (upto - self.window - self.mid_start) // self.n_cluster))
         if limit == 0:
-            return torch.arange(0, upto, device=dev, dtype=torch.long), torch.zeros(0, dtype=torch.long, device=dev)
+            return self._get_range(0, upto, dev), torch.zeros(0, dtype=torch.long, device=dev)
         clustered_end = self.mid_start + limit * self.n_cluster
-        sink = torch.arange(0, min(self.n_sink, upto), device=dev, dtype=torch.long)
-        tail = torch.arange(clustered_end, upto, device=dev, dtype=torch.long)
-        q = F.normalize(q_idx.float().reshape(-1, q_idx.shape[-1]).mean(dim=0), dim=-1, eps=1e-6)
-        cents = self.centroids[:limit].to(dev)
-        toks = self.bucket_tokens[:limit].to(dev)
+        sink = self._get_range(0, min(self.n_sink, upto), dev)
+        tail = self._get_range(clustered_end, upto, dev)
+        if _q_already_unit and q_idx.dtype == torch.float32 and q_idx.numel() == self.d:
+            q = q_idx.reshape(-1)
+        else:
+            q = F.normalize(q_idx.float().reshape(-1, q_idx.shape[-1]).mean(dim=0), dim=-1, eps=1e-6)
         stage1_budget = int(budget) * self.rerank
         eff_mode = str(search_mode or self.search_mode).lower().strip()
 
         if eff_mode == "tree":
+            cents = self.centroids[:limit].to(dev)
+            toks = self.bucket_tokens[:limit].to(dev)
             sel_flat = self._select_tree_buckets(
                 cents, toks, q, stage1_token_budget=stage1_budget, upto=upto, dist_alpha_over_tau=dist_alpha_over_tau
             )
+        elif len(self._block_compact_ends) > limit and self._compact_len >= self._block_compact_ends[limit]:
+            n_comp = self._block_compact_ends[limit]
+            if n_comp == 0:
+                sel_flat = torch.zeros(0, dtype=torch.long, device=dev)
+            else:
+                c_cents = self._buf_compact_cents[:n_comp].to(dev)
+                c_btoks = self._buf_compact_btoks[:n_comp].to(dev)
+                c_flat_ids = self._buf_compact_flat_ids[:n_comp].to(dev)
+                flat_scores = torch.mv(c_cents, q)
+                if dist_alpha_over_tau > 0.0:
+                    q_pos = float(upto - 1)
+                    blk_ids = torch.div(c_flat_ids, self.pools_per_block, rounding_mode="floor")
+                    blk_centers = self.mid_start + (blk_ids.float() + 0.5) * float(self.n_cluster)
+                    flat_scores = flat_scores - float(dist_alpha_over_tau) * torch.log1p(
+                        (q_pos - blk_centers).clamp(min=0.0) / max(1.0, float(self.window))
+                    )
+                max_cand_buckets = min(n_comp, max(16, stage1_budget // max(1, self.n_pool) + 8))
+                flat_s, top_idx = torch.topk(flat_scores, k=max_cand_buckets, largest=True, sorted=True)
+                flat_t = c_btoks.index_select(0, top_idx)
+                csum = torch.cumsum(flat_t, dim=0)
+                take = ((csum - flat_t) < stage1_budget) & torch.isfinite(flat_s)
+                sel_flat = c_flat_ids.index_select(0, top_idx)[take]
         else:
+            cents = self.centroids[:limit].to(dev)
+            toks = self.bucket_tokens[:limit].to(dev)
             scores = torch.einsum("bcd,d->bc", cents, q)
             if dist_alpha_over_tau > 0.0:
                 q_pos = float(upto - 1)
@@ -927,7 +977,6 @@ class PagedLatentIndex:
                 scores = scores - blk_pen.unsqueeze(1)
             scores = scores.masked_fill(toks == 0, float("-inf"))
             flat_scores = scores.reshape(-1)
-            # Bounded top-k candidate selection instead of sorting the entire history's buckets (§8)
             max_cand_buckets = min(int(flat_scores.numel()), max(16, stage1_budget // max(1, self.n_pool) + 8))
             flat_s, flat_i = torch.topk(flat_scores, k=max_cand_buckets, largest=True, sorted=True)
             flat_t = toks.reshape(-1).index_select(0, flat_i)
@@ -938,13 +987,18 @@ class PagedLatentIndex:
 
         # Direct O(K) bucket-to-pool-base lookup without scanning all `limit * pools_per_block` labels (§8)
         self._ensure_materialized()
+        pool_offs = self._get_range(0, self.n_pool, dev).unsqueeze(0)
         if sel_flat.numel() == 0:
             mid = torch.zeros(0, dtype=torch.long, device=dev)
         elif self._mat_bpools.numel() > 0 and int(self._mat_bpools.shape[0]) >= limit:
             bpools_flat = self._mat_bpools[:limit].reshape(-1, self.max_pools_per_bucket).to(dev)
             sel_pool_bases = bpools_flat.index_select(0, sel_flat)  # [M_buckets, max_pools_per_bucket]
             valid_bases = sel_pool_bases[sel_pool_bases >= 0]
-            mid = (valid_bases.unsqueeze(1) + torch.arange(self.n_pool, device=dev).unsqueeze(0)).reshape(-1)
+            if self.rerank == 1 and valid_bases.numel() > 0:
+                sorted_bases = torch.sort(valid_bases).values
+                mid = (sorted_bases.unsqueeze(1) + pool_offs).reshape(-1)
+                return torch.cat([sink, mid, tail], dim=0), sel_flat
+            mid = (valid_bases.unsqueeze(1) + pool_offs).reshape(-1)
         else:
             sel_mask = torch.zeros(limit * self.pools_per_block, dtype=torch.bool, device=dev)
             sel_mask[sel_flat] = True
@@ -952,7 +1006,7 @@ class PagedLatentIndex:
             pool_sel = sel_mask.gather(1, self.labels[:limit].to(dev))
             pool_ids = torch.nonzero(pool_sel)
             base = self.mid_start + pool_ids[:, 0] * self.n_cluster + pool_ids[:, 1] * self.n_pool
-            mid = (base.unsqueeze(1) + torch.arange(self.n_pool, device=dev).unsqueeze(0)).reshape(-1)
+            mid = (base.unsqueeze(1) + pool_offs).reshape(-1)
 
         if self.rerank > 1 and mid.numel() > int(budget):
             cand_k_lat: Optional[torch.Tensor] = None
@@ -975,15 +1029,69 @@ class PagedLatentIndex:
     @torch.no_grad()
     def select(self, q_idx: torch.Tensor, budget: int, upto: Optional[int] = None,
                dist_alpha_over_tau: float = 0.0, search_mode: Optional[str] = None,
-               candidate_key_fn: Optional[Any] = None) -> torch.Tensor:
+               candidate_key_fn: Optional[Any] = None, _q_already_unit: bool = False) -> torch.Tensor:
         """`q_idx`: [d] or [Tq, d] unit-norm (mean-pooled if 2-D). Returns sorted exact key positions (sink+selected+tail)."""
+        dev = q_idx.device
+        upto_i = self.t if upto is None else min(int(upto), self.t)
+        limit = 0 if self.n_blocks == 0 else max(0, min(self.n_blocks, (upto_i - self.window - self.mid_start) // self.n_cluster))
+        if limit == 0 or (self.rerank == 1 and limit * self.n_cluster <= int(budget)):
+            return self._get_range(0, upto_i, dev)
+
+        eff_mode = str(search_mode or self.search_mode).lower().strip()
+        if (
+            eff_mode == "flat"
+            and self.rerank == 1
+            and len(self._block_compact_ends) > limit
+            and self._compact_len >= self._block_compact_ends[limit]
+            and int(self._buf_bpools.shape[0]) >= limit
+            and self._buf_compact_cents.device == dev
+            and self._buf_bpools.device == dev
+        ):
+            n_comp = self._block_compact_ends[limit]
+            clustered_end = self.mid_start + limit * self.n_cluster
+            sink = self._get_range(0, min(self.n_sink, upto_i), dev)
+            tail = self._get_range(clustered_end, upto_i, dev)
+            if n_comp == 0:
+                return torch.cat([sink, tail], dim=0)
+            if _q_already_unit and q_idx.dtype == torch.float32 and q_idx.numel() == self.d:
+                q = q_idx.reshape(-1)
+            else:
+                q = F.normalize(q_idx.float().reshape(-1, q_idx.shape[-1]).mean(dim=0), dim=-1, eps=1e-6)
+            c_cents = self._buf_compact_cents[:n_comp]
+            c_btoks = self._buf_compact_btoks[:n_comp]
+            c_flat_ids = self._buf_compact_flat_ids[:n_comp]
+            flat_scores = torch.mv(c_cents, q)
+            if dist_alpha_over_tau > 0.0:
+                q_pos = float(upto_i - 1)
+                blk_ids = torch.div(c_flat_ids, self.pools_per_block, rounding_mode="floor")
+                blk_centers = self.mid_start + (blk_ids.float() + 0.5) * float(self.n_cluster)
+                flat_scores = flat_scores - float(dist_alpha_over_tau) * torch.log1p(
+                    (q_pos - blk_centers).clamp(min=0.0) / max(1.0, float(self.window))
+                )
+            stage1_budget = int(budget)
+            max_cand_buckets = min(n_comp, max(16, stage1_budget // max(1, self.n_pool) + 8))
+            flat_s, top_idx = torch.topk(flat_scores, k=max_cand_buckets, largest=True, sorted=True)
+            flat_t = c_btoks.index_select(0, top_idx)
+            csum = torch.cumsum(flat_t, dim=0)
+            take = ((csum - flat_t) < stage1_budget) & torch.isfinite(flat_s)
+            cand_flat_ids = c_flat_ids.index_select(0, top_idx)
+            bpools_flat = self._buf_bpools[:limit].reshape(-1, self.max_pools_per_bucket)
+            cand_pools = bpools_flat.index_select(0, cand_flat_ids)
+            valid_bases = cand_pools[take.unsqueeze(1) & (cand_pools >= 0)]
+            if valid_bases.numel() > 0:
+                sorted_bases = torch.sort(valid_bases).values
+                mid = (sorted_bases.unsqueeze(1) + self._get_range(0, self.n_pool, dev).unsqueeze(0)).reshape(-1)
+                return torch.cat([sink, mid, tail], dim=0)
+            return torch.cat([sink, tail], dim=0)
+
         sel_pos, _ = self.select_with_buckets(
             q_idx,
             budget=budget,
-            upto=upto,
+            upto=upto_i,
             dist_alpha_over_tau=dist_alpha_over_tau,
             search_mode=search_mode,
             candidate_key_fn=candidate_key_fn,
+            _q_already_unit=_q_already_unit,
         )
         return sel_pos
 

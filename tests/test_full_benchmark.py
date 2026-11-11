@@ -105,6 +105,56 @@ class TestFullBenchmark(unittest.TestCase):
             self.assertFalse(result["model_quality_run"])
             self.assertFalse(result["complete"])
 
+    def test_resume_skips_verified_rows_recovers_truncated_tail_and_rejects_tampering(self):
+        rows = [
+            {"problem_type": "bfs", "prompt": "r0", "answer": ["a0"]},
+            {"problem_type": "parents", "prompt": "skip", "answer": ["x"]},
+            {"problem_type": "bfs", "prompt": "r2", "answer": ["a2"]},
+            {"problem_type": "bfs", "prompt": "r3", "answer": ["a3"]},
+        ]
+        seen_prompts: list[str] = []
+
+        def tracked_eval(model, tokenizer, item, **kwargs):
+            seen_prompts.append(item["prompt"])
+            return evaluate(model, tokenizer, item, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # Step 1: Run partial subset of 1 eligible row, then append a simulated truncated crash line
+            part = run_dataset(Model(), None, NATIVE_PROTOCOLS["graphwalks_bfs"], tmp,
+                               rows=rows, evaluator=tracked_eval, converter=convert, limit=1)
+            self.assertEqual(part["attempted"], 1)
+            self.assertEqual(seen_prompts, ["r0"])
+            jsonl_path = Path(part["predictions"])
+            with jsonl_path.open("a", encoding="utf-8") as fh:
+                fh.write('{"row_index": 2, "truncated": ')
+
+            # Step 2: Resume full dataset; r0 is verified & skipped, truncated tail is cleaned, only r2 & r3 run
+            seen_prompts.clear()
+            full_res = run_dataset(Model(), None, NATIVE_PROTOCOLS["graphwalks_bfs"], tmp,
+                                   rows=rows, evaluator=tracked_eval, converter=convert, resume=True)
+            self.assertEqual(seen_prompts, ["r2", "r3"])
+            self.assertEqual(full_res["attempted"], 3)
+            self.assertEqual(full_res["scored"], 3)
+            self.assertEqual(full_res["resumed_rows"], 1)
+            self.assertTrue(full_res["complete"])
+            self.assertEqual(full_res["score"], 100.0)
+            saved_lines = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([r["row_index"] for r in saved_lines], [0, 2, 3])
+
+            # Step 3: Calling resume=True again on an already-complete suite returns immediately with 0 eval calls
+            seen_prompts.clear()
+            cached_res = run_dataset(Model(), None, NATIVE_PROTOCOLS["graphwalks_bfs"], tmp,
+                                     rows=rows, evaluator=tracked_eval, converter=convert, resume=True)
+            self.assertEqual(seen_prompts, [])
+            self.assertTrue(cached_res["complete"])
+
+            # Step 4: Tampering with input rows when summary is incomplete raises ValueError on sha256 mismatch
+            (Path(tmp) / "graphwalks_bfs.summary.json").unlink()
+            tampered_rows = [{"problem_type": "bfs", "prompt": "TAMPERED", "answer": ["a0"]}, *rows[1:]]
+            with self.assertRaisesRegex(ValueError, "Resume integrity error"):
+                run_dataset(Model(), None, NATIVE_PROTOCOLS["graphwalks_bfs"], tmp,
+                            rows=tampered_rows, evaluator=tracked_eval, converter=convert, resume=True)
+
 
 if __name__ == "__main__":
     unittest.main()

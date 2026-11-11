@@ -2825,9 +2825,13 @@ def benchmark_loop72_decode_speed(
         report.update(status="blocked", reason="model_tokenizer_and_pytorch_required")
         report["horizons"] = [{"prompt_tokens": n, "status": "blocked", "reason": report["reason"]} for n in lengths]
         return report
-    if "force_think_close" not in inspect.signature(model.generate_cached).parameters:
+    gen_sig_params = inspect.signature(model.generate_cached).parameters
+    if "force_think_close" not in gen_sig_params:
         report.update(status="unsupported", reason="runtime_cannot_disable_forced_thinking_close")
         return report
+    speed_extra_kwargs: Dict[str, Any] = {}
+    if "abort_on_degenerate_loop" in gen_sig_params:
+        speed_extra_kwargs["abort_on_degenerate_loop"] = False
     device = next(model.base.parameters()).device
     report["device"] = str(device)
     context_limit = _configured_context_limit(model)
@@ -2858,7 +2862,8 @@ def benchmark_loop72_decode_speed(
                 start = time.perf_counter()
                 out = model.generate_cached(inp, max_new_tokens=int(gen_tokens), do_sample=False,
                                             repetition_penalty=1.0, force_think_close=False,
-                                            top_p=1.0, top_k=0, tokenizer=tokenizer, stream_print=False, cache=cache)
+                                            top_p=1.0, top_k=0, tokenizer=tokenizer, stream_print=False, cache=cache,
+                                            **speed_extra_kwargs)
                 if getattr(device, "type", str(device).split(":")[0]) == "cuda":
                     torch.cuda.synchronize(device)
                 wall = time.perf_counter() - start

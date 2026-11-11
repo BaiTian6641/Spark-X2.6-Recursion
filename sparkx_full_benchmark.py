@@ -164,6 +164,55 @@ def _accept_row(spec: DatasetProtocol, row: dict[str, Any]) -> bool:
     return True
 
 
+class ResumeIntegrityError(ValueError):
+    """Raised when resumable JSONL predictions do not match pinned dataset row digests."""
+
+
+def _load_resumable_records(output: Path) -> dict[int, dict[str, Any]]:
+    raw_lines = output.read_text(encoding="utf-8").splitlines()
+    clean_lines: list[str] = []
+    records: dict[int, dict[str, Any]] = {}
+    truncated_tail = False
+    for idx, line in enumerate(raw_lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            rec = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            if idx == len(raw_lines) - 1:
+                truncated_tail = True
+                break
+            raise ValueError(f"Corrupt non-trailing JSONL record at {output}:{idx + 1}") from exc
+        if not isinstance(rec, dict) or "row_index" not in rec or "row_sha256" not in rec:
+            raise ValueError(f"Invalid resumable JSONL record schema at {output}:{idx + 1}")
+        r_idx = int(rec["row_index"])
+        if r_idx in records:
+            raise ValueError(f"Duplicate row_index={r_idx} in {output}")
+        records[r_idx] = rec
+        clean_lines.append(stripped)
+    if truncated_tail:
+        tmp_out = output.with_suffix(".jsonl.tmp")
+        tmp_out.write_text(("".join(x + "\n" for x in clean_lines)), encoding="utf-8")
+        tmp_out.replace(output)
+    return records
+
+
+def _account_record_result(result: dict[str, Any], scores: list[float], counts: dict[str, int]) -> None:
+    if result.get("score") is not None:
+        if result.get("status") != "completed":
+            raise ValueError("A numeric score requires status='completed'")
+        score = float(result["score"])
+        if not (0.0 <= score <= 100.0):
+            raise ValueError(f"Invalid score for native protocol: {score}")
+        scores.append(score)
+        counts["scored"] += 1
+    elif result.get("status") in ("error", "generation_error", "invalid"):
+        counts["errors"] += 1
+    else:
+        counts["blocked"] += 1
+
+
 def run_dataset(
     model: Any, tokenizer: Any, spec: DatasetProtocol, output_dir: str | Path,
     *, max_new_tokens: int = 32768, limit: int | None = None,
@@ -172,11 +221,14 @@ def run_dataset(
     evaluator: Callable[..., dict[str, Any]] | None = None,
     converter: Callable[..., dict[str, Any] | None] | None = None,
     verbose: bool | None = None,
+    resume: bool = False,
 ) -> dict[str, Any]:
     """Evaluate every eligible row; ``limit`` always makes the run a subset.
 
     Optional injected rows/evaluator are for unit tests.  They are recorded and
     can never produce a model-quality claim.  Results are flushed per example.
+    When ``resume=True``, already-flushed JSONL rows in ``output_dir`` are verified
+    by ``row_index`` and ``row_sha256`` and skipped without re-running generation.
     """
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive or None")
@@ -197,28 +249,65 @@ def run_dataset(
     dest = Path(output_dir)
     dest.mkdir(parents=True, exist_ok=True)
     output = dest / f"{spec.name}.jsonl"
+    manifest_path = dest / f"{spec.name}.manifest.json"
+    summary_path = dest / f"{spec.name}.summary.json"
+    existing_records: dict[int, dict[str, Any]] = {}
     if output.exists():
-        raise FileExistsError(f"Use a fresh output directory; refusing to mix runs: {output}")
+        if not resume:
+            raise FileExistsError(f"Use a fresh output directory; refusing to mix runs: {output}")
+        if manifest_path.exists():
+            prev_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            expected_proto = json.loads(json.dumps(dataclasses.asdict(spec)))
+            if (
+                prev_manifest.get("suite") != spec.name
+                or prev_manifest.get("dataset_protocol") != expected_proto
+                or bool(prev_manifest.get("injected_test_inputs")) != bool(test_inputs)
+            ):
+                raise ValueError(f"Cannot resume {output}: manifest protocol or test-input provenance mismatch")
+        existing_records = _load_resumable_records(output)
+        if summary_path.exists() and limit is None:
+            try:
+                prev_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            except Exception:
+                prev_summary = {}
+            if (
+                prev_summary.get("complete") is True
+                and prev_summary.get("dataset_exhausted") is True
+                and len(existing_records) == int(prev_summary.get("attempted", -1))
+            ):
+                if verbose:
+                    print(
+                        f"  [{spec.name} | resume] Suite already complete "
+                        f"(scored={prev_summary.get('scored')}/{prev_summary.get('attempted')}, "
+                        f"score={prev_summary.get('score')}); skipping.",
+                        flush=True,
+                    )
+                return prev_summary
+
     options = {"do_sample": False, "temperature": 0.0, "top_p": 1.0,
                "top_k": -1, "repetition_penalty": 1.0, "force_think_close": False}
     options.update(generation_options or {})
     metadata = {"suite": spec.name, "dataset_protocol": dataclasses.asdict(spec),
                 "generation": {**options, "max_new_tokens": max_new_tokens},
                 "limit": limit, "injected_test_inputs": test_inputs,
+                "resumed": bool(existing_records),
                 "source": source_identity(),
                 "model_manifest": _jsonable(model.execution_manifest()) if hasattr(model, "execution_manifest") else None,
                 "model_metadata": _jsonable(getattr(model, "loaded_meta", None)),
                 "published_score_comparable": False,
                 "comparison_note": "Full dataset coverage does not establish equivalence to the model-card protocol. No macro comparison is computed."}
-    (dest / f"{spec.name}.manifest.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n")
+    manifest_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n")
     counts = {"rows_seen": 0, "excluded_by_declared_filter": 0, "attempted": 0,
               "scored": 0, "blocked": 0, "errors": 0}
     scores: list[float] = []
     ended = False
     suite_error = None
     started = time.perf_counter()
+    resumed_count = 0
+    resumed_banner_printed = False
+    file_mode = "a" if existing_records else "w"
     stream = iter(rows if rows is not None else load_pinned_rows(spec))
-    with output.open("w", encoding="utf-8") as handle:
+    with output.open(file_mode, encoding="utf-8") as handle:
         try:
             while limit is None or counts["attempted"] < limit:
                 try:
@@ -232,7 +321,28 @@ def run_dataset(
                     counts["excluded_by_declared_filter"] += 1
                     continue
                 counts["attempted"] += 1
-                record: dict[str, Any] = {"row_index": index, "row_sha256": stable_digest(row),
+                row_digest = stable_digest(row)
+                if index in existing_records:
+                    prev_rec = existing_records[index]
+                    if prev_rec.get("row_sha256") != row_digest:
+                        raise ResumeIntegrityError(
+                            f"Resume integrity error at {spec.name} row_index={index}: "
+                            f"expected sha256={prev_rec.get('row_sha256')}, got {row_digest}"
+                        )
+                    _account_record_result(prev_rec, scores, counts)
+                    resumed_count += 1
+                    continue
+                if existing_records and not resumed_banner_printed and verbose:
+                    r_mean = (sum(scores) / len(scores)) if scores else None
+                    r_mean_str = f"{r_mean:.2f}" if r_mean is not None else "N/A"
+                    print(
+                        f"  [{spec.name} | resumed {resumed_count} verified rows: "
+                        f"scored={counts['scored']}/{counts['attempted'] - 1}, running_mean={r_mean_str}] "
+                        f"continuing from row #{counts['attempted']}...",
+                        flush=True,
+                    )
+                    resumed_banner_printed = True
+                record: dict[str, Any] = {"row_index": index, "row_sha256": row_digest,
                                           "source_id": row.get("_id", row.get("id"))}
                 row_t0 = time.perf_counter()
                 if verbose:
@@ -261,18 +371,7 @@ def run_dataset(
                         if _eval_accepts_verbose and verbose:
                             eval_kwargs["verbose"] = True
                         result = evaluator(model, tokenizer, task, **eval_kwargs)
-                    if result.get("score") is not None:
-                        if result.get("status") != "completed":
-                            raise ValueError("A numeric score requires status='completed'")
-                        score = float(result["score"])
-                        if not (0.0 <= score <= 100.0):
-                            raise ValueError(f"Invalid score for native protocol: {score}")
-                        scores.append(score)
-                        counts["scored"] += 1
-                    elif result.get("status") in ("error", "generation_error", "invalid"):
-                        counts["errors"] += 1
-                    else:
-                        counts["blocked"] += 1
+                    _account_record_result(result, scores, counts)
                     record.update(_jsonable(result))
                 except Exception as exc:
                     counts["errors"] += 1
@@ -298,25 +397,30 @@ def run_dataset(
                     )
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
                 handle.flush()
+        except ResumeIntegrityError:
+            raise
         except Exception as exc:
             suite_error = f"{type(exc).__name__}: {exc}"
     full_coverage = ended and limit is None and counts["attempted"] > 0 and counts["blocked"] == counts["errors"] == 0
     mean = sum(scores) / len(scores) if scores else None
     result = {"suite": spec.name, "status": "complete" if full_coverage else "incomplete",
               "complete": full_coverage, "dataset_exhausted": ended, **counts,
+              "resumed_rows": resumed_count,
               "score": mean if full_coverage else None, "score_on_scored_rows": mean,
               "intended_model_run": not test_inputs,
               "model_quality_run": not test_inputs and counts["scored"] > 0,
               "published_score_comparable": False,
               "suite_error": suite_error, "elapsed_seconds": time.perf_counter() - started,
-              "manifest": str(dest / f"{spec.name}.manifest.json"), "predictions": str(output)}
-    (dest / f"{spec.name}.summary.json").write_text(json.dumps(result, indent=2) + "\n")
+              "manifest": str(manifest_path), "predictions": str(output)}
+    summary_path.write_text(json.dumps(result, indent=2) + "\n")
     return result
 
 
 def run_full_benchmarks(model: Any, tokenizer: Any, output_dir: str | Path,
                         suites: Iterable[str] | None = None, max_new_tokens: int = 32768,
-                        limit: int | None = None, verbose: bool = True) -> dict[str, Any]:
+                        limit: int | None = None, verbose: bool = True,
+                        resume: bool = False,
+                        generation_options: dict[str, Any] | None = None) -> dict[str, Any]:
     """Run supported datasets and enumerate every remaining blocked suite."""
     names = list(suites or [*NATIVE_PROTOCOLS, *EXTERNAL_PROTOCOLS])
     unknown = set(names) - set(NATIVE_PROTOCOLS) - set(EXTERNAL_PROTOCOLS)
@@ -335,12 +439,14 @@ def run_full_benchmarks(model: Any, tokenizer: Any, output_dir: str | Path,
             if verbose:
                 print(
                     f"\n=== [FullBench {native_idx}/{len(native_names)}] Starting Native Suite '{name}' "
-                    f"(dataset={spec.dataset}@{spec.revision[:8]}, max_new_tokens={max_new_tokens}, limit={limit}) ===",
+                    f"(dataset={spec.dataset}@{spec.revision[:8]}, max_new_tokens={max_new_tokens}, limit={limit}, resume={resume}) ===",
                     flush=True,
                 )
             try:
                 entry = run_dataset(model, tokenizer, spec, dest,
-                                    max_new_tokens=max_new_tokens, limit=limit, verbose=verbose)
+                                    max_new_tokens=max_new_tokens, limit=limit,
+                                    generation_options=generation_options,
+                                    verbose=verbose, resume=resume)
             except Exception as exc:
                 entry = {"suite": name, "status": "blocked", "score": None,
                          "reason": f"{type(exc).__name__}: {exc}", "complete": False}
@@ -377,6 +483,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="Explicit runtime identity; omit only to preserve the saved checkpoint/default mode")
     parser.add_argument("--max-new-tokens", type=int, default=32768)
     parser.add_argument("--limit", type=int, default=None, help="Explicit subset; cannot be reported as a full run")
+    parser.add_argument("--resume", action="store_true", help="Resume from verified flushed JSONL rows in --output-dir")
     args = parser.parse_args(argv)
     report = preflight(args.suites)
     dest = Path(args.output_dir)
@@ -389,7 +496,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return 2
     if not any(x["suite"] in NATIVE_PROTOCOLS for x in report["suites"]):
-        result = run_full_benchmarks(None, None, dest, args.suites, args.max_new_tokens, args.limit)
+        result = run_full_benchmarks(None, None, dest, args.suites, args.max_new_tokens, args.limit, resume=args.resume)
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 2
     from load_inference_v03 import load_sparkx_loop72_lsa
@@ -398,7 +505,7 @@ def main(argv: list[str] | None = None) -> int:
                                             config_path=args.config,
                                             dlsa_checkpoint=args.dlsa_checkpoint,
                                             recurrence_mode=args.recurrence_mode)
-    result = run_full_benchmarks(model, tokenizer, dest, args.suites, args.max_new_tokens, args.limit)
+    result = run_full_benchmarks(model, tokenizer, dest, args.suites, args.max_new_tokens, args.limit, resume=args.resume)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result["complete"] else 2
 

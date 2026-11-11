@@ -544,6 +544,8 @@ class SparkGenerationBackend:
         gen_ids = out[0, len(feed_ids):].tolist()
         count = len(gen_ids)
         reason = timing.get("finish_reason")
+        if reason == "degenerate_loop":
+            reason = "length"
         if reason not in {"stop", "length"}:
             self._prefix_state = None
             raise ProtocolError("Runtime did not report a valid generation finish_reason", 500, "runtime_contract_error")

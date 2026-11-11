@@ -452,6 +452,7 @@ class GlobalPagedVisitSlot:
 
         # Isolated per-visit D-LSA index state slot
         self.dlsa_state_slot: Dict[str, Any] = {}
+        self._last_checked_index_alloc: Optional[Tuple[int, int, str, int]] = None
 
         # Operational telemetry
         self.page_hits: int = 0
@@ -673,11 +674,18 @@ class GlobalPagedVisitSlot:
         idx = self.dlsa_state_slot.get("index")
         if idx is None or not hasattr(idx, "index_allocated_bytes"):
             return False
-        per_visit_cap = max(0, int(self.cfg.index_gpu_budget_bytes) // max(1, int(self.cfg.num_global_visits)))
+        alloc_ver = int(getattr(idx, "_alloc_version", -1))
+        budget_b = int(self.cfg.index_gpu_budget_bytes)
+        if alloc_ver >= 0 and self._last_checked_index_alloc == (id(idx), alloc_ver, device_type, budget_b):
+            return False
+        per_visit_cap = max(0, budget_b // max(1, int(self.cfg.num_global_visits)))
         if int(idx.index_allocated_bytes(device_type)) > per_visit_cap:
             idx.offload_index_to_cpu()
             self.index_cpu_offloads += 1
+            self._last_checked_index_alloc = (id(idx), int(getattr(idx, "_alloc_version", -1)), device_type, budget_b)
             return True
+        if alloc_ver >= 0:
+            self._last_checked_index_alloc = (id(idx), alloc_ver, device_type, budget_b)
         return False
 
     def append(

@@ -531,6 +531,48 @@ class GenerationHookTests(unittest.TestCase):
         self.assertEqual(seen, [])
         self.assertEqual(model.calls, [])
 
+    def test_periodic_loop_detector_and_generation_loop_guards(self):
+        from sparkx_loop_v03_core import _detect_periodic_token_loop
+        from sparkx_dlsa import PagedLatentIndex
+
+        # 1. Pure-Python periodic suffix detector
+        self.assertIsNone(_detect_periodic_token_loop(list(range(200)), max_period=32, min_repeats=16, min_total_span=160))
+        self.assertEqual(
+            _detect_periodic_token_loop([1, 2, 5] + [9, 10, 11] * 55, max_period=32, min_repeats=16, min_total_span=160),
+            (3, 54),
+        )
+
+        # 2. force_think_close=True closes <think> early at 160-token periodic cycle instead of waiting for budget
+        seq_think_loop = [3] + [9, 10, 11] * 60 + [12, 2]
+        model_close = GenerationStub(seq_think_loop)
+        seen_close = []
+        self.generate(model_close, max_new_tokens=1024, eos_token_id=2, force_think_close=True, token_callback=seen_close.append)
+        self.assertIn(4, seen_close)
+        self.assertLess(len(seen_close), 220)
+        self.assertTrue(model_close.last_generation_timing.get('think_loop_guard_closed'))
+        self.assertEqual(model_close.last_generation_timing['finish_reason'], 'stop')
+
+        # 3. force_think_close=False + greedy decode NEVER injects </think> (token 4), and aborts cleanly at 768-token span
+        seq_greedy_loop = [3] + [9, 10, 11] * 300
+        model_official = GenerationStub(seq_greedy_loop)
+        seen_official = []
+        self.generate(model_official, max_new_tokens=2048, force_think_close=False, token_callback=seen_official.append)
+        self.assertNotIn(4, seen_official)
+        self.assertGreaterEqual(len(seen_official), 768)
+        self.assertLess(len(seen_official), 832)
+        self.assertEqual(model_official.last_generation_timing['finish_reason'], 'degenerate_loop')
+        self.assertEqual(model_official.last_generation_timing['degenerate_loop']['period'], 3)
+
+        # 4. PagedLatentIndex.select compact fast path matches select_with_buckets bit-for-bit across exact and sparse regimes
+        torch.manual_seed(17)
+        k_lat = torch.nn.functional.normalize(torch.randn(192, 16), dim=-1)
+        idx = PagedLatentIndex(k_lat, n_sink=4, n_pool=4, n_cluster=32, avg_bucket_size=8, max_bucket_size=16, window=16, rerank=1)
+        q_lat = torch.nn.functional.normalize(torch.randn(1, 16), dim=-1)
+        for upto_val, b_val, alpha_val in ((100, 96, 0.0), (180, 48, 0.0), (192, 48, 0.25)):
+            sel_fast = idx.select(q_lat, budget=b_val, upto=upto_val, dist_alpha_over_tau=alpha_val, _q_already_unit=True)
+            sel_ref, _ = idx.select_with_buckets(q_lat, budget=b_val, upto=upto_val, dist_alpha_over_tau=alpha_val)
+            self.assertTrue(torch.equal(sel_fast, sel_ref), f"Mismatch at upto={upto_val}, budget={b_val}, alpha={alpha_val}")
+
 
 @unittest.skipIf(torch is None, 'torch not installed')
 class LoaderContractTests(unittest.TestCase):

@@ -267,6 +267,7 @@ def _select_for_single_query(
         dist_alpha_over_tau=indexer.dist_alpha_over_tau(),
         search_mode=indexer.search_mode,
         candidate_key_fn=_cand_fn if (slot is not None and not idx_obj.persistent_token_latents and indexer.rerank > 1) else None,
+        _q_already_unit=True,
     )
     if slot is not None and max_reuse > 1:
         slot.dlsa_state_slot["last_q_proj"] = q_proj.detach()
@@ -398,6 +399,34 @@ def paged_dlsa_global_attention_forward(
     # Path 2: Single-query sparse decode (`q_len == 1`)
     if q_len == 1:
         p0 = max_upto - 1
+        max_reuse = max(2 if selection_reuse else 1, int(getattr(indexer, "selection_reuse_steps", 1)))
+        if (
+            max_reuse <= 1
+            and idx_obj.rerank == 1
+            and int(getattr(indexer, "rerank", 1)) == 1
+            and slot.is_fully_gpu_resident(max_upto)
+        ):
+            limit_blk = (
+                0
+                if idx_obj.n_blocks == 0
+                else max(0, min(idx_obj.n_blocks, (max_upto - idx_obj.window - idx_obj.mid_start) // idx_obj.n_cluster))
+            )
+            if limit_blk * idx_obj.n_cluster <= eff_budget:
+                slot.sparse_Step_calls += 1
+                if telemetry is not None:
+                    telemetry.sparse_decode_calls += 1
+                    telemetry.total_selected_keys += int(max_upto)
+                    telemetry.total_sparse_queries += 1
+                k_all, v_all = slot.get_resident_prefix(max_upto)
+                return _sdpa_gqa(
+                    query,
+                    k_all,
+                    v_all,
+                    attn_mask=None,
+                    is_causal=False,
+                    scale=scale,
+                    enable_native_gqa=enable_native_gqa,
+                )
         sel = _select_for_single_query(
             indexer,
             idx_obj,
